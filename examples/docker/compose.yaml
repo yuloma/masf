@@ -1,0 +1,31 @@
+services:
+  controller:
+    image: "${MASF_CONTROLLER_IMAGE:-masf-controller:pilot}"
+    pull_policy: never
+    entrypoint: ["masf", "--config", "/etc/masf/pilot.toml"]
+    command: ["serve"]
+    init: true
+    restart: unless-stopped
+    user: "${MASF_UID:?Define MASF_UID}:${MASF_GID:?Define MASF_GID}"
+    environment:
+      HOME: /tmp
+      XDG_STATE_HOME: /var/lib
+      MASF_JOBS_DIR: "${MASF_JOBS_DIR:?Define MASF_JOBS_DIR}"
+      GH_TOKEN:
+    volumes:
+      - type: bind
+        source: "${MASF_CONFIG_DIR:?Define MASF_CONFIG_DIR}"
+        target: /etc/masf
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${MASF_STATE_DIR:?Define MASF_STATE_DIR}"
+        target: /var/lib/masf
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${MASF_JOBS_DIR:?Define MASF_JOBS_DIR}"
+        target: "${MASF_JOBS_DIR:?Define MASF_JOBS_DIR}"
+        bind:
+          create_host_path: false

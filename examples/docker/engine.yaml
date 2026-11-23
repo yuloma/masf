@@ -1,0 +1,12 @@
+services:
+  controller:
+    environment:
+      DOCKER_HOST: unix:///var/run/docker.sock
+    group_add:
+      - "${MASF_DOCKER_GID:?Define el GID del socket Docker}"
+    volumes:
+      - type: bind
+        source: "${MASF_DOCKER_SOCKET:-/var/run/docker.sock}"
+        target: /var/run/docker.sock
+        bind:
+          create_host_path: false

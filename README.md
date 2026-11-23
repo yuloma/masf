@@ -6,6 +6,8 @@ MASF es una fábrica de software que se instala una vez y mantiene los repositor
 
 **El proyecto está en fase de especificación.** La fábrica, sus adaptadores y el instalador se desarrollarán en este mismo repositorio. Los comandos del piloto describen la interfaz prevista.
 
+La instalación recomendada usará Docker Compose para el controlador central. También se podrá ejecutar el controlador nativamente en Linux. En ambos casos, un proyecto que solo funciona en Docker podrá levantar su aplicación y sus dependencias para cada tarea, conservando el entorno de desarrollo del equipo. El perfil de PostgreSQL ya se puede probar con `bash examples/docker/smoke-profile.sh` en un host con Docker. [Despliegue y ejecución en Docker](docs/docker.md).
+
 ## Cómo se usará
 
 1. El operador registra el repositorio, su etiqueta, sus comprobaciones y los proveedores disponibles en la configuración central.
@@ -19,6 +21,7 @@ MASF es una fábrica de software que se instala una vez y mantiene los repositor
 | --- | --- |
 | Entender el ciclo de una issue, los permisos y el contrato de los agentes | [Especificación](docs/especificacion.md) |
 | Ver cómo se registran repositorios y se asignan proveedores | [Configuración de ejemplo](examples/factory.toml) |
+| Desplegar el controlador y configurar los servicios de un proyecto Docker | [Guía de Docker](docs/docker.md) · [Compose central](examples/docker/compose.yaml) · [Perfil de proyecto](examples/profiles/postgres.yaml) |
 | Implementar el primer incremento y saber cuándo está terminado | [Plan de implementación y encargo inicial](docs/implementacion.md) |
 | Instalar la primera versión y evaluar un PR real | [Protocolo de instalación y piloto](docs/piloto.md) |
 | Contribuir a la propia fábrica con un agente | [AGENTS.md](AGENTS.md) |

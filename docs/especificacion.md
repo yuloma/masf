@@ -10,15 +10,17 @@ El repositorio `yuloma/masf` será la fuente de las versiones del motor, los ada
 
 | Componente | Responsabilidad |
 | --- | --- |
-| Servicio central | Un proceso en Linux sondea GitHub, reclama trabajos, aplica las transiciones y reconcilia los resultados. Proponemos Python 3.11 o superior, SQLite, Git y `gh` para el primer host. |
+| Servicio central | Un proceso Python 3.11+ en un contenedor Docker o en Linux nativo sondea GitHub, reclama trabajos y publica resultados con Git y `gh`. En la instalación Docker, esas dependencias están en la imagen del controlador. |
 | Registro de repositorios | El operador configura `owner/repo`, etiqueta, rama base opcional, entorno, preparación, checks y rutas protegidas. Toda selección se limita a repositorios habilitados. |
-| Entorno de tarea | Un clon de trabajo dedicado por issue conserva el código entre etapas. Los procesos de agentes y checks corren en contenedores desechables. El servicio retiene los puntos de recuperación y libera el entorno al terminar. |
+| Entorno de tarea | Un clon dedicado por issue conserva el código entre etapas. Los agentes corren en contenedores desechables. Para los checks se usa una copia limpia del SHA en una imagen o un proyecto Compose con los servicios que necesite ese repositorio. |
 | Adaptadores | Inician una CLI por etapa, aplican sus permisos y traducen la respuesta al contrato común. El modelo y el ejecutable pueden variar por proveedor. |
 | Publicación | Solo el servicio tiene la credencial de escritura en GitHub. Tras los checks y la revisión, sube la rama y abre un PR en borrador con un enlace a la issue. El merge corresponde a una persona. |
 
 Para el primer host, SQLite sirve a la vez de cola y registro de estado. Una instalación persistente puede dar servicio a varios repositorios con un único trabajo activo. El intervalo de sondeo y la concurrencia son configurables. Los webhooks, los workers en varias máquinas y el panel web pueden evaluarse cuando el uso lo justifique.
 
 La configuración toma como base los roles globales y aplica después las excepciones de `repositories.routing`. Cada repositorio puede indicar `runner_image` para usar una imagen distinta de `runner.image`. Un campo `model` opcional en cada proveedor fija el modelo solicitado. Si se omite, se registra el modelo efectivo cuando lo comunique la CLI. Una ruta a un proveedor desconocido o desactivado en un destino habilitado es un error de configuración. Se puede operar aunque falte una CLI sin roles asignados. [Ejemplo TOML](../examples/factory.toml).
+
+El controlador en Docker es el despliegue recomendado para el piloto. SQLite y los directorios de trabajo persisten al recrear su contenedor. El bloque opcional `repositories.compose` selecciona los manifiestos aprobados y el servicio que ejecuta `setup` y `checks`. La imagen de los agentes sigue determinada por `runner_image` o `runner.image`. El controlador nativo admite los mismos dos entornos de comprobación. [Montajes, permisos y ciclo de verificación](docker.md).
 
 ## Ciclo de una issue
 
@@ -59,6 +61,7 @@ Cada etapa recibe sus entradas por contenido o archivos. Un id de sesión del pr
 - **Permisos por operación.** El diagnóstico distingue lectura de issues, escritura de ramas y creación de PR. Poder leer un repositorio público o figurar como administrador no demuestra los permisos efectivos de la integración. Cuando una operación carezca de evidencia, se muestra como pendiente de comprobar. Un 403 en publicación conserva el SHA y la evidencia. Una vez corregido el acceso, se reanuda desde `publishing` si la base y el candidato siguen vigentes.
 - **Comprobaciones reproducibles.** Los comandos de preparación y checks se declaran como listas de argumentos en un perfil de confianza y se ejecutan dentro del entorno de tarea. Se valida el perfil sobre la base al dar de alta el proyecto. Si la base falla o el perfil carece de checks aplicables, el operador recibe la causa antes de consumir una ronda de agentes. El informe identifica el SHA, el comando, su código de salida y su duración.
 - **Separación de accesos.** Cada rol recibe solo el clon y los artefactos que necesita. Las herramientas de un agente y los procesos que ejecutan código del proyecto quedan fuera de la base de estado, la credencial de GitHub, los proyectos vecinos y el socket Docker del host. La autenticación del proveedor se limita a su ejecución. Los checks se ejecutan sin las credenciales de agentes.
+- **Aislamiento de servicios.** Con Compose se persisten el identificador de proyecto, el perfil aprobado y el SHA de cada verificación. Base, candidato y reintentos tienen redes, volúmenes y copias propios. El servicio recupera y retira exclusivamente los recursos que creó, incluso después de una cancelación o un reinicio. La prueba del proyecto nunca puede seleccionar por sí misma el contexto Docker del controlador.
 - **Evidencia local.** Por trabajo se conserva su repositorio, issue, plan, versión de la política, base y candidato, intentos, decisiones y referencia al PR. Por etapa se registran versión de CLI, proveedor, modelo si se conoce, duración, reintentos y causa de fallo. El uso comunicado por el proveedor conserva unidad y procedencia. Los valores ausentes son desconocidos. Una estimación de coste se guarda aparte de un cargo efectivamente facturado. Los logs se filtran antes de guardarse o resumirse en GitHub.
 
 ## Referencia de diseño

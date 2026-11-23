@@ -46,3 +46,16 @@ protected_paths = [".github/workflows/**"]
 # plan = "claude"
 # build = "codex"
 # review = "cursor"
+
+[[repositories]]
+# Proyecto SQL que ejecuta todo en Docker. El perfil vive junto al TOML del operador.
+slug = "example-org/masf-pilot-sql"
+enabled = false
+label = "masf:ready"
+setup = [["psql", "-X", "-v", "ON_ERROR_STOP=1", "-f", "schema.sql"]]
+checks = [["psql", "-X", "-v", "ON_ERROR_STOP=1", "-f", "tests/smoke.sql"]]
+protected_paths = [".github/workflows/**"]
+
+[repositories.compose]
+files = ["profiles/postgres.yaml"]
+service = "app"

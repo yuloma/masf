@@ -1,0 +1,39 @@
+services:
+  app:
+    image: postgres:17-alpine
+    user: postgres
+    command: ["tail", "-f", "/dev/null"]
+    working_dir: /workspace
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGDATABASE: pilot
+      PGUSER: pilot
+      PGPASSWORD: pilot-local
+    volumes:
+      - type: bind
+        source: "${MASF_WORKSPACE:?Falta el checkout de la prueba}"
+        target: /workspace
+        read_only: true
+        bind:
+          create_host_path: false
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: pilot
+      POSTGRES_USER: pilot
+      POSTGRES_PASSWORD: pilot-local
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "pilot", "-d", "pilot"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - data:/var/lib/postgresql/data
+volumes:
+  data: {}
+networks:
+  default:
+    internal: true

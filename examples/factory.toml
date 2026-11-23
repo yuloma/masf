@@ -1,0 +1,61 @@
+# Ejemplo del contrato previsto. Copiar a la configuración privada del operador.
+version = 1
+
+[service]
+poll_seconds = 60
+max_parallel_jobs = 1
+max_build_rounds = 2
+step_timeout_seconds = 900
+
+[runner]
+# Imagen que se construirá localmente durante la instalación del piloto.
+image = "masf-runner:pilot"
+
+[providers.codex]
+enabled = true
+executable = "codex"
+
+[providers.cursor]
+enabled = true
+executable = "agent"
+
+[providers.claude]
+# Activar al configurar Claude Code en el runner.
+enabled = false
+executable = "claude"
+
+[routing]
+plan = "codex"
+build = "codex"
+review = "cursor"
+
+[[repositories]]
+# Reemplazar por un destino propio y habilitarlo tras verificar sus checks.
+slug = "example-org/masf-pilot"
+enabled = false
+label = "masf:ready"
+# Si se omite base_branch, se usa la rama predeterminada de GitHub.
+# base_branch = "main"
+# runner_image = "mi-organizacion/masf-python:local"
+setup = []
+checks = [["python3", "-m", "unittest", "discover", "-s", "tests"]]
+protected_paths = [".github/workflows/**"]
+
+# Ejemplo opcional para este destino con los tres proveedores habilitados.
+# [repositories.routing]
+# plan = "claude"
+# build = "codex"
+# review = "cursor"
+
+[[repositories]]
+# Proyecto SQL que ejecuta todo en Docker. El perfil vive junto al TOML del operador.
+slug = "example-org/masf-pilot-sql"
+enabled = false
+label = "masf:ready"
+setup = [["psql", "-X", "-v", "ON_ERROR_STOP=1", "-f", "schema.sql"]]
+checks = [["psql", "-X", "-v", "ON_ERROR_STOP=1", "-f", "tests/smoke.sql"]]
+protected_paths = [".github/workflows/**"]
+
+[repositories.compose]
+files = ["profiles/postgres.yaml"]
+service = "app"

@@ -1,0 +1,35 @@
+name: Docker Compose pilot
+
+"on":
+  pull_request:
+    paths:
+      - ".github/workflows/docker-pilot.yml"
+      - "examples/docker/**"
+      - "examples/profiles/**"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  compose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Validate controller deployment
+        shell: bash
+        run: |
+          export MASF_CONFIG_DIR="$RUNNER_TEMP/config"
+          export MASF_STATE_DIR="$RUNNER_TEMP/state"
+          export MASF_JOBS_DIR="$RUNNER_TEMP/jobs"
+          export MASF_UID="$(id -u)" MASF_GID="$(id -g)"
+          export MASF_DOCKER_GID="$(stat -c %g /var/run/docker.sock)"
+          mkdir -p "$MASF_CONFIG_DIR" "$MASF_STATE_DIR" "$MASF_JOBS_DIR"
+          control=(docker compose --env-file /dev/null -p masf-control -f examples/docker/compose.yaml)
+          "${control[@]}" config --quiet
+          "${control[@]}" -f examples/docker/engine.yaml config --quiet
+      - name: Check isolated PostgreSQL projects
+        run: bash examples/docker/smoke-profile.sh

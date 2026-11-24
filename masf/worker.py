@@ -188,6 +188,9 @@ class Worker:
                 "diff", "--no-renames", "--name-only", "-z", j["base"], candidate
             ).split("\0")
             for path in paths:
+                approval = j.get("path_approvals", {}).get(path, {})
+                if approval.get("fingerprint") == j["fingerprint"]:
+                    continue
                 if any(
                     fnmatch.fnmatchcase(path, pattern)
                     for pattern in repo.get("protected_paths", [])

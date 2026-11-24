@@ -1,4 +1,6 @@
 import argparse
+import fnmatch
+from datetime import datetime, timezone
 import fcntl
 import json
 import os
@@ -8,7 +10,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .config import ConfigError, load, xdg
 from .queue import (
@@ -153,7 +155,7 @@ def tick(db, cfg, config, root, once):
     return errors
 
 
-def resume(db, cfg, target):
+def resume(db, cfg, target, allow_protected_paths=()):
     slug, number = target.rsplit("#", 1)
     row = db.execute(
         "SELECT data FROM jobs WHERE slug=? AND number=? AND state IN ('needs_input','blocked')",
@@ -169,6 +171,38 @@ def resume(db, cfg, target):
         j["repo"]["routing"] = current["routing"]
         j.pop("review", None)
     issue = api(f"repos/{slug}/issues/{number}")
+    if allow_protected_paths:
+        if (
+            j["state"] != "blocked"
+            or not j.get("candidate")
+            or not eligible(issue, j["repo"])
+            or fingerprint(issue) != j["fingerprint"]
+        ):
+            raise ValueError(
+                "La autorización requiere un trabajo bloqueado con candidato y alcance vigente"
+            )
+        approvals = dict(j.get("path_approvals", {}))
+        for path in allow_protected_paths:
+            normalized = PurePosixPath(path)
+            if (
+                not path
+                or normalized.is_absolute()
+                or str(normalized) != path
+                or any(part in (".", "..", ".git") for part in normalized.parts)
+                or any(char in path for char in "*?[]\\")
+                or not any(
+                    fnmatch.fnmatchcase(path, pattern)
+                    for pattern in j["repo"].get("protected_paths", [])
+                )
+            ):
+                raise ValueError(
+                    "Indica una ruta protegida exacta relativa al repositorio"
+                )
+            approvals[path] = {
+                "candidate": j["candidate"],
+                "fingerprint": j["fingerprint"],
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
     if not eligible(issue, j["repo"]):
         save(db, j, "cancelled")
     elif fingerprint(issue) != j["fingerprint"] or j["state"] == "needs_input":
@@ -185,7 +219,10 @@ def resume(db, cfg, target):
             reason="",
         )
     else:
-        save(db, j, j.get("retry", "queued"), reason="")
+        updates = {"reason": ""}
+        if allow_protected_paths:
+            updates["path_approvals"] = approvals
+        save(db, j, j.get("retry", "queued"), **updates)
 
 
 def main():
@@ -197,7 +234,14 @@ def main():
     subs.add_parser("doctor").add_argument("--offline", action="store_true")
     subs.add_parser("scan").add_argument("--dry-run", action="store_true")
     subs.add_parser("run").add_argument("--once", action="store_true", required=True)
-    subs.add_parser("resume").add_argument("issue")
+    resume_parser = subs.add_parser("resume")
+    resume_parser.add_argument("issue")
+    resume_parser.add_argument(
+        "--allow-protected-path",
+        action="append",
+        default=[],
+        help="Autoriza una ruta exacta para este trabajo y su alcance vigente",
+    )
     subs.add_parser("status")
     subs.add_parser("serve")
     args = parser.parse_args()
@@ -233,7 +277,7 @@ def main():
                 try:
                     fcntl.flock(lock, fcntl.LOCK_EX)
                     if args.cmd == "resume":
-                        resume(db, cfg, args.issue)
+                        resume(db, cfg, args.issue, args.allow_protected_path)
                         return 0
                     errors = tick(db, load(config), config, root, args.cmd == "run")
                 except Exception as exc:

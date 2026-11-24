@@ -139,3 +139,5 @@ Antes de entregar una actualización, los checks de `main` deben pasar dentro de
 La regresión de Cursor usa una muestra de la CLI `2026.11.11-b912975`, sin credenciales. Su envoltura JSON puede concatenar progreso y respuesta en `result`. El adaptador debe aceptar el objeto final completo y rechazar objetos truncados o seguidos de texto adicional.
 
 La entrada de procesos usa un archivo temporal privado para conservar prompts grandes mientras se consulta el plazo o la elegibilidad. Una regresión con un lector lento verifica el contenido completo en Python 3.11 y versiones posteriores.
+
+La aceptación de I2 incluye autorizar con `resume --allow-protected-path RUTA` un archivo exacto de un trabajo bloqueado. La regresión debe conservar el candidato y las rondas, rechazar comodines y rutas no canónicas, mantener la comprobación de otros archivos e invalidar el permiso si cambia la huella de la issue.

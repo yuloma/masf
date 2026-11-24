@@ -81,7 +81,13 @@ class Contracts(unittest.TestCase):
         for name, example in examples.items():
             with self.subTest(name=name):
                 self.assertEqual(
-                    providers.parse(name, "review", json.dumps(example))[0], result
+                    providers.parse(
+                        name,
+                        "review",
+                        json.dumps(example)
+                        + ('\n{"type":"turn.completed"}' if name == "codex" else ""),
+                    )[0],
+                    result,
                 )
                 with self.assertRaises(ValueError):
                     providers.parse(name, "build", json.dumps(example))
@@ -154,7 +160,7 @@ class Delivery(TemporaryTest):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def agent(self, role, job, cfg, workspace, inputs, owner):
+    def agent(self, role, job, cfg, workspace, inputs, owner, *, guard=None):
         self.roles.append(role)
         if role == "plan":
             result = {"criteria": ["AC1 greet"]}
@@ -277,6 +283,94 @@ class Delivery(TemporaryTest):
         )
         self.assertEqual(restored["candidate"], self.job["candidate"])
         self.assertEqual(restored["state"], "publishing")
+
+    def test_recover_created_pr_after_base_advanced(self):
+        self.crash = True
+        with self.assertRaisesRegex(RuntimeError, "lost response"):
+            self.worker.process()
+        self.crash = False
+        original = self.job["candidate"]
+        (self.source / "other").write_text("new base")
+        command(["git", "add", "."], cwd=self.source)
+        command(
+            [
+                "git",
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.org",
+                "commit",
+                "-m",
+                "advance",
+            ],
+            cwd=self.source,
+        )
+        self.base = command(["git", "rev-parse", "HEAD"], cwd=self.source)
+        self.worker.process()
+        self.assertEqual(self.job["state"], "pr_open")
+        self.assertEqual(self.job["candidate"], original)
+        self.assertEqual(self.roles, ["plan", "build", "review"])
+        self.assertEqual(len(self.prs), 1)
+
+    def test_recover_pushed_branch_after_base_advanced(self):
+        self.deny = True
+        with self.assertRaisesRegex(RuntimeError, "403"):
+            self.worker.process()
+        previous = self.job["candidate"]
+        (self.source / "other").write_text("new base")
+        command(["git", "add", "."], cwd=self.source)
+        command(
+            [
+                "git",
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.org",
+                "commit",
+                "-m",
+                "advance",
+            ],
+            cwd=self.source,
+        )
+        self.base = command(["git", "rev-parse", "HEAD"], cwd=self.source)
+        self.deny = False
+        self.worker.process()
+        self.assertEqual(self.job["state"], "pr_open")
+        self.assertNotEqual(self.job["candidate"], previous)
+        self.assertEqual(self.roles, ["plan", "build", "review", "review"])
+        self.assertEqual(self.job["checks"]["sha"], self.job["candidate"])
+
+    def test_infrastructure_failure_resumes_checks(self):
+        original = self.worker.test
+
+        def failing_check(sha):
+            if sha == self.base:
+                return original(sha)
+            return {
+                "sha": sha,
+                "passed": False,
+                "failure_kind": "infrastructure",
+                "commands": [],
+            }
+
+        self.worker.test = failing_check
+        with self.assertRaisesRegex(RuntimeError, "infraestructura"):
+            self.worker.process()
+        candidate = self.job["candidate"]
+        self.assertEqual(self.job["state"], "checking")
+        self.assertEqual(self.job["rounds"], 1)
+        self.worker.test = original
+        self.worker.process()
+        self.assertEqual(self.job["candidate"], candidate)
+        self.assertEqual(self.roles, ["plan", "build", "review"])
+
+    def test_guard_preserves_cancelled_state(self):
+        from masf.system import TaskStopped
+
+        self.issue["labels"] = []
+        with self.assertRaises(TaskStopped):
+            self.worker.guard()
+        self.assertEqual(self.job["state"], "cancelled")
 
 
 class Leases(TemporaryTest):

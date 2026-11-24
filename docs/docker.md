@@ -94,3 +94,15 @@ MASF_SMOKE_BASE_SUBNET=10.253.248.0/28 MASF_SMOKE_CANDIDATE_SUBNET=10.253.248.16
 ```
 
 Para verificar el motor desde Linux, instala el paquete en un entorno virtual con `python -m pip install .`, ejecuta `python -m unittest discover -v` y activa las pruebas de Docker con `MASF_TEST_ENGINE=1 python -m unittest tests.test_engine -v`. Estas últimas aceptan las mismas dos variables de subred. La alternativa nativa incluye un [servicio de usuario de systemd](../examples/systemd/masf.service). Instala el entorno virtual en la ruta de su `ExecStart`, configura las variables de autenticación en `~/.config/masf/service.env` con permisos 0600, copia la unidad a `~/.config/systemd/user/` y ejecuta `systemctl --user enable --now masf`. Para mantenerlo tras el cierre de sesión, habilita la persistencia del gestor de usuario con `loginctl enable-linger "$USER"`.
+
+## Operación continua y reanudación
+
+La imagen de runtime incluye PyYAML, requerido por el paquete y sus pruebas. Después de actualizar MASF, reconstruye también el runner para que los checks del nuevo código dispongan de sus dependencias. Comprueba la rama base con ese runner antes de admitir issues.
+
+Un fallo de infraestructura durante los checks conserva el candidato y deja el trabajo bloqueado en esa etapa. Tras corregir la causa, `resume OWNER/REPO#N` repite la comprobación del mismo SHA. Un resultado funcional fallido permite otra ronda de construcción dentro del límite configurado. El plazo `step_timeout_seconds` comprende el arranque del entorno y la suma de los comandos de preparación y comprobación. La limpieza dispone de su propio plazo para retirar los recursos.
+
+Durante una etapa activa se consulta la issue cada cinco segundos, sujeto al tiempo de respuesta de GitHub. Si se cierra, pierde la etiqueta o cambia su contenido, se interrumpe el proceso y se retiran los recursos de comprobación. El estado registrado distingue cancelación de una petición que requiere confirmar el nuevo alcance.
+
+Al recuperar una publicación, se busca primero el PR creado por ese trabajo y se contrasta su SHA con la evidencia guardada. Una rama base que haya avanzado después de publicar conserva el PR recuperado. Cuando solo se alcanzó a subir la rama, su intención persistida permite actualizarla con una condición de SHA para repetir las verificaciones antes de abrir el PR.
+
+El sondeo respeta `Retry-After` y el reinicio de la cuota comunicado por GitHub. Un fallo aislado al consultar un PR se registra y permite atender otros trabajos. La autenticación caducada del proveedor se muestra como bloqueo y requiere renovar su acceso en el host antes de reanudar.

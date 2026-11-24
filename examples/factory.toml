@@ -5,6 +5,7 @@ version = 1
 poll_seconds = 60
 max_parallel_jobs = 1
 max_build_rounds = 2
+# Plazo total de cada etapa, incluida la suma de setup y checks.
 step_timeout_seconds = 900
 
 [runner]

@@ -51,7 +51,7 @@ export GH_TOKEN="$(gh auth token)"
 "${control[@]}" logs --tail 40 controller
 ```
 
-Para actualizar, construye las imágenes de la nueva revisión y ejecuta `"${control[@]}" up -d --force-recreate controller` cuando la cola esté en reposo. Los bind mounts conservan la base y los trabajos. Si un proveedor rechaza la autenticación, renueva el acceso de su CLI y usa `"${control[@]}" run --rm controller resume OWNER/REPO#N`. Una reasignación de roles en el TOML se aplica a una tarea bloqueada al reanudarla.
+Para actualizar, construye las imágenes del controlador y del runner de la nueva revisión y ejecuta `"${control[@]}" up -d --force-recreate controller` cuando la cola esté en reposo. Los bind mounts conservan la base y los trabajos. Si un proveedor rechaza la autenticación, renueva el acceso de su CLI y usa `"${control[@]}" run --rm controller resume OWNER/REPO#N`. Una reasignación de roles en el TOML se aplica a una tarea bloqueada al reanudarla.
 
 ## Cómo funciona
 

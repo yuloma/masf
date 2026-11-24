@@ -1,6 +1,6 @@
 FROM docker:27-cli AS engine
 FROM debian:bookworm-slim AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates git ripgrep && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-yaml ca-certificates git ripgrep && rm -rf /var/lib/apt/lists/*
 FROM runtime AS controller
 ARG MASF_REVISION=unknown
 LABEL org.opencontainers.image.revision=$MASF_REVISION

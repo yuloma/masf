@@ -23,6 +23,7 @@ def parse(provider, role, output):
     meta = {}
     if provider == "codex":
         messages = []
+        completed = False
         for line in output.splitlines():
             event = json.loads(line)
             if event["type"] in ("error", "turn.failed"):
@@ -32,8 +33,12 @@ def parse(provider, role, output):
             item = event.get("item", {})
             if item.get("type") == "agent_message":
                 messages.append(item["text"])
+            if event["type"] == "turn.completed":
+                completed = True
             if "usage" in event:
                 meta["usage"] = event["usage"]
+        if not completed:
+            raise ValueError("Codex: flujo incompleto, falta turn.completed")
         if not messages:
             raise ValueError("Codex: falta el mensaje final")
         payload = messages[-1]
@@ -80,7 +85,7 @@ def parse(provider, role, output):
     return payload, meta
 
 
-def invoke(role, job, cfg, workspace, inputs, owner):
+def invoke(role, job, cfg, workspace, inputs, owner, *, guard=None):
     provider = job["repo"]["routing"][role]
     settings = cfg["providers"][provider]
     exe = settings["executable"]
@@ -180,6 +185,7 @@ def invoke(role, job, cfg, workspace, inputs, owner):
                 env=docker_env(),
                 stdin=None if provider == "cursor" else prompt,
                 timeout=cfg["service"]["step_timeout_seconds"],
+                guard=guard,
             )
             result, meta = parse(provider, role, output)
         finally:

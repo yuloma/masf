@@ -22,3 +22,8 @@ jobs:
       - run: /tmp/masf-venv/bin/python -m unittest discover -v
       - run: /tmp/masf-venv/bin/masf --config examples/factory.toml doctor --offline
       - run: docker build --target controller -t masf-controller:pilot .
+      - run: docker build --target runtime -t masf-runner:pilot .
+      - name: Verify checks and cleanup with local Docker
+        env:
+          MASF_TEST_ENGINE: "1"
+        run: /tmp/masf-venv/bin/python -m unittest tests.test_engine -v

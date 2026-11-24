@@ -139,3 +139,25 @@ Antes de entregar una actualización, los checks de `main` deben pasar dentro de
 La regresión de Cursor usa una muestra de la CLI `2026.11.11-b912975`, sin credenciales. Su envoltura JSON puede concatenar progreso y respuesta en `result`. El adaptador debe aceptar el objeto final completo y rechazar objetos truncados o seguidos de texto adicional.
 
 La entrada de procesos usa un archivo temporal privado para conservar prompts grandes mientras se consulta el plazo o la elegibilidad. Una regresión con un lector lento verifica el contenido completo en Python 3.11 y versiones posteriores.
+
+### Recuperación tras terminar el controlador
+
+Desde la raíz del repositorio, con las dependencias de MASF instaladas, ejecuta:
+
+```bash
+python3 -m unittest tests.test_process_recovery.ProcessRecovery -v
+```
+
+Los cinco casos arrancan la CLI con `run --once`, un remoto Git temporal, un servidor HTTP de GitHub en loopback y un proveedor de prueba. Ejecutan un check de prueba en la copia local de cada SHA y funcionan sin Docker, credenciales ni cuentas de IA. El proceso recibe `SIGKILL` tras confirmar la reserva, el push o la creación del PR en el simulador. El harness verifica que la reserva vigente impide otro intento y adelanta su vencimiento en SQLite para que la CLI la reclame sin esperar 90 segundos.
+
+Los casos de publicación repiten el escenario con la base estable y con un avance de `main`. Si solo se subió la rama y la base avanzó, el reemplazo verifica la nueva base y el nuevo candidato y vuelve a revisar el candidato antes de crear el PR. Si ya se creó el PR, recupera su número y su SHA originales. Los registros de roles y checks comprueban la reutilización de la evidencia vigente. Las regresiones con excepciones simuladas siguen formando parte de la suite.
+
+Para interrumpir un check real dentro de Compose, usa un Docker Engine local con el plugin Compose y la imagen `masf-runner:pilot` ya disponible. La CI ejecuta el caso en el paso de pruebas con Docker tras construir esa imagen:
+
+```bash
+MASF_TEST_ENGINE=1 python3 -m unittest tests.test_process_recovery.ComposeProcessRecovery -v
+```
+
+El caso Compose espera una señal escrita por el check dentro del contenedor antes de matar el controlador. Después cambia el volumen declarado en el perfil del operador. El reemplazo retira el proyecto anterior con el manifiesto congelado, completa el check en un proyecto nuevo y retira sus recursos y su journal. Un proyecto Compose de control conserva su contenedor, su red y el dato guardado en su volumen durante y después de la recuperación.
+
+**Resultado observado con Python 3.11.2.** `python3 -m unittest discover -v` descubrió 55 pruebas. Pasaron 45, incluidos los cinco casos de recuperación sin Engine, y se omitieron 10 por requerir Docker Engine. El caso de recuperación con Compose queda pendiente de ejecución en un entorno con Docker local.

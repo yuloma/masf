@@ -15,6 +15,17 @@ Deja el servicio en marcha y dame el PR en borrador que la fábrica haya generad
 
 Puedes añadir el `OWNER/REPO` del piloto al mensaje. Si abres el agente en un checkout de MASF, usará el manual de esa revisión. Para la prueba real necesitarás un repositorio donde puedas abrir un PR y acceso a una cuenta de al menos un proveedor. [Instrucciones de instalación](INSTALL.md).
 
+**Estado de esta revisión.** El repositorio contiene la especificación y un piloto ejecutable de Docker. La primera ejecución del prompt incluye implementar el motor y los adaptadores pendientes. Cuando la revisión elegida ya incluya la fábrica completa, el mismo prompt instalará y verificará esa versión.
+
+El prompt elige Docker Compose para el controlador central salvo que pidas la instalación nativa en Linux. En ambos casos, un proyecto que solo funciona en Docker podrá levantar su aplicación y sus dependencias para cada tarea. El perfil de PostgreSQL ya se puede probar con `bash examples/docker/smoke-profile.sh` en un host con Docker. [Despliegue y ejecución en Docker](docs/docker.md).
+
+```text
+Instala en esta máquina la fábrica global de https://github.com/yuloma/masf. Sigue su INSTALL.md e implementa en MASF lo que falte.
+Deja el servicio en marcha y dame el PR en borrador que la fábrica haya generado y verificado a partir de una issue de mi repositorio piloto.
+```
+
+Puedes añadir el `OWNER/REPO` del piloto al mensaje. Si abres el agente en un checkout de MASF, usará el manual de esa revisión. Para la prueba real necesitarás un repositorio donde puedas abrir un PR y acceso a una cuenta de al menos un proveedor. [Instrucciones de instalación](INSTALL.md).
+
 El prompt elige Docker Compose para el controlador central salvo que pidas la instalación nativa en Linux. En ambos casos, un proyecto que solo funciona en Docker podrá levantar su aplicación y sus dependencias para cada tarea. El perfil de PostgreSQL ya se puede probar con `bash examples/docker/smoke-profile.sh` en un host con Docker. [Despliegue y ejecución en Docker](docs/docker.md).
 
 ## Construir y operar el servicio

@@ -745,6 +745,7 @@ class Delivery(TemporaryTest):
         self.assertEqual(
             restored["base_resolutions"][0]["previous_candidate"], previous
         )
+        self.job = restored
         self.worker.job = restored
         self.worker.process()
         self.assertEqual(restored["state"], "pr_open")

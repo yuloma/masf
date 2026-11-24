@@ -10,7 +10,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .config import load, xdg
+from .config import ConfigError, load, xdg
 from .queue import (
     api,
     claim,
@@ -253,6 +253,9 @@ def main():
                     flush=True,
                 )
                 time.sleep(delay)
+    except ConfigError as exc:
+        print(clean(f"{exc} ({config})"), file=sys.stderr)
+        return 1
     except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
         print(clean(str(exc)), file=sys.stderr)
         return 1

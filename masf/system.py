@@ -39,6 +39,8 @@ def command(
             )
             source.write(stdin)
             source.seek(0)
+        if guard:
+            guard()
         proc = stack.enter_context(
             subprocess.Popen(
                 args,

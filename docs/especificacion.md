@@ -40,6 +40,38 @@ Cada intento de construcción cuenta como una ronda. Los fallos de infraestructu
 
 Antes de publicar se releen el estado, la etiqueta y la huella del encargo. Si el autor cambió el contenido, el trabajo pasa a `needs_input` para confirmar el alcance actualizado. Las reglas o instrucciones de proyecto aplicables, incluido un `AGENTS.md` existente, se ponen a disposición de los tres adaptadores. Las convenciones del proyecto orientan la implementación dentro de los permisos fijados por el operador.
 
+## CI de un PR abierto
+
+La etapa del trabajo y la observación de CI se registran por separado. `status` muestra ambas, el SHA observado, los límites y la intervención pendiente. `status --json` expone el estado actual en un objeto por trabajo. `history OWNER/REPO#N` devuelve las transiciones de ese trabajo en JSON por línea, con su intento y evidencia. Los checks locales y la revisión conservan el SHA al que corresponden aunque avance el PR.
+
+| Observación del head vinculado | Decisión |
+| --- | --- |
+| `waiting` o `pending` | `pr_open` sigue observando. Un workflow en curso, un check pendiente o un rerun en ejecución aplaza la decisión. Las conclusiones del head anterior quedan en el historial. |
+| `success` | `pr_open` queda disponible para la decisión de integración del operador. El servicio sigue observando el PR, incluido un rerun posterior. |
+| Fallo funcional confirmado | `building` usa el plan vigente y el head fallido. Recibe el check, la ejecución y el intento de CI, junto con evidencia filtrada y acotada. La reserva y el historial identifican una sola reparación para la observación. |
+| Fallo de infraestructura | `checking` repite la comprobación local del candidato tras la espera configurada, dentro del límite técnico. Si los checks locales pasan sobre el head fallido, `needs_input` pide relanzar el CI remoto. Un error transitorio del sondeo vuelve a intentar la lectura y respeta además la espera comunicada por GitHub. |
+| Acceso, cuota o configuración del CI | `blocked` conserva el diagnóstico y pide resolver la causa y relanzar el CI. |
+| Evidencia insuficiente o límite agotado | `needs_input` muestra el check y la acción solicitada. La falta de evidencia requiere consultar el check y relanzar CI con un resultado clasificable. Las rondas funcionales agotadas requieren aprobación explícita. |
+| Reparación local aprobada | `publishing` registra el número del PR, el SHA remoto esperado y el SHA aprobado por checks y revisión. El push condicionado actualiza la rama existente. `pr_open` vuelve a observar CI para el nuevo SHA. |
+| Head inesperado o alcance modificado | `needs_input` conserva el candidato y muestra la discrepancia. El operador verifica el head o confirma la huella actualizada de la issue. Si el PR se cierra o fusiona, o la issue deja de ser elegible, el trabajo refleja `closed`, `merged` o `cancelled`. |
+
+Se consultan las ejecuciones de GitHub Actions del head y la rama del PR, los check runs de otras integraciones y el último estado por contexto. Los jobs de Actions se toman del intento vigente. La evidencia enlaza los recursos consultados y guarda extractos de anotaciones y logs pertinentes. Un fallo sin señales suficientes requiere intervención. La configuración admite `service.max_ci_technical_retries` (2 por defecto) y `service.ci_retry_seconds` (60 por defecto). Las rondas de reparación funcional cuentan en `max_build_rounds` y se registran también por separado. El checkpoint permite retomar una ronda tras una interrupción y reutilizar el resultado de construcción cuando ya quedó persistido.
+
+### Operaciones del controlador
+
+Ejecuta estos comandos con el TOML y el estado habituales de la instalación. La evidencia indica qué verificó el operador y qué autoriza. Las decisiones quedan asociadas a su identidad local, el trabajo, la huella de la issue y los SHAs correspondientes.
+
+```bash
+masf status --json
+masf history 'OWNER/REPO#10'
+masf resume 'OWNER/REPO#10' --accept-head SHA --evidence 'Diff y procedencia del nuevo head revisados'
+masf resume 'OWNER/REPO#10' --add-rounds 1 --evidence 'Autorizada una ronda para el fallo registrado'
+masf resume 'OWNER/REPO#10' --allow-protected-path .github/workflows/factory.yml
+masf link-pr 'OWNER/REPO#10' --pr 23 --head SHA --evidence 'Issue, PR y alcance verificados'
+```
+
+`--accept-head` requiere el SHA observado en el conflicto y lo contrasta con el PR y su referencia. `--add-rounds` amplía un límite agotado para la huella vigente y puede acompañar la reconciliación del head. Un fallo de CI de acceso, cuota, configuración o evidencia insuficiente se reexamina con `resume` tras atender la causa y solicitar un rerun. Las autorizaciones de rutas siguen siendo por archivo exacto y por trabajo. `link-pr` exige una issue elegible, un PR abierto del mismo repositorio y la rama `masf/issue-N` hacia la base configurada. La vinculación permite iniciar el diagnóstico y solicitar la planificación cuando falte un plan.
+
 ## Proveedores y contrato de etapa
 
 | Id en MASF | Interfaz no interactiva de referencia | Tratamiento del resultado |

@@ -15,11 +15,34 @@ Deja el servicio en marcha y dame el PR en borrador que la fábrica haya generad
 
 Puedes añadir el `OWNER/REPO` del piloto al mensaje. Si abres el agente en un checkout de MASF, usará el manual de esa revisión. Para la prueba real necesitarás un repositorio donde puedas abrir un PR y acceso a una cuenta de al menos un proveedor. [Instrucciones de instalación](INSTALL.md).
 
-**Estado de esta revisión.** El repositorio contiene la especificación y un piloto ejecutable de Docker. La primera ejecución del prompt incluye implementar el motor y los adaptadores pendientes. Cuando la revisión elegida ya incluya la fábrica completa, el mismo prompt instalará y verificará esa versión.
-
 El prompt elige Docker Compose para el controlador central salvo que pidas la instalación nativa en Linux. En ambos casos, un proyecto que solo funciona en Docker podrá levantar su aplicación y sus dependencias para cada tarea. El perfil de PostgreSQL ya se puede probar con `bash examples/docker/smoke-profile.sh` en un host con Docker. [Despliegue y ejecución en Docker](docs/docker.md).
 
-## Cómo se usará
+## Construir y operar el servicio
+
+Desde el checkout que se va a instalar, construye el controlador y empaqueta las distribuciones Linux independientes de las CLIs elegidas. El ejemplo utiliza Codex y Cursor.
+
+```bash
+docker build --target controller -t masf-controller:pilot .
+bash examples/docker/build-runner.sh codex cursor
+```
+
+Prepara el registro externo y el array Bash `control` con ambos manifiestos. Activa el repositorio en el TOML y configura las rutas absolutas de autenticación que leerá Docker en el host. [Directorios y variables](docs/docker.md#desplegar-el-controlador).
+
+```bash
+export MASF_CODEX_AUTH="$HOME/.codex/auth.json"
+export MASF_CURSOR_AUTH="$HOME/.config/cursor/auth.json"
+export GH_TOKEN="$(gh auth token)"
+"${control[@]}" run --rm controller doctor --offline
+"${control[@]}" run --rm controller doctor
+"${control[@]}" run --rm controller scan --dry-run
+"${control[@]}" up -d controller
+"${control[@]}" exec -T controller masf --config /etc/masf/pilot.toml status
+"${control[@]}" logs --tail 40 controller
+```
+
+Para actualizar, construye las imágenes de la nueva revisión y ejecuta `"${control[@]}" up -d --force-recreate controller` cuando la cola esté en reposo. Los bind mounts conservan la base y los trabajos. Si un proveedor rechaza la autenticación, renueva el acceso de su CLI y usa `"${control[@]}" run --rm controller resume OWNER/REPO#N`. Una reasignación de roles en el TOML se aplica a una tarea bloqueada al reanudarla.
+
+## Cómo funciona
 
 1. El operador registra el repositorio, su etiqueta, sus comprobaciones y los proveedores disponibles en la configuración central.
 2. Una persona marca una issue que está lista para desarrollo. El servicio la recoge en el siguiente sondeo y abre un único trabajo para ella.

@@ -1,0 +1,13 @@
+[Unit]
+Description=Controlador central MASF
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/masf/service.env
+ExecStart=%h/.local/share/masf/venv/bin/masf --config %h/.config/masf/config.toml serve
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target

@@ -15,9 +15,20 @@ started=()
 stack() {
   local stage=$1
   shift
+  local extra=() subnet
+  if [[ $stage == base ]]; then
+    subnet=${MASF_SMOKE_BASE_SUBNET:-}
+  else
+    subnet=${MASF_SMOKE_CANDIDATE_SUBNET:-}
+  fi
+  if [[ -n $subnet ]]; then
+    [[ $subnet =~ ^[0-9./]+$ ]] || return 2
+    printf 'networks:\n  default:\n    ipam:\n      config:\n        - subnet: %s\n' "$subnet" > "$scratch/$stage.yaml"
+    extra=(-f "$scratch/$stage.yaml")
+  fi
   MASF_WORKSPACE="$scratch/$stage" "${engine[@]}" compose \
     --env-file /dev/null --project-directory "$profile_dir" \
-    -p "$prefix-$stage" -f "$profile_dir/postgres.yaml" "$@"
+    -p "$prefix-$stage" -f "$profile_dir/postgres.yaml" "${extra[@]}" "$@"
 }
 
 cleanup() {

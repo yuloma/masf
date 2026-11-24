@@ -1,0 +1,4 @@
+**
+!masf/
+!masf/*.py
+!pyproject.toml

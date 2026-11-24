@@ -543,6 +543,74 @@ class Delivery(TemporaryTest):
             self.worker.guard()
         self.assertEqual(self.job["state"], "cancelled")
 
+    def test_resume_approves_one_path_for_one_job(self):
+        from masf.cli import resume
+
+        self.changed = ".github/workflows/factory.yml"
+        with self.assertRaisesRegex(RuntimeError, "protegida"):
+            self.worker.process()
+        candidate = self.job["candidate"]
+        queue.save(
+            self.worker.db,
+            self.job,
+            "blocked",
+            retry="checking",
+            reason="Ruta protegida",
+        )
+        with patch("masf.cli.api", self.api):
+            resume(
+                self.worker.db,
+                self.cfg,
+                f"{self.repo['slug']}#1",
+                [".github/workflows/factory.yml"],
+            )
+        restored = json.loads(
+            self.worker.db.execute("SELECT data FROM jobs").fetchone()[0]
+        )
+        self.assertEqual(restored["candidate"], candidate)
+        self.assertEqual(restored["rounds"], 1)
+        self.assertEqual(restored["repo"]["protected_paths"], [".github/workflows/**"])
+        self.worker.job = restored
+        self.worker.process()
+        self.assertEqual(restored["state"], "pr_open")
+        self.assertEqual(self.roles, ["plan", "build", "review"])
+
+    def test_path_approval_preserves_other_protections(self):
+        self.changed = ".github/workflows/other.yml"
+        self.job["path_approvals"] = {
+            ".github/workflows/factory.yml": {"fingerprint": self.job["fingerprint"]}
+        }
+        with self.assertRaisesRegex(RuntimeError, "protegida"):
+            self.worker.process()
+
+    def test_stale_scope_invalidates_path_approval(self):
+        self.changed = ".github/workflows/factory.yml"
+        self.job["path_approvals"] = {self.changed: {"fingerprint": "old scope"}}
+        with self.assertRaisesRegex(RuntimeError, "protegida"):
+            self.worker.process()
+
+    def test_resume_rejects_broad_or_noncanonical_paths(self):
+        from masf.cli import resume
+
+        self.changed = ".github/workflows/factory.yml"
+        with self.assertRaisesRegex(RuntimeError, "protegida"):
+            self.worker.process()
+        queue.save(self.worker.db, self.job, "blocked", retry="checking")
+        for path in (
+            ".github/**",
+            "/.github/workflows/factory.yml",
+            "../secret",
+            ".github/../factory.yml",
+            ".github//workflows/factory.yml",
+        ):
+            with self.subTest(path=path), patch("masf.cli.api", self.api):
+                with self.assertRaisesRegex(ValueError, "ruta protegida exacta"):
+                    resume(self.worker.db, self.cfg, f"{self.repo['slug']}#1", [path])
+        stored = json.loads(
+            self.worker.db.execute("SELECT data FROM jobs").fetchone()[0]
+        )
+        self.assertNotIn("path_approvals", stored)
+
 
 class Leases(TemporaryTest):
     def test_expired_attempt_cannot_publish(self):

@@ -106,3 +106,13 @@ Durante una etapa activa se consulta la issue cada cinco segundos, sujeto al tie
 Al recuperar una publicación, se busca primero el PR creado por ese trabajo y se contrasta su SHA con la evidencia guardada. Una rama base que haya avanzado después de publicar conserva el PR recuperado. Cuando solo se alcanzó a subir la rama, su intención persistida permite actualizarla con una condición de SHA para repetir las verificaciones antes de abrir el PR.
 
 El sondeo respeta `Retry-After` y el reinicio de la cuota comunicado por GitHub. Un fallo aislado al consultar un PR se registra y permite atender otros trabajos. La autenticación caducada del proveedor se muestra como bloqueo y requiere renovar su acceso en el host antes de reanudar.
+
+## Autorizar una ruta protegida para un trabajo
+
+Cuando un candidato modifica una ruta protegida, `status` muestra el archivo y el trabajo pasa a `blocked`. Revisa el diff y, con autorización del operador, utiliza una ruta exacta al reanudar.
+
+```bash
+"${control[@]}" run --rm controller resume OWNER/REPO#N --allow-protected-path .github/workflows/factory.yml
+```
+
+La opción se puede repetir para varios archivos. Cada autorización queda asociada al trabajo y a la huella vigente de la issue, con fecha y SHA del candidato autorizado. El servicio comprueba las demás rutas protegidas usando el perfil del trabajo. Un cambio del contenido de la issue requiere confirmar el alcance y volver a autorizar las rutas necesarias. La reanudación conserva el candidato y continúa desde la etapa bloqueada.

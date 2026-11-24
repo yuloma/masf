@@ -147,3 +147,5 @@ La aceptación de recuperación de I2 incluye una construcción interrumpida tra
 La aceptación de diagnóstico de I3 incluye salida en streaming de Cursor con resultado terminal, rechazo de flujos incompletos y conservación de actividad anterior a un timeout. Un proceso que produce abundante stderr debe terminar y entregar su actividad sin bloquear la captura.
 
 La aceptación de Cursor comprueba además una revisión no interactiva capaz de utilizar Shell para lectura y verificación, con el código montado para lectura. El diff del candidato se entrega con sus saltos de línea y el contenido del transporte estructurado permanece fuera de los mensajes persistidos de error.
+
+La aceptación de I2 incluye un conflicto real al avanzar la base y su resolución mediante `resume --resolved-commit SHA`. Se verifica que el commit integra candidato y base, que se rechazan referencias o commits ajenos, que se conserva el número de rondas y que se repiten los checks y la revisión sobre el SHA resuelto.

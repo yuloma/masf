@@ -679,6 +679,105 @@ class Delivery(TemporaryTest):
             with self.subTest(path=path), self.assertRaises(ValueError):
                 saved_workspace(self.worker.root, path)
 
+    def test_resolve_base_conflict_and_reverify_new_commit(self):
+        from masf.cli import resume
+
+        self.changed = "README"
+        original = self.agent
+        advanced = False
+
+        def advance(role, job, cfg, workspace, inputs, owner, **kwargs):
+            nonlocal advanced
+            result = original(role, job, cfg, workspace, inputs, owner, **kwargs)
+            if role == "review" and not advanced:
+                advanced = True
+                (self.source / "README").write_text("new main")
+                command(["git", "add", "."], cwd=self.source)
+                command(
+                    [
+                        "git",
+                        "-c",
+                        "user.name=test",
+                        "-c",
+                        "user.email=test@example.org",
+                        "commit",
+                        "-m",
+                        "advance",
+                    ],
+                    cwd=self.source,
+                )
+                self.base = command(["git", "rev-parse", "HEAD"], cwd=self.source)
+            return result
+
+        with patch.object(worker.providers, "invoke", advance):
+            with self.assertRaisesRegex(
+                RuntimeError, "Conflicto al actualizar la base en README"
+            ):
+                self.worker.process()
+        previous = self.job["candidate"]
+        self.assertEqual(self.job["base_conflict"]["paths"], ["README"])
+        workspace = self.worker.checkout(previous)
+        (workspace / "README").write_text("resolved")
+        self.worker.git("add", "-A", "--", ".", workspace=workspace)
+        tree = self.worker.git("write-tree")
+        resolved = self.worker.git(
+            "commit-tree", tree, "-p", previous, "-p", self.base, "-m", "resolve"
+        )
+        queue.save(self.worker.db, self.job, "blocked", retry="publishing")
+        with (
+            patch("masf.cli.api", self.api),
+            patch("masf.cli.latest", return_value=self.base),
+            patch.dict("os.environ", {"MASF_JOBS_DIR": str(self.root / "jobs")}),
+        ):
+            resume(
+                self.worker.db,
+                self.cfg,
+                f"{self.repo['slug']}#1",
+                resolved_commit=resolved,
+            )
+        restored = json.loads(
+            self.worker.db.execute("SELECT data FROM jobs").fetchone()[0]
+        )
+        self.assertEqual(restored["state"], "checking")
+        self.assertEqual(restored["rounds"], 1)
+        self.assertNotIn("checks", restored)
+        self.assertNotIn("review", restored)
+        self.assertEqual(
+            restored["base_resolutions"][0]["previous_candidate"], previous
+        )
+        self.worker.job = restored
+        self.worker.process()
+        self.assertEqual(restored["state"], "pr_open")
+        self.assertEqual(restored["checks"]["sha"], resolved)
+        self.assertEqual(restored["review"]["sha"], resolved)
+
+    def test_resolved_commit_rejects_unrelated_and_invalid_commits(self):
+        from masf.cli import resume
+
+        self.deny = True
+        with self.assertRaisesRegex(RuntimeError, "403"):
+            self.worker.process()
+        queue.save(self.worker.db, self.job, "blocked", retry="publishing")
+        for value in ("HEAD", self.base):
+            with (
+                self.subTest(value=value),
+                patch("masf.cli.api", self.api),
+                patch("masf.cli.latest", return_value=self.base),
+                patch.dict("os.environ", {"MASF_JOBS_DIR": str(self.root / "jobs")}),
+            ):
+                with self.assertRaises(ValueError):
+                    resume(
+                        self.worker.db,
+                        self.cfg,
+                        f"{self.repo['slug']}#1",
+                        resolved_commit=value,
+                    )
+        stored = json.loads(
+            self.worker.db.execute("SELECT data FROM jobs").fetchone()[0]
+        )
+        self.assertEqual(stored["state"], "blocked")
+        self.assertEqual(stored["candidate"], self.job["candidate"])
+
 
 class Leases(TemporaryTest):
     def test_expired_attempt_cannot_publish(self):

@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 import fnmatch
 import json
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -10,7 +11,7 @@ from urllib.parse import urlencode
 
 from . import checks, providers
 from .queue import api, eligible, fingerprint, latest, save
-from .system import TaskStopped, clean, command, docker_env
+from .system import ProcessError, TaskStopped, clean, command, docker_env
 
 
 def saved_workspace(root, path):
@@ -306,7 +307,31 @@ class Worker:
             current = latest(j["slug"], j["branch"])
             if current != j["base"]:
                 self.git("fetch", "--no-tags", self.url, current)
-                tree = self.git("merge-tree", "--write-tree", current, candidate)
+                try:
+                    tree = self.git("merge-tree", "--write-tree", current, candidate)
+                except ProcessError as exc:
+                    if "CONFLICT" not in exc.stdout:
+                        raise
+                    paths = sorted(
+                        set(
+                            re.findall(
+                                r"^\d+ [0-9a-f]+ [123]\t(.+)$", exc.stdout, re.MULTILINE
+                            )
+                        )
+                    )
+                    self.update(
+                        "publishing",
+                        base_conflict={
+                            "base": current,
+                            "candidate": candidate,
+                            "paths": paths,
+                        },
+                    )
+                    raise RuntimeError(
+                        "Conflicto al actualizar la base en "
+                        + ", ".join(paths)
+                        + ". Resuelve el merge y usa resume --resolved-commit SHA"
+                    ) from None
                 rebased = self.git("commit-tree", tree, "-p", current, "-m", j["title"])
                 if not self.test(current)["passed"]:
                     raise RuntimeError("Fallan los checks de la nueva base")

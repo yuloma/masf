@@ -3,6 +3,7 @@ import fnmatch
 from datetime import datetime, timezone
 import fcntl
 import json
+import re
 import os
 import sqlite3
 import sys
@@ -20,6 +21,7 @@ from .queue import (
     eligible,
     fingerprint,
     renew,
+    latest,
     retry_delay,
     save,
     scan,
@@ -155,7 +157,14 @@ def tick(db, cfg, config, root, once):
     return errors
 
 
-def resume(db, cfg, target, allow_protected_paths=(), reuse_workspace=None):
+def resume(
+    db,
+    cfg,
+    target,
+    allow_protected_paths=(),
+    reuse_workspace=None,
+    resolved_commit=None,
+):
     slug, number = target.rsplit("#", 1)
     row = db.execute(
         "SELECT data FROM jobs WHERE slug=? AND number=? AND state IN ('needs_input','blocked')",
@@ -203,6 +212,43 @@ def resume(db, cfg, target, allow_protected_paths=(), reuse_workspace=None):
                 "fingerprint": j["fingerprint"],
                 "at": datetime.now(timezone.utc).isoformat(),
             }
+    resolution = None
+    if resolved_commit is not None:
+        if (
+            not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", resolved_commit)
+            or j["state"] != "blocked"
+            or j.get("retry") != "publishing"
+            or not j.get("candidate")
+            or j.get("pr_number")
+            or not eligible(issue, j["repo"])
+            or fingerprint(issue) != j["fingerprint"]
+        ):
+            raise ValueError(
+                "La resolución requiere un commit completo y una publicación bloqueada con alcance vigente"
+            )
+        jobs = Path(
+            os.environ.get("MASF_JOBS_DIR") or xdg("DATA", ".local/share") / "jobs"
+        )
+        store = jobs / f"{j['repo_id']}-{j['number']}" / "git"
+        git = ["git", "--git-dir", str(store)]
+        current_base = latest(slug, j["branch"])
+        command(git + ["rev-parse", "--verify", resolved_commit + "^{commit}"])
+        for ancestor in (j["candidate"], current_base):
+            try:
+                command(
+                    git + ["merge-base", "--is-ancestor", ancestor, resolved_commit]
+                )
+            except RuntimeError:
+                raise ValueError(
+                    "El commit resuelto debe incluir el candidato y la base actual"
+                ) from None
+        resolution = {
+            "previous_base": j["base"],
+            "previous_candidate": j["candidate"],
+            "base": current_base,
+            "candidate": resolved_commit,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
     if reuse_workspace is not None:
         if (
             j["state"] != "blocked"
@@ -253,7 +299,17 @@ def resume(db, cfg, target, allow_protected_paths=(), reuse_workspace=None):
             updates["path_approvals"] = approvals
         if reuse_workspace is not None:
             updates["build_workspace"] = checkpoint
-        save(db, j, j.get("retry", "queued"), **updates)
+        state = j.get("retry", "queued")
+        if resolution is not None:
+            for key in ("checks", "review", "base_checked", "base_conflict"):
+                j.pop(key, None)
+            updates.update(
+                base=resolution["base"],
+                candidate=resolved_commit,
+                base_resolutions=[*(j.get("base_resolutions") or []), resolution],
+            )
+            state = "checking"
+        save(db, j, state, **updates)
 
 
 def main():
@@ -277,6 +333,10 @@ def main():
         "--reuse-workspace",
         type=Path,
         help="Recupera una copia conservada de este trabajo tras una interrupción",
+    )
+    resume_parser.add_argument(
+        "--resolved-commit",
+        help="Selecciona un commit local que resuelve la actualización de base",
     )
     subs.add_parser("status")
     subs.add_parser("serve")
@@ -319,6 +379,7 @@ def main():
                             args.issue,
                             args.allow_protected_path,
                             args.reuse_workspace,
+                            args.resolved_commit,
                         )
                         return 0
                     errors = tick(db, load(config), config, root, args.cmd == "run")

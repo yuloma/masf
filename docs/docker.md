@@ -138,3 +138,15 @@ Cursor se ejecuta con salida `stream-json`. El adaptador exige un resultado term
 Al actualizar una CLI en el host, reconstruye el runner con `bash examples/docker/build-runner.sh codex cursor` para que el servicio utilice esa distribución.
 
 El modo no interactivo de Cursor permite ejecutar las herramientas necesarias durante la revisión; Docker monta el código para lectura en los roles plan y review. El encargo se presenta con metadatos legibles y el diff en líneas independientes para que las herramientas de lectura puedan inspeccionarlo sin truncar una única línea JSON extensa.
+
+## Resolver un conflicto de actualización de base
+
+Si la rama base avanza y Git detecta un conflicto, el trabajo queda bloqueado con las rutas afectadas. El operador puede resolver el merge en un clon independiente y traer el commit resultante al almacén Git del trabajo.
+
+El commit de resolución debe incluir como antecesores tanto el candidato conservado como la base actual. Tras revisar la resolución, se puede seleccionar con el comando siguiente.
+
+```bash
+"${control[@]}" run --rm controller resume OWNER/REPO#N --resolved-commit SHA_COMPLETO
+```
+
+Esta operación se aplica a una publicación bloqueada antes de registrar un PR. Conserva el plan y las rondas, registra los SHAs anteriores y la resolución, e inicia la comprobación de la nueva base y del candidato resuelto. El nuevo SHA recibe checks y revisión antes de publicarse.

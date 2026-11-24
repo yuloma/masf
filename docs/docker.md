@@ -1,6 +1,6 @@
 # MASF en Docker y proyectos que usan Compose
 
-El controlador se podrá instalar en un contenedor o en un entorno virtual de Linux. En ambas instalaciones cada repositorio podrá ejecutar sus comprobaciones en una imagen individual o en un conjunto de servicios Compose. Un solo controlador podrá mantener repositorios de ambos tipos y repartir los roles entre Codex, Cursor y Claude Code.
+El controlador se puede instalar en un contenedor o en un entorno virtual de Linux. En ambas instalaciones cada repositorio podrá ejecutar sus comprobaciones en una imagen individual o en un conjunto de servicios Compose. Un solo controlador podrá mantener repositorios de ambos tipos y repartir los roles entre Codex, Cursor y Claude Code.
 
 | Pieza | Dónde se ejecuta | Qué conserva |
 | --- | --- | --- |
@@ -10,7 +10,7 @@ El controlador se podrá instalar en un contenedor o en un entorno virtual de Li
 
 ## Desplegar el controlador
 
-El [manifiesto central](../examples/docker/compose.yaml) describe el despliegue. La imagen local `masf-controller:pilot` y el ejecutable `masf` son entregables de I1. Esta revisión permite probar el [perfil de proyecto](#probar-el-perfil-sin-instalar-masf) independientemente del controlador.
+El [manifiesto central](../examples/docker/compose.yaml) describe el despliegue. La imagen local `masf-controller:pilot` instala el ejecutable `masf`. También puedes probar el [perfil de proyecto](#probar-el-perfil-sin-instalar-masf) independientemente del controlador.
 
 En el host del piloto se necesita Linux con Docker Engine local y el plugin Docker Compose con soporte de `up --wait`. La imagen de I1 incluye MASF, sus dependencias, Git y `gh`. Desde I2 incluye también el cliente Docker y el plugin Compose. Las CLIs de IA van en las imágenes de los agentes. El host puede ejecutar el piloto contenedorizado con Docker y las utilidades habituales de Linux, aunque carezca de Python, PHP, PostgreSQL o un editor abierto.
 
@@ -74,3 +74,23 @@ Desde la raíz del repositorio, consulta la ayuda con `bash examples/docker/smok
 Desde un host Linux con Docker y Compose, `bash examples/docker/smoke-profile.sh` prueba el [perfil de PostgreSQL](../examples/profiles/postgres.yaml) sin credenciales de GitHub ni de IA. Usa la imagen `postgres:17-alpine` y la descarga si falta. Ejecuta `psql` desde `app` contra `db`, crea una tabla en dos proyectos simultáneos y escribe una fila en la base. Comprueba que el candidato empieza vacío y que la base conserva su fila. Al salir retira los dos proyectos y sus volúmenes. Las credenciales de ejemplo solo abren la base efímera de este perfil, que usa una red interna sin puertos publicados.
 
 El [workflow del piloto](../.github/workflows/docker-pilot.yml) valida con `docker compose config` el manifiesto central solo y con la extensión de acceso al motor. Después ejecuta el mismo script en un runner Linux de GitHub al cambiar los manifiestos o la prueba.
+
+## Autenticación y diagnóstico
+
+El servicio arranca con la credencial de GitHub del controlador. Para cada proveedor asignado, exporta la ruta en el host del archivo de autenticación de su CLI antes de crear el controlador. El runner recibe ese archivo por separado y trabaja con una copia en memoria durante la etapa.
+
+| Proveedor | Distribución Linux para la imagen | Archivo de autenticación en el host |
+| --- | --- | --- |
+| Codex | Binario independiente y sus auxiliares | `MASF_CODEX_AUTH=$HOME/.codex/auth.json` tras `codex login` |
+| Cursor | Directorio de la versión instalada de Cursor Agent | `MASF_CURSOR_AUTH=$HOME/.config/cursor/auth.json` tras `agent login` con almacén de archivo |
+| Claude Code | Instalación nativa de `claude` | `MASF_CLAUDE_AUTH=$HOME/.claude/.credentials.json` tras autenticar la CLI en Linux |
+
+`doctor` comprueba la lectura en GitHub, Docker, Compose y la versión de cada ejecutable asignado. La disponibilidad efectiva de cada cuenta para generar una respuesta se registra al ejecutar el rol. Si los tokens caducan, renueva la sesión en el host.
+
+Cuando Docker agota su reserva automática de redes, puedes asignar dos subredes libres a la prueba de PostgreSQL. Este ejemplo requiere que las dos subredes estén libres en el host y en el Engine.
+
+```bash
+MASF_SMOKE_BASE_SUBNET=10.253.248.0/28 MASF_SMOKE_CANDIDATE_SUBNET=10.253.248.16/28 bash examples/docker/smoke-profile.sh
+```
+
+Para verificar el motor desde Linux, instala el paquete en un entorno virtual con `python -m pip install .`, ejecuta `python -m unittest discover -v` y activa las pruebas de Docker con `MASF_TEST_ENGINE=1 python -m unittest tests.test_engine -v`. Estas últimas aceptan las mismas dos variables de subred. La alternativa nativa incluye un [servicio de usuario de systemd](../examples/systemd/masf.service). Instala el entorno virtual en la ruta de su `ExecStart`, configura las variables de autenticación en `~/.config/masf/service.env` con permisos 0600, copia la unidad a `~/.config/systemd/user/` y ejecuta `systemctl --user enable --now masf`. Para mantenerlo tras el cierre de sesión, habilita la persistencia del gestor de usuario con `loginctl enable-linger "$USER"`.

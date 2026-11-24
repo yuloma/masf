@@ -1,6 +1,9 @@
 services:
   controller:
     environment:
+      MASF_CODEX_AUTH:
+      MASF_CURSOR_AUTH:
+      MASF_CLAUDE_AUTH:
       DOCKER_HOST: unix:///var/run/docker.sock
     group_add:
       - "${MASF_DOCKER_GID:?Define el GID del socket Docker}"

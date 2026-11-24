@@ -127,6 +127,9 @@ def verify(repo, config, workspace, sha, folder, owner, timeout, *, guard=None):
         ]
         execute = stack + ["exec", "-T", compose["service"]]
         stop = stack + ["down", "--volumes", "--remove-orphans"]
+        if any("build" in svc for svc in model["services"].values()):
+            # Builds have no explicit image name, so only their project tags are local.
+            stop.extend(["--rmi", "local"])
     else:
         start = [
             "docker",

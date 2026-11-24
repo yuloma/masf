@@ -41,6 +41,71 @@ Simular también lectura correcta de la issue y un 403 al crear la rama o el PR.
 
 **Aceptación con Engine local.** Ejecutar primero la [prueba independiente de PostgreSQL](../examples/docker/smoke-profile.sh). Repetir a través de MASF con el perfil de ejemplo y sin herramientas del proyecto en el host. Verificar la misma tarea con controlador nativo y contenedorizado en instalaciones de prueba independientes. Cubrir dos verificaciones simultáneas, servicios no saludables, un check con salida distinta de cero, cancelación y recuperación después de crear un volumen. Comprobar que un manifiesto o `.env` introducido en la rama no cambia el despliegue, que un perfil con un montaje del socket se rechaza antes de `up` y que el stack de desarrollo sobrevive a la limpieza. Registrar por separado la prueba con Engine de las pruebas con dobles.
 
+La [suite optativa](../tests/test_engine.py) usa perfiles privados derivados del ejemplo. Prueba el montaje y la construcción desde copias de la base, del candidato y del mismo SHA en un reintento. Compara el modelo efectivo y el estado de los servicios con el perfil aprobado. Tras cada verificación comprueba que el stack de control conserva los contenedores, los recursos y la fila de prueba. Emite evidencia JSON con el SHA, la huella del modelo, el proyecto y los inventarios antes y después de la limpieza, incluida la recuperación.
+
+Desde la raíz del checkout, prepara Docker Engine local con Compose y las imágenes locales `postgres:17-alpine`, `masf-runner:pilot` y `masf-controller:pilot`. El [contrato de Docker](docker.md) describe la preparación de las imágenes. Ejecuta estos bloques en orden. Cada modalidad crea y elimina su propia instalación temporal. La modalidad nativa requiere Python 3.11 o superior con PyYAML.
+
+```bash
+python3 -m unittest discover -v
+bash examples/docker/smoke-profile.sh
+```
+
+```bash
+(
+  set -eu
+  i2_root=$(realpath "$(mktemp -d)")
+  trap 'rm -rf -- "$i2_root"' EXIT
+  export MASF_TEST_ENGINE_CONFIG_DIR="$i2_root/config"
+  export MASF_TEST_ENGINE_STATE_DIR="$i2_root/state"
+  export MASF_JOBS_DIR="$i2_root/jobs"
+  mkdir -m 700 "$MASF_TEST_ENGINE_CONFIG_DIR" "$MASF_TEST_ENGINE_STATE_DIR" "$MASF_JOBS_DIR"
+  export DOCKER_HOST="unix://${MASF_DOCKER_SOCKET:-/var/run/docker.sock}"
+  MASF_TEST_ENGINE=1 python3 -m unittest tests.test_engine -v
+)
+```
+
+```bash
+(
+  set -eu
+  i2_root=$(realpath "$(mktemp -d)")
+  trap 'rm -rf -- "$i2_root"' EXIT
+  export MASF_CONFIG_DIR="$i2_root/config" MASF_STATE_DIR="$i2_root/state"
+  export MASF_JOBS_DIR="$i2_root/jobs"
+  mkdir -m 700 "$MASF_CONFIG_DIR" "$MASF_STATE_DIR" "$MASF_JOBS_DIR"
+  export MASF_UID="$(id -u)" MASF_GID="$(id -g)"
+  export MASF_DOCKER_SOCKET="${MASF_DOCKER_SOCKET:-/var/run/docker.sock}"
+  export MASF_DOCKER_GID="$(stat -c %g "$MASF_DOCKER_SOCKET")"
+  export DOCKER_HOST="unix://$MASF_DOCKER_SOCKET"
+  unset GH_TOKEN MASF_CODEX_AUTH MASF_CURSOR_AUTH MASF_CLAUDE_AUTH
+  i2_project=$(basename "$i2_root" | tr '[:upper:]' '[:lower:]' | tr . -)
+  i2_compose=(docker compose --env-file /dev/null -p "masf-i2-$i2_project"
+    -f examples/docker/compose.yaml -f examples/docker/engine.yaml)
+  cleanup_i2() {
+    local result=$?
+    "${i2_compose[@]}" down --remove-orphans || result=1
+    rm -rf -- "$i2_root" || result=1
+    exit "$result"
+  }
+  trap cleanup_i2 EXIT
+  "${i2_compose[@]}" run --rm --no-deps \
+    --entrypoint /opt/venv/bin/python -w /opt/masf-test-source \
+    -v "$(pwd -P):/opt/masf-test-source:ro" \
+    -v "$MASF_CONFIG_DIR:/tmp/masf-test-config" \
+    -e MASF_TEST_ENGINE=1 -e MASF_TEST_ENGINE_CONFIG_DIR=/tmp/masf-test-config \
+    -e MASF_TEST_ENGINE_STATE_DIR=/var/lib/masf \
+    controller -m unittest tests.test_engine -v
+)
+```
+
+El manifiesto central conserva la misma ruta absoluta de trabajos dentro y fuera del controlador contenedorizado. El montaje adicional de configuración permite a la suite generar los perfiles de prueba. Las verificaciones usan el Engine local y los repositorios Git temporales.
+
+| Comprobación | Resultado observado |
+| --- | --- |
+| `python3 -m unittest discover -v` | 49 pruebas, 40 correctas y 9 omitidas por requerir Engine. Incluye la comprobación con un doble del comando guardado para limpiar la imagen. |
+| `bash -n examples/docker/smoke-profile.sh` y `bash examples/docker/smoke-profile.sh --help` | Ambas finalizaron con código 0. |
+| `bash examples/docker/smoke-profile.sh` | Código 127 al invocar Docker. La prueba de PostgreSQL queda pendiente. |
+| `docker compose version` y comprobación de `/var/run/docker.sock` | El cliente y el socket local no estaban disponibles. Las ejecuciones con Engine desde ambos controladores quedan pendientes. |
+
 ## I3 · Intercambiar los tres proveedores
 
 **Resultado para el operador.** Añadir Cursor CLI y Claude Code como adaptadores del mismo contrato. `plan`, `build` y `review` se asignan desde la configuración, con excepciones por repositorio. Un proveedor deshabilitado o sin roles asignados puede estar ausente de la instalación. La preparación del runner y las instrucciones de autenticación cubren los tres proveedores de forma independiente.

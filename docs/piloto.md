@@ -2,6 +2,8 @@
 
 Este protocolo se ejecutará con una revisión que ya implemente el incremento correspondiente. Los comandos `masf` de este documento son la interfaz prevista. El primer resultado de campo será un PR en un proyecto desechable elegido por el operador.
 
+Para la instalación completa desde el prompt del README, [INSTALL.md](../INSTALL.md) indica cuándo construir las piezas pendientes, cómo poner en marcha el servicio y qué evidencia entregar. Los ejercicios de este protocolo también se pueden ejecutar por separado durante el desarrollo.
+
 ## 1. Preparar la instalación central
 
 Para el piloto recomendado usa un host Linux con Docker Engine y Compose. El controlador también se podrá instalar directamente en Linux con Python 3.11 o superior y Git. En ambas modalidades, I1 requiere acceso de lectura a GitHub para el sondeo. Desde I2 se necesita Docker, permiso para subir una rama y crear un PR en el proyecto, y acceso a cada proveedor que tenga un rol asignado.
@@ -80,4 +82,4 @@ Desde I4 arranca el controlador con `"${control[@]}" up -d controller` en Docker
 | Persistencia y limpieza | Recrear el controlador conserva SQLite, evidencia e identificadores. Terminar o cancelar una prueba retira sus contenedores, redes y volúmenes propios. |
 | Coste del proceso | Quedan anotados tiempo por etapa, rondas, intervenciones y uso disponible. Si no hay datos de coste, el informe lo indica. |
 
-Conserva en la instalación del operador la revisión de MASF, versiones de las CLIs ejecutadas, id del trabajo, SHA, URL del PR y el resultado de cada criterio. Esos datos permiten decidir qué proveedor asignar a cada rol y qué fallo corregir antes de incorporar proyectos reales. Al terminar, detén `serve` y deshabilita las entradas de prueba. El historial y los PR permiten revisar lo ocurrido después.
+Conserva en la instalación del operador la revisión de MASF, versiones de las CLIs ejecutadas, id del trabajo, SHA, URL del PR y el resultado de cada criterio. En una instalación operativa, deja `serve` activo con los repositorios autorizados. Si el operador solicitó únicamente un ensayo desechable, detén su instancia y deshabilita sus entradas de prueba al terminar.

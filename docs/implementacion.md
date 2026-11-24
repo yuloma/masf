@@ -2,6 +2,8 @@
 
 Cada incremento deja algo que el operador puede comprobar y que el siguiente agente puede usar. Se empieza por descubrir trabajo real con acceso de lectura. La primera ejecución de pago llega cuando se puede entregar y revisar un PR completo.
 
+Para el encargo de instalación completa, usa [INSTALL.md](../INSTALL.md). I1 a I4 son hitos de ese mismo encargo. Reutiliza lo que ya esté implementado y continúa desde cada hito hasta que el servicio procese la issue piloto y publique su PR.
+
 ## I1 · Registrar repositorios y descubrir trabajo
 
 **Resultado para el operador.** Se pueden registrar y consultar issues desde un paquete nativo o desde la imagen del controlador. En Docker el host aporta Engine y Compose. En la instalación nativa de I1 bastan Python 3.11 o superior, SQLite y, para consultar GitHub, `gh` autenticado con lectura de los repositorios elegidos.
@@ -48,6 +50,8 @@ Simular también lectura correcta de la issue y un 403 al crear la rama o el PR.
 Publicar en el README los comandos para arrancar y actualizar el controlador mediante Compose, consultar su estado y recrearlo conservando SQLite y trabajos. Usar la vía contenedorizada en el piloto de servicio continuo y comprobar `status` tras la recreación. Mantener la vía nativa para operadores que ya gestionan procesos Linux.
 
 ## Encargo para iniciar I1
+
+Este prompt corresponde a una petición expresa de implementar solo I1. Para la instalación completa, sigue [INSTALL.md](../INSTALL.md).
 
 > Trabaja en `yuloma/masf`. Lee `AGENTS.md`, `docs/especificacion.md`, `docs/docker.md`, `examples/factory.toml` y el apartado I1 de `docs/implementacion.md`. Implementa I1 en una rama del repositorio. Entrega el paquete instalable, los cuatro comandos, la imagen del controlador y persistencia idempotente. Usa ambos registros de ejemplo y ejecuta la suite sin servicios externos en un entorno virtual limpio. En un host con Docker, construye la imagen y verifica la aceptación de empaquetado con el Compose central. Actualiza el README y deja un PR con resultados y limitaciones observadas. La aceptación requiere que una issue elegible se pueda registrar como `queued` y consultar tras recrear el contenedor.
 

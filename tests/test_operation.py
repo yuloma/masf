@@ -16,6 +16,19 @@ class Commands(unittest.TestCase):
             command([sys.executable, "-c", "import time;time.sleep(30)"], timeout=0.1)
         self.assertLess(time.monotonic() - started, 3)
 
+    def test_large_input_survives_slow_reader(self):
+        payload = "á" * 200000
+        output = command(
+            [
+                sys.executable,
+                "-c",
+                "import sys,time;time.sleep(1.2);print(len(sys.stdin.read()))",
+            ],
+            stdin=payload,
+            timeout=5,
+        )
+        self.assertEqual(output, str(len(payload)))
+
     def test_guard_terminates_running_process(self):
         def stop():
             raise TaskStopped("cancelled")

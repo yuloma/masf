@@ -3,6 +3,8 @@ import re
 import subprocess
 import signal
 import time
+import tempfile
+from contextlib import ExitStack
 
 
 def clean(value):
@@ -29,17 +31,27 @@ def command(
     args, *, cwd=None, stdin=None, env=None, timeout=120, combined=False, guard=None
 ):
     deadline = time.monotonic() + timeout
-    with subprocess.Popen(
-        args,
-        cwd=cwd,
-        env=env,
-        stdin=subprocess.PIPE if stdin is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT if combined else subprocess.PIPE,
-        text=True,
-        errors="replace",
-        start_new_session=True,
-    ) as proc:
+    with ExitStack() as stack:
+        source = None
+        if stdin is not None:
+            source = stack.enter_context(
+                tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+            )
+            source.write(stdin)
+            source.seek(0)
+        proc = stack.enter_context(
+            subprocess.Popen(
+                args,
+                cwd=cwd,
+                env=env,
+                stdin=source,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT if combined else subprocess.PIPE,
+                text=True,
+                errors="replace",
+                start_new_session=True,
+            )
+        )
         try:
             while True:
                 if guard:
@@ -48,12 +60,10 @@ def command(
                 if remaining <= 0:
                     raise RuntimeError(f"{args[0]}: tiempo agotado ({timeout}s)")
                 try:
-                    stdout, stderr = proc.communicate(
-                        input=stdin, timeout=min(1, remaining)
-                    )
+                    stdout, stderr = proc.communicate(timeout=min(1, remaining))
                     break
                 except subprocess.TimeoutExpired:
-                    stdin = None
+                    continue
         except BaseException:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)

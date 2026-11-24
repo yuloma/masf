@@ -21,6 +21,10 @@ Entregar un Dockerfile que instale ese mismo paquete, Git y `gh`, y documentar c
 
 **Aceptación.** En una instalación limpia del paquete, la configuración de ejemplo pasa la validación. Con un GitHub simulado que tenga dos páginas, una issue sin etiqueta, un PR etiquetado y dos repositorios con el mismo número de issue, solo se admiten las issues elegibles de los repositorios habilitados. Dos procesos que ejecuten `scan` sobre la misma base dejan una sola fila por issue. Un error de acceso se distingue de una cola vacía y permite que los otros repositorios se procesen. La suite se puede ejecutar sin cuentas de IA, Docker ni credenciales de escritura.
 
+La suite nativa ejecuta dos procesos de la CLI con el mismo TOML y la misma SQLite. El `gh` simulado espera a ambos al resolver el primer commit base, antes de insertar trabajos. Los dos procesos salen con código 0 y dejan cuatro filas `queued`, una por cada combinación de ID de repositorio y número de issue elegible. Un HTTP 403 en el primer repositorio aparece en stderr con su nombre y produce código 1, mientras las issues elegibles del segundo repositorio quedan en cola. `scan --dry-run` informa de las issues elegibles mediante consultas de lectura y conserva el estado local tanto si la cola existe como si todavía no se ha creado.
+
+En Python 3.11.2, `python3 -m unittest discover -v` terminó con código 0 en un entorno sin credenciales ni servicios externos. Descubrió 39 pruebas, pasaron 32 y se omitieron las 7 optativas que requieren Docker Engine.
+
 Como prueba de empaquetado en un host con Docker, construir la imagen, ejecutar `doctor --offline` sin montar el socket y comprobar que un `scan` y un `status` en contenedores distintos conservan la misma issue en SQLite. Ejercitar en la suite nativa una entrada histórica sin bloque Compose, la entrada multiservicio de ejemplo y una ruta que intenta salir del directorio de configuración.
 
 ## I2 · Entregar el primer PR con Codex

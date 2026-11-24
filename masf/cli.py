@@ -25,7 +25,7 @@ from .queue import (
     scan,
 )
 from .system import TaskStopped, clean, command, docker_env
-from .worker import Worker
+from .worker import Worker, saved_workspace
 
 
 def doctor(cfg, offline):
@@ -155,7 +155,7 @@ def tick(db, cfg, config, root, once):
     return errors
 
 
-def resume(db, cfg, target, allow_protected_paths=()):
+def resume(db, cfg, target, allow_protected_paths=(), reuse_workspace=None):
     slug, number = target.rsplit("#", 1)
     row = db.execute(
         "SELECT data FROM jobs WHERE slug=? AND number=? AND state IN ('needs_input','blocked')",
@@ -203,10 +203,39 @@ def resume(db, cfg, target, allow_protected_paths=()):
                 "fingerprint": j["fingerprint"],
                 "at": datetime.now(timezone.utc).isoformat(),
             }
+    if reuse_workspace is not None:
+        if (
+            j["state"] != "blocked"
+            or j.get("retry") != "building"
+            or not eligible(issue, j["repo"])
+            or fingerprint(issue) != j["fingerprint"]
+        ):
+            raise ValueError(
+                "La recuperación requiere construcción bloqueada y alcance vigente"
+            )
+        jobs = Path(
+            os.environ.get("MASF_JOBS_DIR") or xdg("DATA", ".local/share") / "jobs"
+        )
+        folder = saved_workspace(
+            jobs / f"{j['repo_id']}-{j['number']}", reuse_workspace
+        )
+        checkpoint = {
+            "path": str(folder),
+            "input_sha": j.get("candidate") or j["base"],
+            "fingerprint": j["fingerprint"],
+            "error": j.get("reason"),
+        }
     if not eligible(issue, j["repo"]):
         save(db, j, "cancelled")
     elif fingerprint(issue) != j["fingerprint"] or j["state"] == "needs_input":
-        for key in ("plan", "candidate", "checks", "review", "feedback"):
+        for key in (
+            "plan",
+            "candidate",
+            "checks",
+            "review",
+            "feedback",
+            "build_workspace",
+        ):
             j.pop(key, None)
         save(
             db,
@@ -222,6 +251,8 @@ def resume(db, cfg, target, allow_protected_paths=()):
         updates = {"reason": ""}
         if allow_protected_paths:
             updates["path_approvals"] = approvals
+        if reuse_workspace is not None:
+            updates["build_workspace"] = checkpoint
         save(db, j, j.get("retry", "queued"), **updates)
 
 
@@ -241,6 +272,11 @@ def main():
         action="append",
         default=[],
         help="Autoriza una ruta exacta para este trabajo y su alcance vigente",
+    )
+    resume_parser.add_argument(
+        "--reuse-workspace",
+        type=Path,
+        help="Recupera una copia conservada de este trabajo tras una interrupción",
     )
     subs.add_parser("status")
     subs.add_parser("serve")
@@ -277,7 +313,13 @@ def main():
                 try:
                     fcntl.flock(lock, fcntl.LOCK_EX)
                     if args.cmd == "resume":
-                        resume(db, cfg, args.issue, args.allow_protected_path)
+                        resume(
+                            db,
+                            cfg,
+                            args.issue,
+                            args.allow_protected_path,
+                            args.reuse_workspace,
+                        )
                         return 0
                     errors = tick(db, load(config), config, root, args.cmd == "run")
                 except Exception as exc:

@@ -1,5 +1,5 @@
 # Ejemplo del contrato previsto. Copiar a la configuración privada del operador.
-version = 1
+version = 1 # Entero de versión.
 
 [service]
 poll_seconds = 60
@@ -15,6 +15,7 @@ image = "masf-runner:pilot"
 [providers.codex]
 enabled = true
 executable = "codex"
+# model = "nombre-del-modelo"
 
 [providers.cursor]
 enabled = true
@@ -26,6 +27,8 @@ enabled = false
 executable = "claude"
 
 [routing]
+# Los nombres de proveedor son texto. Cada repositorio completa los tres roles
+# con las asignaciones globales y sus excepciones locales.
 plan = "codex"
 build = "codex"
 review = "cursor"
@@ -58,5 +61,6 @@ checks = [["psql", "-X", "-v", "ON_ERROR_STOP=1", "-f", "tests/smoke.sql"]]
 protected_paths = [".github/workflows/**"]
 
 [repositories.compose]
+# Si el manifiesto YAML declara services, cada definición de servicio es una tabla.
 files = ["profiles/postgres.yaml"]
 service = "app"

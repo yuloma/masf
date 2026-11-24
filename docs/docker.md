@@ -116,3 +116,15 @@ Cuando un candidato modifica una ruta protegida, `status` muestra el archivo y e
 ```
 
 La opción se puede repetir para varios archivos. Cada autorización queda asociada al trabajo y a la huella vigente de la issue, con fecha y SHA del candidato autorizado. El servicio comprueba las demás rutas protegidas usando el perfil del trabajo. Un cambio del contenido de la issue requiere confirmar el alcance y volver a autorizar las rutas necesarias. La reanudación conserva el candidato y continúa desde la etapa bloqueada.
+
+## Recuperar una construcción interrumpida
+
+El controlador registra la copia de construcción antes de llamar al agente. Si la etapa termina por timeout, `resume OWNER/REPO#N` reutiliza esa copia cuando corresponde al SHA de entrada y a la huella vigente de la issue. El siguiente intento recibe el plan y el motivo de la interrupción y continúa sobre los archivos conservados. Cada intento cuenta dentro del límite de rondas configurado.
+
+Para trabajos creados por versiones anteriores que carezcan de esa referencia, el operador puede seleccionar una copia conservada dentro del directorio del trabajo.
+
+```bash
+"${control[@]}" run --rm controller resume OWNER/REPO#N --reuse-workspace /ruta/jobs/ID-N/tmpXXXX
+```
+
+La ruta debe ser un directorio directo del trabajo. El controlador valida su pertenencia y conserva el aislamiento de los metadatos Git. Si la tarea necesita más tiempo, ajusta `service.step_timeout_seconds` en el TOML antes de reanudarla.

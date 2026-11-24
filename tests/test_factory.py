@@ -611,6 +611,74 @@ class Delivery(TemporaryTest):
         )
         self.assertNotIn("path_approvals", stored)
 
+    def test_interrupted_build_reuses_saved_workspace(self):
+        first = True
+        original = self.agent
+        seen = []
+
+        def interrupted(role, job, cfg, workspace, inputs, owner, **kwargs):
+            nonlocal first
+            if role == "build":
+                seen.append(workspace)
+                if first:
+                    first = False
+                    (workspace / "partial.txt").write_text("preserved")
+                    raise RuntimeError("docker: tiempo agotado")
+                self.assertEqual((workspace / "partial.txt").read_text(), "preserved")
+                self.assertTrue(inputs["recovery"]["workspace_reused"])
+            return original(role, job, cfg, workspace, inputs, owner, **kwargs)
+
+        with patch.object(worker.providers, "invoke", interrupted):
+            with self.assertRaisesRegex(RuntimeError, "tiempo agotado"):
+                self.worker.process()
+            stored = json.loads(
+                self.worker.db.execute("SELECT data FROM jobs").fetchone()[0]
+            )
+            self.assertEqual(stored["build_workspace"]["path"], str(seen[0]))
+            self.worker.process()
+        self.assertEqual(seen[0], seen[1])
+        self.assertEqual(self.job["state"], "pr_open")
+        self.assertEqual(self.job["rounds"], 2)
+        self.assertIsNone(self.job["build_workspace"])
+
+    def test_resume_recovers_legacy_workspace(self):
+        from masf.cli import resume
+
+        folder = (
+            self.worker.checkout(self.base)
+            if self.worker.store.exists()
+            else self.worker.root / "legacy"
+        )
+        folder.mkdir(exist_ok=True)
+        (folder / "partial.txt").write_text("preserved")
+        queue.save(
+            self.worker.db, self.job, "blocked", retry="building", reason="timeout"
+        )
+        with (
+            patch("masf.cli.api", self.api),
+            patch.dict("os.environ", {"MASF_JOBS_DIR": str(self.root / "jobs")}),
+        ):
+            resume(
+                self.worker.db,
+                self.cfg,
+                f"{self.repo['slug']}#1",
+                reuse_workspace=folder,
+            )
+        j = json.loads(self.worker.db.execute("SELECT data FROM jobs").fetchone()[0])
+        self.assertEqual(j["build_workspace"]["path"], str(folder))
+        self.assertEqual(j["build_workspace"]["input_sha"], self.base)
+        self.assertEqual(j["state"], "building")
+        self.assertEqual(j["rounds"], 0)
+
+    def test_workspace_recovery_rejects_other_job_and_git_store(self):
+        from masf.worker import saved_workspace
+
+        outside = self.root / "outside"
+        outside.mkdir()
+        for path in (outside, self.worker.root, self.worker.root / "git"):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                saved_workspace(self.worker.root, path)
+
 
 class Leases(TemporaryTest):
     def test_expired_attempt_cannot_publish(self):

@@ -118,6 +118,16 @@ El manifiesto central conserva la misma ruta absoluta de trabajos dentro y fuera
 
 **Aceptación.** Aplicar el protocolo del piloto desde un checkout limpio. La segunda consulta y el reinicio durante la publicación mantienen una única rama y un PR por issue. Un segundo repositorio funciona con la misma instalación y configuración adicional. El informe identifica la versión instalada, el destino, los agentes realmente ejecutados, los checks y las intervenciones humanas.
 
+La aceptación del sondeo de PR se ejecuta localmente con `python3 -m unittest tests.test_observation -v`.
+
+1. Admitir issues y enumerar las páginas de PR de los repositorios habilitados. Identificar los PR sin trabajo en `status --pr`, comprobar la procedencia de la marca antes de vincular automáticamente y permitir una asociación local mediante `link-pr`.
+2. Conservar la identidad, referencias, borrador y estado del PR. Contrastar con el detalle los PR que desaparezcan de un listado completo antes de marcar cierre o merge. Incluir un trabajo cuyo único vínculo registrado sea la URL del PR.
+3. Guardar los check runs, commit statuses, workflows, ejecuciones, jobs e intentos por head. Distinguir requisitos leídos, resultados esperados ausentes y requisitos cuya lectura o aplicación no se pudo verificar.
+4. Registrar estados y conclusiones separados, incluidas peticiones de intervención. Recuperar anotaciones y extractos filtrados de fallo y permitir reintentar los diagnósticos inaccesibles. Comprobar la correlación de checks comunicados después del job y el filtrado de credenciales con escapes de terminal y valores marcados por Actions.
+5. Mantener el sondeo con un worker ocupado y conservar candidato y rondas. Simular errores de consulta y cuota, conservar la última información válida y seguir con otros PR mientras GitHub permita consultar.
+6. Repetir el sondeo y abrir de nuevo la misma SQLite. Consultar mediante `status` y `logs --pr OWNER/REPO#PR --sha SHA` sin duplicar transiciones. Verificar un head nuevo, un rerun que reutilice el ID de un check y una ejecución nueva del mismo workflow. Simular también un fallo temporal al recuperar un intento histórico y comprobar que su estado previo sigue disponible hasta que se restablezca la consulta. [Contrato de observación v1](especificacion.md#formato-de-observación-v1).
+7. Reproducir el PR #23 abierto y vinculado al trabajo #10. La evidencia simulada atribuye el CI al head comunicado por el operador `d8cda48a51ee46eb285ac866e8b58d4ad89415db` y conserva `bb747e16b42c2aaf05ac9275c9625cde90a49aec` como candidato. La simulación representa el merge de `main` en la rama del PR mediante los padres del commit. La comprobación con evidencia real del CI de ese PR queda pendiente.
+
 Publicar en el README los comandos para arrancar y actualizar el controlador mediante Compose, consultar su estado y recrearlo conservando SQLite y trabajos. Usar la vía contenedorizada en el piloto de servicio continuo y comprobar `status` tras la recreación. Mantener la vía nativa para operadores que ya gestionan procesos Linux.
 
 ## Encargo para iniciar I1

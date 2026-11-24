@@ -9,10 +9,11 @@ import sys
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path, PurePosixPath
 
 from .config import ConfigError, load, xdg
+from .observe import link_pull, load_row, observe
 from .queue import (
     api,
     claim,
@@ -26,6 +27,9 @@ from .queue import (
 )
 from .system import TaskStopped, clean, command, docker_env
 from .worker import Worker
+
+
+RUNNABLE = ("queued", "planning", "building", "checking", "reviewing", "publishing")
 
 
 def doctor(cfg, offline):
@@ -84,10 +88,9 @@ def process_task(cfg, config, root, job):
     ttl = 90
     stop = threading.Event()
     db = connect(root)
-    if not claim(db, job, token, ttl):
+    if not claim(db, job, token, ttl, cfg["service"]["max_parallel_jobs"]):
         db.close()
         return 0
-    job["attempt"] = token
 
     def heartbeat():
         conn = connect(root)
@@ -98,9 +101,17 @@ def process_task(cfg, config, root, job):
         finally:
             conn.close()
 
-    thread = threading.Thread(target=heartbeat, daemon=True)
-    thread.start()
+    thread = None
     try:
+        current = load_row(db.execute(
+            "SELECT data FROM jobs WHERE repo_id=? AND number=?",
+            (job["repo_id"], job["number"]),
+        ).fetchone())
+        if current is None or current["state"] not in RUNNABLE:
+            return 0
+        job = current | {"attempt": token}
+        thread = threading.Thread(target=heartbeat, daemon=True)
+        thread.start()
         jobs = Path(
             os.environ.get("MASF_JOBS_DIR") or xdg("DATA", ".local/share") / "jobs"
         )
@@ -115,44 +126,75 @@ def process_task(cfg, config, root, job):
         return 1
     finally:
         stop.set()
-        thread.join()
+        if thread is not None:
+            thread.join()
         with db:
             db.execute("DELETE FROM leases WHERE token=?", (token,))
         db.close()
 
 
-def tick(db, cfg, config, root, once):
-    errors = scan(cfg, db)
-    if retry_delay():
-        return errors + 1
+def pending_jobs(db, cfg, running, limit):
     active = {repo["slug"] for repo in cfg["repositories"] if repo["enabled"]}
-    for row in db.execute("SELECT data FROM jobs WHERE state='pr_open'").fetchall():
-        job = json.loads(row[0])
-        if job["slug"] in active:
-            try:
-                pr = api(f"repos/{job['slug']}/pulls/{job['pr_number']}")
-                if pr["state"] == "closed":
-                    job.pop("attempt", None)
-                    save(db, job, "merged" if pr["merged_at"] else "closed")
-            except RuntimeError as exc:
-                print(f"{job['slug']}: {clean(str(exc))}", file=sys.stderr, flush=True)
-                errors += 1
-    if retry_delay():
-        return errors + 1
-    limit = 1 if once else cfg["service"]["max_parallel_jobs"]
-    pending = []
+    if limit <= 0 or retry_delay():
+        return
+    states = ",".join("?" for _ in RUNNABLE)
     for row in db.execute(
-        "SELECT data FROM jobs WHERE state IN ('queued','planning','building','checking','reviewing','publishing') ORDER BY rowid"
+        f"""SELECT jobs.data FROM jobs LEFT JOIN leases USING(repo_id,number)
+        WHERE jobs.state IN ({states})
+        AND (leases.expires IS NULL OR leases.expires<=unixepoch()) ORDER BY jobs.rowid""",
+        RUNNABLE,
     ):
-        job = json.loads(row[0])
-        if job["slug"] in active:
-            pending.append(job)
-        if len(pending) >= limit:
-            break
-    with ThreadPoolExecutor(limit) as pool:
-        futures = [pool.submit(process_task, cfg, config, root, job) for job in pending]
-        errors += sum(future.result() for future in futures)
-    return errors
+        job = load_row(row)
+        key = job["repo_id"], job["number"]
+        if job["slug"] in active and key not in running:
+            yield key, job
+            limit -= 1
+            if limit == 0:
+                break
+
+
+class Workers:
+    def __init__(self):
+        self.running = {}
+        self.pool = None
+        self.capacity = 0
+
+    def dispatch(self, db, cfg, config, root, *, once=False):
+        errors = self.reap()
+        limit = 1 if once else cfg["service"]["max_parallel_jobs"]
+        if limit > self.capacity:
+            self.close(wait_for_jobs=False)
+            self.pool = ThreadPoolExecutor(limit)
+            self.capacity = limit
+        for key, job in pending_jobs(db, cfg, self.running, limit - len(self.running)):
+            self.running[key] = self.pool.submit(process_task, cfg, config, root, job)
+        return errors + (self.reap(wait=True) if once else 0)
+
+    def reap(self, wait=False):
+        errors = 0
+        for key, future in tuple(self.running.items()):
+            if wait or future.done():
+                del self.running[key]
+                errors += future.result()
+        return errors
+
+    def close(self, wait_for_jobs=True):
+        if wait_for_jobs:
+            wait(self.running.values())
+        if self.pool is not None:
+            self.pool.shutdown(wait=wait_for_jobs)
+
+
+def tick(db, cfg, config, root, once, workers=None):
+    repository_ids = {}
+    errors = scan(cfg, db, repository_ids=repository_ids) + observe(db, api, cfg, repository_ids)
+    if workers is not None:
+        return errors + workers.dispatch(db, cfg, config, root, once=once)
+    workers = Workers()
+    try:
+        return errors + workers.dispatch(db, cfg, config, root, once=once) + workers.reap(wait=True)
+    finally:
+        workers.close()
 
 
 def resume(db, cfg, target, allow_protected_paths=()):
@@ -225,6 +267,65 @@ def resume(db, cfg, target, allow_protected_paths=()):
         save(db, j, j.get("retry", "queued"), **updates)
 
 
+def pull_target(value):
+    slug, sep, number = value.rpartition("#")
+    if not sep or slug.count("/") != 1 or not number.isascii() or not number.isdecimal() or int(number) < 1:
+        raise argparse.ArgumentTypeError("Usa propietario/repositorio#número")
+    return slug, int(number)
+
+
+def pull_output(db, target, *, history=False, sha=None):
+    params = target or ()
+    pull_filter = " WHERE slug=? COLLATE NOCASE AND number=?" if target else ""
+    for row in db.execute("SELECT data FROM pull_requests" + pull_filter + " ORDER BY slug,number", params):
+        pr = load_row(row)
+        ident = pr["repo_id"], pr["number"]
+        label = {"repo_id": pr["repo_id"], "number": pr["number"]}
+        if not history:
+            ci = load_row(db.execute(
+                "SELECT data FROM pull_ci WHERE repo_id=? AND number=? AND sha=?",
+                (*ident, pr["head"]["sha"]),
+            ).fetchone())
+            print(json.dumps({"type": "pull_request", **pr, "ci": ci}))
+            continue
+        sha_filter = " AND sha=? COLLATE NOCASE" if sha else ""
+        params_with_sha = (*ident, sha) if sha else ident
+        for item in db.execute(
+            "SELECT id,at,sha,kind,detail FROM pull_events WHERE repo_id=? AND number=?"
+            + sha_filter + " ORDER BY id", params_with_sha,
+        ):
+            print(json.dumps({"type": "pull_event", **label, **dict(item), "detail": json.loads(item["detail"])}))
+        for item in db.execute(
+            "SELECT sha,data FROM pull_ci WHERE repo_id=? AND number=?" + sha_filter + " ORDER BY sha",
+            params_with_sha,
+        ):
+            print(json.dumps({"type": "pull_evidence", **label, "sha": item["sha"], "ci": load_row(item)}))
+
+    if sha:
+        return
+    source_filter = " WHERE slug=? COLLATE NOCASE" if target else ""
+    slug_params = (target[0],) if target else ()
+    if history:
+        for row in db.execute("SELECT * FROM pull_source_events" + source_filter + " ORDER BY id", slug_params):
+            if target and row["source"].startswith("pull:") and row["source"] != f"pull:{target[1]}":
+                continue
+            print(json.dumps({
+                "type": "pull_source_event", **dict(row),
+                "error": json.loads(row["error"]) if row["error"] else None,
+            }))
+    else:
+        for row in db.execute("SELECT * FROM pull_sources" + source_filter + " ORDER BY slug", slug_params):
+            errors = json.loads(row["error"])
+            if target:
+                errors = {key: value for key, value in errors.items()
+                          if not key.startswith("pull:") or key == f"pull:{target[1]}"}
+            if errors:
+                print(json.dumps({
+                    "type": "pull_source", "slug": row["slug"],
+                    "changed_at": row["changed_at"], "errors": errors,
+                }))
+
+
 def main():
     parser = argparse.ArgumentParser(prog="masf")
     parser.add_argument(
@@ -242,10 +343,17 @@ def main():
         default=[],
         help="Autoriza una ruta exacta para este trabajo y su alcance vigente",
     )
-    subs.add_parser("status")
+    subs.add_parser("status").add_argument("--pr", type=pull_target)
+    logs = subs.add_parser("logs")
+    logs.add_argument("--pr", type=pull_target)
+    logs.add_argument("--sha")
+    link = subs.add_parser("link-pr")
+    link.add_argument("pr", type=pull_target)
+    link.add_argument("issue", type=pull_target)
     subs.add_parser("serve")
     args = parser.parse_args()
     config = args.config.absolute()
+    db = None
     try:
         cfg = load(config)
         if args.cmd == "doctor":
@@ -258,51 +366,66 @@ def main():
         if args.cmd == "scan":
             return bool(scan(cfg, db))
         if args.cmd == "status":
-            for row in db.execute("SELECT data FROM jobs ORDER BY rowid"):
-                j = json.loads(row[0])
-                print(
-                    f"{j['slug']}#{j['number']} {j['state']}",
-                    j.get("candidate", ""),
-                    j.get("pr", ""),
-                    j.get("reason", ""),
-                )
+            if not args.pr:
+                for row in db.execute("SELECT data FROM jobs ORDER BY rowid"):
+                    j = load_row(row)
+                    print(
+                        f"{j['slug']}#{j['number']} {j['state']}",
+                        j.get("candidate", ""),
+                        j.get("pr", ""),
+                        j.get("reason", ""),
+                    )
+            pull_output(db, args.pr)
+            return 0
+        if args.cmd == "logs":
+            pull_output(db, args.pr, history=True, sha=args.sha)
             return 0
         if args.cmd == "serve":
             print(
                 f"MASF serve activo, configuración {config}, sondeo cada {cfg['service']['poll_seconds']}s",
                 flush=True,
             )
-        with (root / "worker.lock").open("a") as lock:
-            while True:
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX)
-                    if args.cmd == "resume":
-                        resume(db, cfg, args.issue, args.allow_protected_path)
-                        return 0
-                    errors = tick(db, load(config), config, root, args.cmd == "run")
-                except Exception as exc:
-                    if args.cmd != "serve":
-                        raise
-                    print(clean(str(exc)), file=sys.stderr, flush=True)
-                    errors = 1
-                finally:
-                    fcntl.flock(lock, fcntl.LOCK_UN)
-                if args.cmd == "run":
-                    return bool(errors)
-                delay = max(
-                    retry_delay(), cfg["service"]["poll_seconds"] * (2 if errors else 1)
-                )
-                print(
-                    f"MASF sondeo completado, errores={errors}, espera={delay:.0f}s",
-                    flush=True,
-                )
-                time.sleep(delay)
+        workers = Workers()
+        try:
+            with (root / "worker.lock").open("a") as lock:
+                while True:
+                    started = time.monotonic()
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX)
+                        if args.cmd == "resume":
+                            resume(db, cfg, args.issue, args.allow_protected_path)
+                            return 0
+                        if args.cmd == "link-pr":
+                            link_pull(db, args.pr, args.issue)
+                            return 0
+                        cfg = load(config)
+                        errors = tick(db, cfg, config, root, args.cmd == "run", workers)
+                    except Exception as exc:
+                        if args.cmd != "serve":
+                            raise
+                        print(clean(str(exc)), file=sys.stderr, flush=True)
+                        errors = 1
+                    finally:
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+                    if args.cmd == "run":
+                        return bool(errors)
+                    delay = max(retry_delay(), started + cfg["service"]["poll_seconds"] - time.monotonic())
+                    print(
+                        f"MASF sondeo completado, errores={errors}, espera={delay:.0f}s",
+                        flush=True,
+                    )
+                    time.sleep(delay)
+        finally:
+            workers.close()
     except ConfigError as exc:
         print(clean(f"{exc} ({config})"), file=sys.stderr)
         return 1
     except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
         print(clean(str(exc)), file=sys.stderr)
         return 1
+    finally:
+        if db is not None:
+            db.close()
 
 
 if __name__ == "__main__":

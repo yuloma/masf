@@ -6,6 +6,7 @@ import time
 import uuid
 
 from .system import TaskStopped, clean, command, docker_env
+from .recovery import retryable
 
 
 def allow_keys(data, keys, field):
@@ -188,6 +189,8 @@ def verify(repo, config, workspace, sha, folder, owner, timeout, *, guard=None):
                     if entry["code"] in (None, 125, 126, 127)
                     else "functional"
                 )
+                if record["failure_kind"] == "infrastructure":
+                    record["retryable"] = retryable(exc)
                 break
             finally:
                 entry["seconds"] = round(time.monotonic() - then, 3)

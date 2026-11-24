@@ -99,7 +99,7 @@ Para verificar el motor desde Linux, instala el paquete en un entorno virtual co
 
 La imagen de runtime incluye PyYAML, requerido por el paquete y sus pruebas. Después de actualizar MASF, reconstruye también el runner para que los checks del nuevo código dispongan de sus dependencias. Comprueba la rama base con ese runner antes de admitir issues.
 
-Un fallo de infraestructura durante los checks conserva el candidato y deja el trabajo bloqueado en esa etapa. Tras corregir la causa, `resume OWNER/REPO#N` repite la comprobación del mismo SHA. Un resultado funcional fallido permite otra ronda de construcción dentro del límite configurado. El plazo `step_timeout_seconds` comprende el arranque del entorno y la suma de los comandos de preparación y comprobación. La limpieza dispone de su propio plazo para retirar los recursos.
+Un fallo temporal reconocido durante los checks conserva el candidato y programa un reintento. Un resultado funcional fallido permite otra ronda de construcción dentro del límite configurado. Un error permanente o el presupuesto agotado dejan el trabajo bloqueado. Tras corregir la causa, `resume OWNER/REPO#N` repite la etapa correspondiente. El plazo `step_timeout_seconds` comprende el arranque del entorno y la suma de los comandos de preparación y comprobación. La limpieza dispone de su propio plazo para retirar los recursos.
 
 Durante una etapa activa se consulta la issue cada cinco segundos, sujeto al tiempo de respuesta de GitHub. Si se cierra, pierde la etiqueta o cambia su contenido, se interrumpe el proceso y se retiran los recursos de comprobación. El estado registrado distingue cancelación de una petición que requiere confirmar el nuevo alcance.
 
@@ -141,7 +141,7 @@ El modo no interactivo de Cursor permite ejecutar las herramientas necesarias du
 
 ## Resolver un conflicto de actualización de base
 
-Si la rama base avanza y Git detecta un conflicto, el trabajo queda bloqueado con las rutas afectadas. El operador puede resolver el merge en un clon independiente y traer el commit resultante al almacén Git del trabajo.
+Si la rama base avanza y Git detecta un conflicto, el servicio registra las rutas y devuelve el árbol combinado al implementador dentro del presupuesto de recuperación. El nuevo candidato incluye ambos padres y necesita checks y revisión propios. Cuando se agota el presupuesto o es necesaria una decisión humana, el operador puede resolver el merge en un clon independiente y traer el commit resultante al almacén Git del trabajo.
 
 El commit de resolución debe incluir como antecesores tanto el candidato conservado como la base actual. Tras revisar la resolución, se puede seleccionar con el comando siguiente.
 
@@ -150,3 +150,20 @@ El commit de resolución debe incluir como antecesores tanto el candidato conser
 ```
 
 Esta operación se aplica a una publicación bloqueada antes de registrar un PR. Conserva el plan y las rondas, registra los SHAs anteriores y la resolución, e inicia la comprobación de la nueva base y del candidato resuelto. El nuevo SHA recibe checks y revisión antes de publicarse.
+
+## Recuperación autónoma limitada
+
+El servicio utiliza estos valores opcionales de `[service]`. Las instalaciones existentes reciben los mismos valores por defecto.
+
+```toml
+max_recovery_attempts = 2
+recovery_backoff_seconds = 30
+```
+
+El presupuesto se comparte entre los reintentos de errores temporales, actualizaciones de base y resoluciones de conflictos del trabajo. Cada decisión se conserva en `recoveries` y en los eventos de SQLite. `max_recovery_attempts = 0` desactiva las recuperaciones automáticas. Los permisos, proveedor asignado y plazo máximo de etapa siguen siendo los del perfil del operador.
+
+Los timeouts, salidas de proveedor inválidas o incompletas y errores reconocidos de red o disponibilidad pueden pasar a `retry_wait`. La espera crece exponencialmente y respeta `Retry-After` o el reinicio de cuota de GitHub. `status` muestra la fecha UTC del siguiente intento. El siguiente sondeo disponible reclama el trabajo al cumplirse esa fecha, incluso después de reiniciar el controlador. Otros trabajos pueden ocupar su plaza durante la espera.
+
+Una construcción interrumpida reutiliza su copia del mismo SHA y alcance. Su continuación cuenta como intento adicional de recuperación y conserva la cuenta total de construcciones. Una revisión interrumpida conserva candidato y checks válidos y repite únicamente la revisión. La publicación conserva su protocolo de reconciliación para recuperar el PR único tras una respuesta perdida.
+
+Una pregunta o cambio de alcance, una ruta protegida, acceso denegado o presupuesto agotado requieren al operador. La recuperación automática no concede permisos ni modifica las credenciales o el límite de tiempo. Los errores desconocidos se conservan con su causa para su diagnóstico.

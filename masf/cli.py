@@ -27,6 +27,7 @@ from .queue import (
     scan,
 )
 from .system import TaskStopped, clean, command, docker_env
+from .recovery import schedule
 from .worker import Worker, saved_workspace
 
 
@@ -82,6 +83,8 @@ def doctor(cfg, offline):
 
 
 def process_task(cfg, config, root, job):
+    if job.get("state") == "retry_wait" and job["recovery_wait"]["until"] > time.time():
+        return 0
     token = uuid.uuid4().hex
     ttl = 90
     stop = threading.Event()
@@ -103,6 +106,8 @@ def process_task(cfg, config, root, job):
     thread = threading.Thread(target=heartbeat, daemon=True)
     thread.start()
     try:
+        if job["state"] == "retry_wait":
+            save(db, job, job["recovery_wait"]["stage"], reason="")
         jobs = Path(
             os.environ.get("MASF_JOBS_DIR") or xdg("DATA", ".local/share") / "jobs"
         )
@@ -112,7 +117,15 @@ def process_task(cfg, config, root, job):
         return 0
     except Exception as exc:
         reason = clean(str(exc))
-        save(db, job, "blocked", retry=job["state"], reason=reason)
+        updates = schedule(job, cfg, exc, minimum_delay=retry_delay())
+        if updates is not None:
+            save(db, job, "retry_wait", **updates)
+        else:
+            if len(job.get("recoveries", [])) >= cfg["service"].get(
+                "max_recovery_attempts", 2
+            ):
+                reason += " (sin presupuesto de recuperación automática)"
+            save(db, job, "blocked", retry=job["state"], reason=reason)
         print(reason, file=sys.stderr, flush=True)
         return 1
     finally:
@@ -144,9 +157,14 @@ def tick(db, cfg, config, root, once):
     limit = 1 if once else cfg["service"]["max_parallel_jobs"]
     pending = []
     for row in db.execute(
-        "SELECT data FROM jobs WHERE state IN ('queued','planning','building','checking','reviewing','publishing') ORDER BY rowid"
+        "SELECT data FROM jobs WHERE state IN ('queued','planning','building','checking','reviewing','publishing','retry_wait') ORDER BY rowid"
     ):
         job = json.loads(row[0])
+        if (
+            job.get("state") == "retry_wait"
+            and job["recovery_wait"]["until"] > time.time()
+        ):
+            continue
         if job["slug"] in active:
             pending.append(job)
         if len(pending) >= limit:
@@ -361,6 +379,14 @@ def main():
                     j.get("candidate", ""),
                     j.get("pr", ""),
                     j.get("reason", ""),
+                    (
+                        "reintento="
+                        + datetime.fromtimestamp(
+                            j["recovery_wait"]["until"], timezone.utc
+                        ).isoformat()
+                    )
+                    if j["state"] == "retry_wait"
+                    else "",
                 )
             return 0
         if args.cmd == "serve":

@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 
 from . import checks, providers
 from .queue import api, eligible, fingerprint, latest, save
+from .recovery import RecoverableFailure, reserve
 from .system import ProcessError, TaskStopped, clean, command, docker_env
 
 
@@ -200,6 +201,10 @@ class Worker:
         if j.get("base_checked") != j["base"]:
             report = self.test(j["base"])
             if not report["passed"]:
+                if report.get("retryable"):
+                    raise RecoverableFailure(
+                        "Infraestructura temporal al comprobar la base"
+                    )
                 raise RuntimeError(
                     "Fallan los checks de la base: " + str(report["commands"][-1])
                 )
@@ -213,10 +218,23 @@ class Worker:
         while self.admission():
             candidate = j.get("candidate")
             if not candidate or j["state"] == "building":
-                if j["rounds"] >= self.cfg["service"]["max_build_rounds"]:
+                recovery = j.get("build_recovery") or {}
+                checkpoint = j.get("build_workspace") or {}
+                if recovery.get("started") or (
+                    not recovery
+                    and checkpoint
+                    and self.cfg["service"].get("max_recovery_attempts", 2)
+                ):
+                    history = reserve(j, self.cfg, "resume_build", candidate=candidate)
+                    recovery = {**(recovery or {"type": "retry"}), "started": False}
+                    self.update("building", recoveries=history, build_recovery=recovery)
+                normal_rounds = j["rounds"] - j.get("recovery_builds", 0)
+                if (
+                    not recovery
+                    and normal_rounds >= self.cfg["service"]["max_build_rounds"]
+                ):
                     raise RuntimeError("Rondas de construcción agotadas")
                 start = candidate or j["base"]
-                checkpoint = j.get("build_workspace") or {}
                 reused = (
                     checkpoint.get("input_sha") == start
                     and checkpoint.get("fingerprint") == j["fingerprint"]
@@ -224,7 +242,7 @@ class Worker:
                 workspace = (
                     saved_workspace(self.root, checkpoint["path"])
                     if reused
-                    else self.checkout(start)
+                    else self.checkout(recovery.get("tree", start))
                 )
                 checkpoint = {
                     "path": str(workspace),
@@ -233,7 +251,11 @@ class Worker:
                     "error": checkpoint.get("error") if reused else None,
                 }
                 self.update(
-                    "building", rounds=j["rounds"] + 1, build_workspace=checkpoint
+                    "building",
+                    rounds=j["rounds"] + 1,
+                    build_workspace=checkpoint,
+                    recovery_builds=j.get("recovery_builds", 0) + bool(recovery),
+                    build_recovery={**recovery, "started": True} if recovery else None,
                 )
                 build = self.role(
                     "build",
@@ -244,6 +266,7 @@ class Worker:
                     recovery={
                         "workspace_reused": reused,
                         "previous_error": checkpoint.get("error"),
+                        **recovery,
                     },
                 )
                 if any(
@@ -254,14 +277,36 @@ class Worker:
                     raise RuntimeError("Metadatos Git dentro de la copia del agente")
                 self.git("add", "-A", "--", ".", workspace=workspace)
                 tree = self.git("write-tree")
+                if recovery.get("type") == "base_conflict":
+                    tracked = set(
+                        self.git("ls-tree", "-r", "--name-only", tree).splitlines()
+                    )
+                    for path in recovery["paths"]:
+                        content = (
+                            self.git("show", f"{tree}:{path}")
+                            if path in tracked
+                            else ""
+                        )
+                        if re.search(
+                            r"^(?:<<<<<<< |=======\s*$|>>>>>>> )", content, re.MULTILINE
+                        ):
+                            raise RecoverableFailure(
+                                "El agente conservó marcadores de conflicto"
+                            )
                 if tree == self.git("rev-parse", j["base"] + "^{tree}"):
                     raise RuntimeError("El agente no ha producido cambios")
-                candidate = self.git(
-                    "commit-tree", tree, "-p", j["base"], "-m", j["title"]
-                )
+                parents = ["-p", j["base"]]
+                if recovery.get("type") == "base_conflict":
+                    parents += ["-p", recovery["candidate"]]
+                candidate = self.git("commit-tree", tree, *parents, "-m", j["title"])
                 self.git("update-ref", "refs/heads/candidate", candidate)
                 self.update(
-                    "checking", candidate=candidate, build=build, build_workspace=None
+                    "checking",
+                    candidate=candidate,
+                    build=build,
+                    build_workspace=None,
+                    build_recovery=None,
+                    base_conflict=None,
                 )
             paths = self.git(
                 "diff", "--no-renames", "--name-only", "-z", j["base"], candidate
@@ -281,6 +326,10 @@ class Worker:
                 if not report["passed"]:
                     if report.get("failure_kind") == "infrastructure":
                         self.update("checking", checks=report)
+                        if report.get("retryable"):
+                            raise RecoverableFailure(
+                                "Infraestructura temporal en checks"
+                            )
                         raise RuntimeError(
                             "Fallo de infraestructura en checks, reanudar tras corregirlo"
                         )
@@ -327,16 +376,71 @@ class Worker:
                             "paths": paths,
                         },
                     )
-                    raise RuntimeError(
-                        "Conflicto al actualizar la base en "
-                        + ", ".join(paths)
-                        + ". Resuelve el merge y usa resume --resolved-commit SHA"
-                    ) from None
+                    tree = exc.stdout.splitlines()[0]
+                    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", tree):
+                        raise RuntimeError(
+                            "Git no devolvió un árbol de conflicto válido"
+                        ) from None
+                    try:
+                        history = reserve(
+                            j,
+                            self.cfg,
+                            "resolve_base",
+                            base=current,
+                            candidate=candidate,
+                            paths=paths,
+                        )
+                    except RuntimeError as exhausted:
+                        raise RuntimeError(
+                            str(exhausted)
+                            + ". Conflicto en "
+                            + ", ".join(paths)
+                            + ". Revisa la resolución y usa resume --resolved-commit SHA"
+                        ) from None
+                    base_report = self.test(current)
+                    if not base_report["passed"]:
+                        if base_report.get("retryable"):
+                            raise RecoverableFailure(
+                                "Infraestructura temporal en la nueva base"
+                            )
+                        raise RuntimeError("Fallan los checks de la nueva base")
+                    self.update(
+                        "building",
+                        base=current,
+                        base_checked=current,
+                        recoveries=history,
+                        build_workspace=None,
+                        build_recovery={
+                            "type": "base_conflict",
+                            "tree": tree,
+                            "base": current,
+                            "candidate": candidate,
+                            "paths": paths,
+                        },
+                        feedback={
+                            "type": "base_conflict",
+                            "paths": paths,
+                            "instruction": "Resolve conflict markers preserving the issue criteria and current base behavior.",
+                        },
+                    )
+                    continue
                 rebased = self.git("commit-tree", tree, "-p", current, "-m", j["title"])
-                if not self.test(current)["passed"]:
+                history = reserve(
+                    j, self.cfg, "refresh_base", base=current, candidate=candidate
+                )
+                base_report = self.test(current)
+                if not base_report["passed"]:
+                    if base_report.get("retryable"):
+                        raise RecoverableFailure(
+                            "Infraestructura temporal en la nueva base"
+                        )
                     raise RuntimeError("Fallan los checks de la nueva base")
                 self.update(
-                    "checking", base=current, base_checked=current, candidate=rebased
+                    "checking",
+                    base=current,
+                    base_checked=current,
+                    candidate=rebased,
+                    recoveries=history,
                 )
                 continue
             self.publish()

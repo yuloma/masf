@@ -1,15 +1,54 @@
 import json
+import re
+import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, closing
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import quote
 
 from masf import config, providers, queue, worker
 from masf.system import command
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "examples/factory.toml"
+
+FAKE_GH = r"""
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+root = Path(__file__).parent
+pid = str(os.getppid())
+args = sys.argv[1:]
+with (root / "requests" / pid).open("a") as log:
+    print(json.dumps(args), file=log)
+
+responses = json.loads((root / "responses.json").read_text())
+if len(args) != 3 or args[:2] != ["api", "--include"] or args[2] not in responses:
+    sys.exit(f"Unexpected gh invocation: {args!r}")
+
+endpoint = args[2]
+barrier = root / "barrier"
+if barrier.is_dir() and endpoint == (barrier / "endpoint").read_text():
+    (barrier / f"scan-{pid}").touch()
+    deadline = time.monotonic() + 15
+    while len(list(barrier.glob("scan-*"))) < 2:
+        if time.monotonic() >= deadline:
+            sys.exit("Timed out waiting for the second scan")
+        time.sleep(0.02)
+
+response = responses[endpoint]
+if response is None:
+    print('HTTP/2.0 403 Forbidden\n\n{"message": "Forbidden"}')
+    sys.exit("gh: Forbidden (HTTP 403)")
+print(json.dumps(response))
+"""
 
 
 class TemporaryTest(unittest.TestCase):
@@ -30,33 +69,165 @@ class TemporaryTest(unittest.TestCase):
 
 
 class Discovery(TemporaryTest):
-    def test_two_pages_two_repositories_concurrent_scans(self):
-        self.cfg["repositories"][1]["enabled"] = True
-
-        def api(endpoint):
-            if "issues?" in endpoint:
-                if endpoint.endswith("page=1"):
-                    return [self.issue, self.issue | {"pull_request": {}}] + [
-                        self.issue | {"labels": []}
-                    ] * 98
-                return [self.issue | {"number": 2}]
-            if "/commits/" in endpoint:
-                return {"sha": "a" * 40}
-            return dict(id=2 if endpoint.endswith("sql") else 1, default_branch="main")
-
-        def scan(_):
-            db = queue.connect(self.root)
-            try:
-                return queue.scan(self.cfg, db)
-            finally:
-                db.close()
-
-        with patch.object(queue, "api", api), ThreadPoolExecutor(2) as pool:
-            self.assertEqual(list(pool.map(scan, range(2))), [0, 0])
-        self.assertEqual(
-            queue.connect(self.root).execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
-            4,
+    def setUp(self):
+        super().setUp()
+        config_file = self.root / "config.toml"
+        config_file.write_text(
+            CONFIG.read_text().replace("enabled = false\nlabel", "enabled = true\nlabel")
         )
+        profile = self.root / "profiles/postgres.yaml"
+        profile.parent.mkdir()
+        profile.write_bytes((CONFIG.parent / "profiles/postgres.yaml").read_bytes())
+        self.scan_argv = [
+            sys.executable, "-m", "masf.cli", "--config", str(config_file), "scan"
+        ]
+        self.state_home = self.root / "state"
+        fake_bin = self.root / "bin"
+        fake_bin.mkdir()
+        self.requests = fake_bin / "requests"
+        self.requests.mkdir()
+        fake_gh = fake_bin / "gh"
+        fake_gh.write_text(f"#!{sys.executable}\n" + FAKE_GH)
+        fake_gh.chmod(0o755)
+        self.responses_file = fake_bin / "responses.json"
+        self.barrier = fake_bin / "barrier"
+        self.scan_options = dict(
+            cwd=ROOT,
+            env={
+                "PATH": str(fake_bin),
+                "XDG_CONFIG_HOME": str(self.root),
+                "XDG_STATE_HOME": str(self.state_home),
+                "PYTHONUTF8": "1",
+            },
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+        )
+        self.slugs = [repo["slug"] for repo in self.cfg["repositories"]]
+        self.responses = {}
+        self.issue_queries = []
+        label = quote(self.repo["label"], safe="")
+        for repo_id, slug in enumerate(self.slugs, start=1):
+            endpoint = f"repos/{slug}"
+            issues = f"{endpoint}/issues?state=open&labels={label}&per_page=100"
+            self.issue_queries.extend([endpoint, f"{issues}&page=1", f"{issues}&page=2"])
+            self.responses[endpoint] = {"id": repo_id, "default_branch": "main"}
+            self.responses[f"{endpoint}/commits/main"] = {"sha": "a" * 40}
+            self.responses[f"{issues}&page=1"] = [
+                self.issue,
+                self.issue | {"number": 3, "pull_request": {}},
+                self.issue | {"number": 4, "state": "closed"},
+                *[self.issue | {"number": 5, "labels": []}] * 97,
+            ]
+            self.responses[f"{issues}&page=2"] = [self.issue | {"number": 2}]
+
+    def run_scan(self, *args):
+        return subprocess.run(
+            [*self.scan_argv, *args], timeout=30, **self.scan_options
+        )
+
+    def jobs(self):
+        database = self.state_home / "masf/queue.sqlite3"
+        with closing(sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)) as db:
+            return db.execute("SELECT repo_id, number, slug, state FROM jobs").fetchall()
+
+    def state_snapshot(self):
+        return {
+            path.relative_to(self.state_home): (
+                path.stat().st_mtime_ns,
+                path.read_bytes() if path.is_file() else None,
+            )
+            for path in (self.state_home, *self.state_home.rglob("*"))
+        }
+
+    def test_two_pages_two_repositories_concurrent_scans(self):
+        self.responses_file.write_text(json.dumps(self.responses))
+        self.barrier.mkdir()
+        (self.barrier / "endpoint").write_text(f"repos/{self.slugs[0]}/commits/main")
+        output = []
+        with ExitStack() as stack:
+            scans = []
+            for _ in range(2):
+                scan = stack.enter_context(
+                    subprocess.Popen(self.scan_argv, **self.scan_options)
+                )
+                stack.callback(scan.kill)
+                scans.append(scan)
+            for scan in scans:
+                stdout, stderr = scan.communicate(timeout=30)
+                self.assertEqual(scan.returncode, 0, stderr)
+                output.extend(stdout.splitlines())
+
+        self.assertCountEqual(
+            [path.name for path in self.barrier.glob("scan-*")],
+            [f"scan-{scan.pid}" for scan in scans],
+        )
+        self.assertCountEqual(
+            self.jobs(),
+            [
+                (repo_id, number, slug, "queued")
+                for repo_id, slug in enumerate(self.slugs, start=1)
+                for number in (1, 2)
+            ],
+        )
+        self.assertCountEqual(
+            output,
+            [
+                f"{slug}#{number} {status}"
+                for slug in self.slugs
+                for number in (1, 2)
+                for status in ("queued", "ya registrado")
+            ],
+        )
+
+    def test_access_failure_does_not_stop_next_repository(self):
+        denied, accessible = self.slugs
+        self.responses[f"repos/{denied}"] = None
+        self.responses_file.write_text(json.dumps(self.responses))
+
+        scan = self.run_scan()
+
+        self.assertEqual(scan.returncode, 1, scan.stderr)
+        self.assertRegex(scan.stderr, rf"(?m)^{re.escape(denied)}: .*HTTP 403")
+        self.assertCountEqual(
+            self.jobs(), [(2, 1, accessible, "queued"), (2, 2, accessible, "queued")]
+        )
+
+    def test_dry_run_preserves_absent_and_existing_state(self):
+        self.responses_file.write_text(json.dumps(self.responses))
+        for existing in (False, True):
+            with self.subTest(existing_state=existing):
+                if existing:
+                    seed = self.run_scan()
+                    self.assertEqual(seed.returncode, 0, seed.stderr)
+                    self.assertEqual(len(self.jobs()), 4)
+                    before = self.state_snapshot()
+                for log in self.requests.iterdir():
+                    log.unlink()
+
+                scan = self.run_scan("--dry-run")
+
+                self.assertEqual(scan.returncode, 0, scan.stderr)
+                self.assertCountEqual(
+                    scan.stdout.splitlines(),
+                    [
+                        f"{slug}#{number} elegible ({self.repo['label']})"
+                        for slug in self.slugs
+                        for number in (1, 2)
+                    ],
+                )
+                self.assertCountEqual(
+                    [
+                        json.loads(line)
+                        for log in self.requests.iterdir()
+                        for line in log.read_text().splitlines()
+                    ],
+                    [["api", "--include", endpoint] for endpoint in self.issue_queries],
+                )
+                if existing:
+                    self.assertEqual(self.state_snapshot(), before)
+                else:
+                    self.assertFalse(self.state_home.exists())
 
     def test_profile_traversal(self):
         file = self.root / "config.toml"

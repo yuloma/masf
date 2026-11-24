@@ -29,14 +29,14 @@ def response_body(output):
     return headers, output
 
 
-def api(endpoint, *opts):
+def api(endpoint, *opts, stdin=None):
     global _retry_at
     if retry_delay():
         raise RuntimeError(
             f"GitHub: límite de peticiones, esperar {retry_delay():.0f}s"
         )
     try:
-        output = command(["gh", "api", "--include", endpoint, *opts])
+        output = command(["gh", "api", "--include", endpoint, *opts], stdin=stdin)
     except ProcessError as exc:
         headers, _ = response_body(exc.stdout)
         if (

@@ -530,10 +530,7 @@ class Worker:
                 head=branch,
                 draft=True,
             )
-            pr = json.loads(
-                command(
-                    ["gh", "api", f"repos/{j['slug']}/pulls", "--input", "-"],
-                    stdin=json.dumps(payload),
-                )
+            pr = api(
+                f"repos/{j['slug']}/pulls", "--input", "-", stdin=json.dumps(payload)
             )
         self.record_pr(pr)

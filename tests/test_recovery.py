@@ -58,6 +58,14 @@ class RecoveryPolicy(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "agotadas"):
             recovery.reserve(self.job, self.cfg, "resolve_base")
 
+    def test_authentication_is_not_retried_even_with_backoff_headers(self):
+        error = ProcessError(
+            "HTTP 401 Unauthorized", "HTTP/2.0 401\nRetry-After: 120\n\n{}"
+        )
+        self.assertIsNone(
+            recovery.schedule(self.job, self.cfg, error, minimum_delay=120)
+        )
+
     def test_waiting_job_does_not_reserve_capacity_and_resumes_when_due(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

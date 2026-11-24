@@ -9,6 +9,17 @@ class RecoverableFailure(RuntimeError):
     pass
 
 
+OPERATOR_MARKERS = (
+    "unauthorized",
+    "unauthenticated",
+    "invalid api key",
+    "authentication",
+    "http 401",
+    "permission denied",
+    "ruta protegida",
+)
+
+
 def reserve(job, cfg, action, **detail):
     history = list(job.get("recoveries", []))
     limit = cfg["service"].get("max_recovery_attempts", 2)
@@ -22,18 +33,7 @@ def retryable(exc):
     from .system import CommandTimeout, ProcessError
 
     text = clean(str(exc))
-    if any(
-        marker in text.lower()
-        for marker in (
-            "unauthorized",
-            "unauthenticated",
-            "invalid api key",
-            "authentication",
-            "http 401",
-            "permission denied",
-            "ruta protegida",
-        )
-    ):
+    if any(marker in text.lower() for marker in OPERATOR_MARKERS):
         return False
     transient = isinstance(exc, (CommandTimeout, RecoverableFailure))
     if isinstance(exc, ProcessError):
@@ -61,6 +61,8 @@ def retryable(exc):
 def schedule(job, cfg, exc, *, minimum_delay=0):
     """Return updates only for known transient failures, never grant permissions."""
     text = clean(str(exc))
+    if any(marker in text.lower() for marker in OPERATOR_MARKERS):
+        return None
     rate_limited = minimum_delay > 0 and (
         "límite de peticiones" in text
         or "retry-after" in getattr(exc, "stdout", "").lower()

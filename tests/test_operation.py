@@ -111,6 +111,20 @@ class GitHubLimits(unittest.TestCase):
         ):
             self.assertEqual(queue.api("repos/test/test"), {"id": 42})
 
+    def test_publication_uses_rate_limit_headers_and_preserves_json_input(self):
+        from masf import queue
+        from masf.system import ProcessError
+
+        payload = '{"draft": true}'
+        error = ProcessError(
+            "gh: HTTP 403", "HTTP/2.0 403 Forbidden\nRetry-After: 120\n\n{}"
+        )
+        with patch("masf.queue.command", side_effect=error) as invoke:
+            with self.assertRaises(ProcessError):
+                queue.api("repos/org/repo/pulls", "--input", "-", stdin=payload)
+            self.assertEqual(invoke.call_args.kwargs["stdin"], payload)
+            self.assertGreater(queue.retry_delay(), 119)
+
 
 class Monitoring(unittest.TestCase):
     def test_failed_pr_lookup_does_not_stop_other_jobs(self):

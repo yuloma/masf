@@ -372,7 +372,11 @@ class Delivery(TemporaryTest):
             commands=[{"argv": ["test"], "code": int(failed)}],
         )
 
-    def api(self, endpoint):
+    def api(self, endpoint, *opts, stdin=None):
+        if stdin is not None:
+            return json.loads(
+                worker.command(["gh", "api", endpoint, *opts], stdin=stdin)
+            )
         return self.prs if "pulls?" in endpoint else self.issue
 
     def run_command(self, args, **kwargs):
@@ -797,7 +801,11 @@ class Delivery(TemporaryTest):
 
         def create(db, cfg, config, state, jobs, job):
             self.job = job
-            self.worker.job = job
+            previous = self.worker
+            self.worker = worker.Worker(previous.db, cfg, config, state, jobs, job)
+            self.worker.url = str(self.source)
+            self.worker.test = previous.test
+            self.worker.recover = previous.recover
             return self.worker
 
         due = max(time.time(), self.job.get("recovery_wait", {}).get("until", 0)) + 1

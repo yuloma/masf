@@ -69,6 +69,8 @@ Antes de crear recursos, el controlador aplicará las siguientes comprobaciones 
 
 ## Probar el perfil sin instalar MASF
 
+Desde la raíz del repositorio, consulta la ayuda con `bash examples/docker/smoke-profile.sh --help` (o `-h`). La ayuda se muestra sin acceso a Docker.
+
 Desde un host Linux con Docker y Compose, `bash examples/docker/smoke-profile.sh` prueba el [perfil de PostgreSQL](../examples/profiles/postgres.yaml) sin credenciales de GitHub ni de IA. Usa la imagen `postgres:17-alpine` y la descarga si falta. Ejecuta `psql` desde `app` contra `db`, crea una tabla en dos proyectos simultáneos y escribe una fila en la base. Comprueba que el candidato empieza vacío y que la base conserva su fila. Al salir retira los dos proyectos y sus volúmenes. Las credenciales de ejemplo solo abren la base efímera de este perfil, que usa una red interna sin puertos publicados.
 
 El [workflow del piloto](../.github/workflows/docker-pilot.yml) valida con `docker compose config` el manifiesto central solo y con la extensión de acceso al motor. Después ejecuta el mismo script en un runner Linux de GitHub al cambiar los manifiestos o la prueba.

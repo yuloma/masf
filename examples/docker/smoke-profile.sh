@@ -1,6 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if (( $# > 0 )); then
+  case "$1" in
+    --help|-h)
+      if (( $# == 1 )); then
+        cat <<'HELP'
+Uso: bash examples/docker/smoke-profile.sh [--help | -h]
+
+Prueba el aislamiento del perfil de PostgreSQL. Comprueba que el candidato
+empieza vacío y que la base conserva su fila de control.
+
+MASF_DOCKER_SOCKET selecciona el socket de Docker (por defecto, /var/run/docker.sock).
+HELP
+        exit 0
+      fi
+      shift
+      ;;
+  esac
+
+  printf 'Argumento desconocido: %s\n' "$1" >&2
+  exit 2
+fi
+
 profile_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../profiles" && pwd -P)
 engine_socket=${MASF_DOCKER_SOCKET:-/var/run/docker.sock}
 engine=(docker --host "unix://$engine_socket")

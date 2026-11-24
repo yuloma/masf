@@ -2,6 +2,7 @@ import argparse
 import fcntl
 import json
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -30,9 +31,23 @@ def doctor(cfg, offline):
     for repo in cfg["repositories"]:
         if repo["enabled"]:
             api(f"repos/{repo['slug']}/issues?per_page=1")
+            observed = False
+            database = xdg("STATE", ".local/state") / "queue.sqlite3"
+            if database.is_file():
+                with sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True) as db:
+                    observed = (
+                        db.execute(
+                            "SELECT 1 FROM jobs WHERE slug=? AND state IN ('pr_open','merged','closed') LIMIT 1",
+                            (repo["slug"],),
+                        ).fetchone()
+                        is not None
+                    )
             print(
                 repo["slug"],
-                "lectura verificada; push y creación de PR pendientes de prueba",
+                "lectura verificada;",
+                "push y creación de PR verificados en el historial"
+                if observed
+                else "push y creación de PR pendientes de prueba",
             )
             for name in sorted(set(repo["routing"].values())):
                 print(

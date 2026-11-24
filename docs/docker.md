@@ -128,3 +128,11 @@ Para trabajos creados por versiones anteriores que carezcan de esa referencia, e
 ```
 
 La ruta debe ser un directorio directo del trabajo. El controlador valida su pertenencia y conserva el aislamiento de los metadatos Git. Si la tarea necesita más tiempo, ajusta `service.step_timeout_seconds` en el TOML antes de reanudarla.
+
+## Diagnosticar una etapa de agente
+
+Cada etapa conserva un archivo `<rol>-<id>.activity.jsonl` en su directorio de evidencia. Registra versión de CLI, tiempos y metadatos de actividad, como inicio y final de herramientas o resultado, asociados al intento y SHA. Los logs del controlador muestran una síntesis periódica de esa actividad.
+
+Cursor se ejecuta con salida `stream-json`. El adaptador exige un resultado terminal completo y valida su contrato. Los fallos conservan la referencia a la actividad y la versión conocida, de forma que un timeout permita contrastar la última señal recibida. El contenido de argumentos, salidas de herramientas y deltas internos queda limitado al transporte temporal del proceso; la actividad persistida contiene metadatos operativos.
+
+Al actualizar una CLI en el host, reconstruye el runner con `bash examples/docker/build-runner.sh codex cursor` para que el servicio utilice esa distribución.

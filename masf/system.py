@@ -28,7 +28,15 @@ class TaskStopped(RuntimeError):
 
 
 def command(
-    args, *, cwd=None, stdin=None, env=None, timeout=120, combined=False, guard=None
+    args,
+    *,
+    cwd=None,
+    stdin=None,
+    env=None,
+    timeout=120,
+    combined=False,
+    guard=None,
+    on_stdout_line=None,
 ):
     deadline = time.monotonic() + timeout
     with ExitStack() as stack:
@@ -39,14 +47,43 @@ def command(
             )
             source.write(stdin)
             source.seek(0)
+        output_file = error_file = reader = None
+        if on_stdout_line:
+            output_file = stack.enter_context(
+                tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8")
+            )
+            reader = stack.enter_context(
+                open(output_file.name, encoding="utf-8", errors="replace")
+            )
+            if not combined:
+                error_file = stack.enter_context(
+                    tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+                )
+        pending = ""
+
+        def drain(final=False):
+            nonlocal pending
+            if reader:
+                pending += reader.read()
+                lines = pending.split("\n")
+                pending = lines.pop()
+                for line in lines:
+                    if line:
+                        on_stdout_line(line)
+                if final and pending:
+                    on_stdout_line(pending)
+                    pending = ""
+
         proc = stack.enter_context(
             subprocess.Popen(
                 args,
                 cwd=cwd,
                 env=env,
                 stdin=source,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT if combined else subprocess.PIPE,
+                stdout=output_file or subprocess.PIPE,
+                stderr=subprocess.STDOUT
+                if combined
+                else (error_file or subprocess.PIPE),
                 text=True,
                 errors="replace",
                 start_new_session=True,
@@ -60,9 +97,19 @@ def command(
                 if remaining <= 0:
                     raise RuntimeError(f"{args[0]}: tiempo agotado ({timeout}s)")
                 try:
-                    stdout, stderr = proc.communicate(timeout=min(1, remaining))
+                    if on_stdout_line:
+                        proc.wait(timeout=min(1, remaining))
+                        drain(final=True)
+                        output_file.seek(0)
+                        stdout = output_file.read()
+                        if error_file:
+                            error_file.seek(0)
+                        stderr = error_file.read() if error_file else None
+                    else:
+                        stdout, stderr = proc.communicate(timeout=min(1, remaining))
                     break
                 except subprocess.TimeoutExpired:
+                    drain()
                     continue
         except BaseException:
             try:
@@ -70,6 +117,7 @@ def command(
             except ProcessLookupError:
                 pass
             proc.communicate()
+            drain(final=True)
             raise
         if proc.returncode:
             raise ProcessError(

@@ -157,3 +157,53 @@ class CursorOutput(unittest.TestCase):
         for payload in ('Progress {"version":1', 'Progress {"version":1} extra'):
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 parse("cursor", "plan", json.dumps({"result": payload}))
+
+
+class ProviderActivity(unittest.TestCase):
+    def test_stream_result_and_incomplete_stream(self):
+        result = {
+            "version": 1,
+            "summary": "Reviewed",
+            "verdict": "pass",
+            "findings": [],
+        }
+        events = [
+            {"type": "system", "subtype": "init"},
+            {"type": "assistant", "message": {"content": []}},
+            {"type": "result", "subtype": "success", "result": json.dumps(result)},
+        ]
+        self.assertEqual(
+            parse("cursor", "review", "\n".join(json.dumps(e) for e in events))[0],
+            result,
+        )
+        with self.assertRaisesRegex(ValueError, "incompleto"):
+            parse("cursor", "review", "\n".join(json.dumps(e) for e in events[:-1]))
+
+    def test_progress_survives_timeout(self):
+        lines = []
+        with self.assertRaisesRegex(RuntimeError, "tiempo agotado"):
+            command(
+                [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    "import time;print('started',flush=True);time.sleep(30)",
+                ],
+                timeout=0.2,
+                on_stdout_line=lines.append,
+            )
+        self.assertEqual(lines, ["started"])
+
+    def test_spooled_stderr_does_not_block_progress(self):
+        lines = []
+        output = command(
+            [
+                sys.executable,
+                "-c",
+                "import sys;sys.stderr.write('x'*200000);print('done')",
+            ],
+            on_stdout_line=lines.append,
+            timeout=3,
+        )
+        self.assertEqual(output, "done")
+        self.assertEqual(lines, ["done"])

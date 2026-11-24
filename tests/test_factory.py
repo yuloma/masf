@@ -331,7 +331,7 @@ class Delivery(TemporaryTest):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def agent(self, role, job, cfg, workspace, inputs, owner, *, guard=None):
+    def agent(self, role, job, cfg, workspace, inputs, owner, *, guard=None, on_activity=None):
         self.roles.append(role)
         if role == "plan":
             result = {"criteria": ["AC1 greet"]}

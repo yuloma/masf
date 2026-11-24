@@ -143,3 +143,5 @@ La entrada de procesos usa un archivo temporal privado para conservar prompts gr
 La aceptación de I2 incluye autorizar con `resume --allow-protected-path RUTA` un archivo exacto de un trabajo bloqueado. La regresión debe conservar el candidato y las rondas, rechazar comodines y rutas no canónicas, mantener la comprobación de otros archivos e invalidar el permiso si cambia la huella de la issue.
 
 La aceptación de recuperación de I2 incluye una construcción interrumpida tras escribir archivos. La reanudación debe reutilizar la copia registrada del mismo SHA y alcance, conservar el plan, contar el siguiente intento y pasar después por checks y revisión. `resume --reuse-workspace RUTA` permite recuperar una copia histórica del propio trabajo y rechaza rutas de otro trabajo o del almacén Git.
+
+La aceptación de diagnóstico de I3 incluye salida en streaming de Cursor con resultado terminal, rechazo de flujos incompletos y conservación de actividad anterior a un timeout. Un proceso que produce abundante stderr debe terminar y entregar su actividad sin bloquear la captura.

@@ -12,6 +12,21 @@ from .queue import api, eligible, fingerprint, latest, save
 from .system import TaskStopped, clean, command, docker_env
 
 
+def saved_workspace(root, path):
+    folder = Path(path).absolute()
+    expected = root.resolve()
+    if (
+        folder.resolve() != folder
+        or folder.parent != expected
+        or folder.name == "git"
+        or not folder.is_dir()
+    ):
+        raise ValueError(
+            "La copia recuperada debe ser un directorio directo del trabajo"
+        )
+    return folder
+
+
 class Worker:
     def __init__(self, db, cfg, config, state, jobs, job):
         self.db, self.cfg, self.config, self.job = db, cfg, config, job
@@ -88,6 +103,10 @@ class Worker:
                 guard=self.guard,
             )
         except Exception as exc:
+            if role == "build" and job["state"] == "building":
+                checkpoint = dict(job.get("build_workspace") or {})
+                checkpoint["error"] = clean(str(exc))
+                self.update("building", build_workspace=checkpoint)
             file.write_text(
                 json.dumps(
                     {
@@ -160,14 +179,35 @@ class Worker:
                 if j["rounds"] >= self.cfg["service"]["max_build_rounds"]:
                     raise RuntimeError("Rondas de construcción agotadas")
                 start = candidate or j["base"]
-                workspace = self.checkout(start)
-                self.update("building", rounds=j["rounds"] + 1)
+                checkpoint = j.get("build_workspace") or {}
+                reused = (
+                    checkpoint.get("input_sha") == start
+                    and checkpoint.get("fingerprint") == j["fingerprint"]
+                )
+                workspace = (
+                    saved_workspace(self.root, checkpoint["path"])
+                    if reused
+                    else self.checkout(start)
+                )
+                checkpoint = {
+                    "path": str(workspace),
+                    "input_sha": start,
+                    "fingerprint": j["fingerprint"],
+                    "error": checkpoint.get("error") if reused else None,
+                }
+                self.update(
+                    "building", rounds=j["rounds"] + 1, build_workspace=checkpoint
+                )
                 build = self.role(
                     "build",
                     start,
                     workspace,
                     plan=j["plan"],
                     feedback=j.get("feedback"),
+                    recovery={
+                        "workspace_reused": reused,
+                        "previous_error": checkpoint.get("error"),
+                    },
                 )
                 if any(
                     name.lower() == ".git"
@@ -183,7 +223,9 @@ class Worker:
                     "commit-tree", tree, "-p", j["base"], "-m", j["title"]
                 )
                 self.git("update-ref", "refs/heads/candidate", candidate)
-                self.update("checking", candidate=candidate, build=build)
+                self.update(
+                    "checking", candidate=candidate, build=build, build_workspace=None
+                )
             paths = self.git(
                 "diff", "--no-renames", "--name-only", "-z", j["base"], candidate
             ).split("\0")

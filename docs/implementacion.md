@@ -151,3 +151,5 @@ La regresión de Cursor usa una muestra de la CLI `2026.11.11-b912975`, sin cred
 La entrada de procesos usa un archivo temporal privado para conservar prompts grandes mientras se consulta el plazo o la elegibilidad. Una regresión con un lector lento verifica el contenido completo en Python 3.11 y versiones posteriores.
 
 La aceptación de I2 incluye autorizar con `resume --allow-protected-path RUTA` un archivo exacto de un trabajo bloqueado. La regresión debe conservar el candidato y las rondas, rechazar comodines y rutas no canónicas, mantener la comprobación de otros archivos e invalidar el permiso si cambia la huella de la issue.
+
+La aceptación de recuperación de I2 incluye una construcción interrumpida tras escribir archivos. La reanudación debe reutilizar la copia registrada del mismo SHA y alcance, conservar el plan, contar el siguiente intento y pasar después por checks y revisión. `resume --reuse-workspace RUTA` permite recuperar una copia histórica del propio trabajo y rechaza rutas de otro trabajo o del almacén Git.

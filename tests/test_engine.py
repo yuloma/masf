@@ -148,3 +148,64 @@ class ComposeChecks(unittest.TestCase):
         worker.recover()
         self.assertFalse(command(volume))
         self.assertFalse((evidence / "cleanup.json").exists())
+
+    def test_cancel_running_check_removes_container(self):
+        import time
+        from masf.system import TaskStopped
+
+        workspace = self.root / "cancel-workspace"
+        workspace.mkdir()
+        repo = {
+            "runner_image": "masf-runner:pilot",
+            "setup": [],
+            "checks": [["sleep", "30"]],
+        }
+        folder = self.root / "cancel-evidence"
+        started = time.monotonic()
+
+        def guard():
+            if time.monotonic() - started > 0.7:
+                raise TaskStopped("cancelled")
+
+        with self.assertRaises(TaskStopped):
+            verify(
+                repo,
+                self.config,
+                workspace,
+                "cancelled",
+                folder,
+                "cancel-test",
+                30,
+                guard=guard,
+            )
+        report = json.loads((folder / "checks.json").read_text())
+        self.assertFalse((folder / "cleanup.json").exists())
+        self.assertFalse(
+            command(
+                ["docker", "ps", "-aq", "--filter", "name=^/" + report["name"] + "$"]
+            )
+        )
+
+    def test_total_check_deadline(self):
+        import time
+
+        workspace = self.root / "deadline-workspace"
+        workspace.mkdir()
+        repo = {
+            "runner_image": "masf-runner:pilot",
+            "setup": [["sleep", "0.6"]],
+            "checks": [["sleep", "0.6"]],
+        }
+        started = time.monotonic()
+        report = verify(
+            repo,
+            self.config,
+            workspace,
+            "deadline",
+            self.root / "deadline-evidence",
+            "deadline-test",
+            1,
+        )
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["failure_kind"], "infrastructure")
+        self.assertLess(time.monotonic() - started, 3)

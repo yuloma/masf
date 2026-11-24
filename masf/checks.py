@@ -5,7 +5,7 @@ import re
 import time
 import uuid
 
-from .system import clean, command, docker_env
+from .system import TaskStopped, clean, command, docker_env
 
 
 def allow_keys(data, keys, field):
@@ -69,7 +69,12 @@ def compose_files(config, profile, folder, workspace):
     return target
 
 
-def verify(repo, config, workspace, sha, folder, owner, timeout):
+def verify(repo, config, workspace, sha, folder, owner, timeout, *, guard=None):
+    deadline = time.monotonic() + timeout
+
+    def remaining():
+        return max(0, deadline - time.monotonic())
+
     name = "masf-check-" + uuid.uuid4().hex
     env = docker_env() | {"MASF_WORKSPACE": str(workspace)}
     record = {"sha": sha, "name": name, "commands": [], "passed": False}
@@ -90,7 +95,14 @@ def verify(repo, config, workspace, sha, folder, owner, timeout):
             name,
             *profiles,
         ]
-        model = json.loads(command(stack + ["config", "--format", "json"], env=env))
+        model = json.loads(
+            command(
+                stack + ["config", "--format", "json"],
+                env=env,
+                timeout=remaining(),
+                guard=guard,
+            )
+        )
         record["profile_sha256"] = hashlib.sha256(
             json.dumps(model, sort_keys=True).encode()
         ).hexdigest()
@@ -147,20 +159,32 @@ def verify(repo, config, workspace, sha, folder, owner, timeout):
     report.write_text(json.dumps(record, indent=2))
     file.write_text(json.dumps([stop, str(workspace)]))
     try:
-        command(start, env=env, timeout=timeout)
+        command(start, env=env, timeout=remaining(), guard=guard)
         for args in repo["setup"] + repo["checks"]:
             then = time.monotonic()
             entry = {"argv": args}
             record["commands"].append(entry)
             try:
                 output = command(
-                    execute + args, env=env, timeout=timeout, combined=True
+                    execute + args,
+                    env=env,
+                    timeout=remaining(),
+                    combined=True,
+                    guard=guard,
                 )
                 entry.update(code=0, log=clean(output)[-4000:])
+            except TaskStopped:
+                record["failure_kind"] = "cancelled"
+                raise
             except RuntimeError as exc:
                 error = str(exc)
                 code = re.match(r"docker \((\d+)\)", error)
                 entry.update(code=int(code[1]) if code else None, log=error)
+                record["failure_kind"] = (
+                    "infrastructure"
+                    if entry["code"] in (None, 125, 126, 127)
+                    else "functional"
+                )
                 break
             finally:
                 entry["seconds"] = round(time.monotonic() - then, 3)

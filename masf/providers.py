@@ -23,6 +23,7 @@ def parse(provider, role, output):
     meta = {}
     if provider == "codex":
         messages = []
+        completed = False
         for line in output.splitlines():
             event = json.loads(line)
             if event["type"] in ("error", "turn.failed"):
@@ -32,8 +33,12 @@ def parse(provider, role, output):
             item = event.get("item", {})
             if item.get("type") == "agent_message":
                 messages.append(item["text"])
+            if event["type"] == "turn.completed":
+                completed = True
             if "usage" in event:
                 meta["usage"] = event["usage"]
+        if not completed:
+            raise ValueError("Codex: flujo incompleto, falta turn.completed")
         if not messages:
             raise ValueError("Codex: falta el mensaje final")
         payload = messages[-1]
@@ -48,9 +53,28 @@ def parse(provider, role, output):
             {k: event[k] for k in ("model", "usage", "total_cost_usd") if k in event}
         )
     if isinstance(payload, str):
-        payload = json.loads(
-            re.sub(r"^\x60\x60\x60(?:json)?\s*|\s*\x60\x60\x60$", "", payload.strip())
+        text = re.sub(
+            r"^\x60\x60\x60(?:json)?\s*|\s*\x60\x60\x60$", "", payload.strip()
         )
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            if provider != "cursor":
+                raise
+            # Cursor's JSON result concatenates progress text and the final answer.
+            decoder = json.JSONDecoder()
+            for match in re.finditer(r"\{", text):
+                try:
+                    candidate, end = decoder.raw_decode(text, match.start())
+                except json.JSONDecodeError:
+                    continue
+                if not text[end:].strip():
+                    payload = candidate
+                    break
+            else:
+                raise ValueError(
+                    "Cursor: falta un objeto JSON final completo"
+                ) from None
     if (
         not isinstance(payload, dict)
         or payload.get("version") != 1
@@ -80,7 +104,7 @@ def parse(provider, role, output):
     return payload, meta
 
 
-def invoke(role, job, cfg, workspace, inputs, owner):
+def invoke(role, job, cfg, workspace, inputs, owner, *, guard=None):
     provider = job["repo"]["routing"][role]
     settings = cfg["providers"][provider]
     exe = settings["executable"]
@@ -169,7 +193,10 @@ def invoke(role, job, cfg, workspace, inputs, owner):
                 "--mount",
                 f"type=bind,src={request.name},dst=/run/masf-task,readonly",
             ]
-            args.append("Read /run/masf-task and carry out the role described there.")
+            args.append(
+                "Read /run/masf-task and carry out the role described there. "
+                f"Your final answer must be only a JSON object matching {SHAPES[role]}."
+            )
         else:
             run += ["-i"]
             if provider == "codex":
@@ -180,6 +207,7 @@ def invoke(role, job, cfg, workspace, inputs, owner):
                 env=docker_env(),
                 stdin=None if provider == "cursor" else prompt,
                 timeout=cfg["service"]["step_timeout_seconds"],
+                guard=guard,
             )
             result, meta = parse(provider, role, output)
         finally:

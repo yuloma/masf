@@ -11,8 +11,18 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .config import load, xdg
-from .queue import api, claim, connect, eligible, fingerprint, renew, save, scan
-from .system import clean, command, docker_env
+from .queue import (
+    api,
+    claim,
+    connect,
+    eligible,
+    fingerprint,
+    renew,
+    retry_delay,
+    save,
+    scan,
+)
+from .system import TaskStopped, clean, command, docker_env
 from .worker import Worker
 
 
@@ -94,6 +104,8 @@ def process_task(cfg, config, root, job):
         )
         Worker(db, cfg, config, root, jobs, job).process()
         return 0
+    except TaskStopped:
+        return 0
     except Exception as exc:
         reason = clean(str(exc))
         save(db, job, "blocked", retry=job["state"], reason=reason)
@@ -109,14 +121,22 @@ def process_task(cfg, config, root, job):
 
 def tick(db, cfg, config, root, once):
     errors = scan(cfg, db)
+    if retry_delay():
+        return errors + 1
     active = {repo["slug"] for repo in cfg["repositories"] if repo["enabled"]}
     for row in db.execute("SELECT data FROM jobs WHERE state='pr_open'").fetchall():
         job = json.loads(row[0])
         if job["slug"] in active:
-            pr = api(f"repos/{job['slug']}/pulls/{job['pr_number']}")
-            if pr["state"] == "closed":
-                job.pop("attempt", None)
-                save(db, job, "merged" if pr["merged_at"] else "closed")
+            try:
+                pr = api(f"repos/{job['slug']}/pulls/{job['pr_number']}")
+                if pr["state"] == "closed":
+                    job.pop("attempt", None)
+                    save(db, job, "merged" if pr["merged_at"] else "closed")
+            except RuntimeError as exc:
+                print(f"{job['slug']}: {clean(str(exc))}", file=sys.stderr, flush=True)
+                errors += 1
+    if retry_delay():
+        return errors + 1
     limit = 1 if once else cfg["service"]["max_parallel_jobs"]
     pending = []
     for row in db.execute(
@@ -203,6 +223,11 @@ def main():
                     j.get("reason", ""),
                 )
             return 0
+        if args.cmd == "serve":
+            print(
+                f"MASF serve activo, configuración {config}, sondeo cada {cfg['service']['poll_seconds']}s",
+                flush=True,
+            )
         with (root / "worker.lock").open("a") as lock:
             while True:
                 try:
@@ -220,7 +245,14 @@ def main():
                     fcntl.flock(lock, fcntl.LOCK_UN)
                 if args.cmd == "run":
                     return bool(errors)
-                time.sleep(cfg["service"]["poll_seconds"] * (2 if errors else 1))
+                delay = max(
+                    retry_delay(), cfg["service"]["poll_seconds"] * (2 if errors else 1)
+                )
+                print(
+                    f"MASF sondeo completado, errores={errors}, espera={delay:.0f}s",
+                    flush=True,
+                )
+                time.sleep(delay)
     except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
         print(clean(str(exc)), file=sys.stderr)
         return 1

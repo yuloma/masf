@@ -60,3 +60,11 @@ Para preparar I2, el siguiente agente debe poder partir del paquete y la cola en
 ## Verificación de esta implementación
 
 La suite de Python usa un remoto Git temporal y dobles de los proveedores y de GitHub. Comprueba la paginación, las claves por repositorio, el vencimiento de reservas, el rechazo de rutas protegidas y la recuperación del mismo candidato tras un 403 o una respuesta perdida del publicador. Las pruebas optativas con Engine ejecutan dos proyectos Compose independientes, comprueban el código de un comando fallido y recuperan volúmenes tras una limpieza interrumpida. Los valores opcionales `MASF_SMOKE_BASE_SUBNET` y `MASF_SMOKE_CANDIDATE_SUBNET` deben preservar el dato de control y permitir retirar ambos proyectos al finalizar. [Comandos de aceptación](docker.md#autenticación-y-diagnóstico).
+
+## Regresiones de operación autónoma
+
+Antes de entregar una actualización, los checks de `main` deben pasar dentro del runner instalado. Las aceptaciones incluyen una respuesta de Codex sin `turn.completed`, un timeout de infraestructura que preserve SHA y rondas, recuperación de un PR creado antes de avanzar la base, interrupción y limpieza de un check activo, plazo acumulado de checks y respeto de los tiempos de espera de GitHub. La CI ejecuta las pruebas con Engine mediante la imagen de runtime.
+
+La regresión de Cursor usa una muestra de la CLI `2026.11.11-b912975`, sin credenciales. Su envoltura JSON puede concatenar progreso y respuesta en `result`. El adaptador debe aceptar el objeto final completo y rechazar objetos truncados o seguidos de texto adicional.
+
+La entrada de procesos usa un archivo temporal privado para conservar prompts grandes mientras se consulta el plazo o la elegibilidad. Una regresión con un lector lento verifica el contenido completo en Python 3.11 y versiones posteriores.

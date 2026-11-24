@@ -9,7 +9,7 @@ from urllib.parse import urlencode
 
 from . import checks, providers
 from .queue import api, eligible, fingerprint, latest, save
-from .system import clean, command, docker_env
+from .system import TaskStopped, clean, command, docker_env
 
 
 class Worker:
@@ -22,10 +22,17 @@ class Worker:
             folder.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.store = self.root / "git"
         self.url = f"https://github.com/{job['slug']}.git"
+        self.next_admission = 0
         self.owner = job.setdefault("owner", uuid.uuid4().hex)
 
     def update(self, state, **fields):
         save(self.db, self.job, state, **fields)
+
+    def guard(self):
+        if time.monotonic() >= self.next_admission:
+            self.next_admission = time.monotonic() + 5
+            if not self.admission():
+                raise TaskStopped("La tarea dejó de ser elegible")
 
     def git(self, *args, workspace=None, stdin=None):
         prefix = [
@@ -63,6 +70,7 @@ class Worker:
             self.evidence / uuid.uuid4().hex,
             self.owner,
             self.cfg["service"]["step_timeout_seconds"],
+            guard=self.guard,
         )
 
     def role(self, role, sha, folder, **inputs):
@@ -77,6 +85,7 @@ class Worker:
                 folder,
                 dict(title=job["title"], body=job["body"], sha=sha, **inputs),
                 self.owner,
+                guard=self.guard,
             )
         except Exception as exc:
             file.write_text(
@@ -125,6 +134,8 @@ class Worker:
         repo = j["repo"]
         self.update(j["state"])
         self.recover()
+        if j.get("intent") and self.reconcile_publication():
+            return
         if not self.admission():
             return
         if not self.store.exists():
@@ -186,6 +197,11 @@ class Worker:
             if report.get("sha") != candidate or not report.get("passed"):
                 report = self.test(candidate)
                 if not report["passed"]:
+                    if report.get("failure_kind") == "infrastructure":
+                        self.update("checking", checks=report)
+                        raise RuntimeError(
+                            "Fallo de infraestructura en checks, reanudar tras corregirlo"
+                        )
                     self.update("building", feedback=report, checks=report)
                     continue
                 self.update("reviewing", checks=report)
@@ -220,6 +236,50 @@ class Worker:
             self.publish()
             return
 
+    def existing_pr(self):
+        j = self.job
+        params = urlencode(
+            dict(
+                head=j["slug"].split("/")[0] + f":masf/issue-{j['number']}",
+                base=j["branch"],
+                state="all",
+            )
+        )
+        return api(f"repos/{j['slug']}/pulls?{params}")
+
+    def record_pr(self, pr):
+        j = self.job
+        if (
+            f"<!-- masf:{self.owner} -->" not in pr["body"]
+            or pr["head"]["sha"] != j["candidate"]
+            or pr["head"]["repo"]["full_name"] != j["slug"]
+            or pr.get("base", {}).get("ref", j["branch"]) != j["branch"]
+        ):
+            raise RuntimeError("PR con procedencia o SHA inesperados")
+        state = (
+            "pr_open"
+            if pr["state"] == "open"
+            else ("merged" if pr["merged_at"] else "closed")
+        )
+        self.update(state, pr=pr["html_url"], pr_number=pr["number"], reason="")
+
+    def reconcile_publication(self):
+        j = self.job
+        matches = self.existing_pr()
+        if not matches:
+            return False
+        if not (
+            j.get("checks", {}).get("passed")
+            and j["checks"]["sha"]
+            == j.get("review", {}).get("sha")
+            == j.get("intent")
+            == j.get("candidate")
+            and j["review"]["result"]["verdict"] == "pass"
+        ):
+            raise RuntimeError("No se puede reconciliar un PR sin evidencia del SHA")
+        self.record_pr(matches[0])
+        return True
+
     def publish(self):
         j = self.job
         branch = f"masf/issue-{j['number']}"
@@ -232,24 +292,19 @@ class Worker:
         ):
             raise ValueError("Falta la aprobación del SHA")
         remote = self.git("ls-remote", self.url, ref)
-        if remote and remote.split()[0] != sha:
-            raise RuntimeError("Rama remota con SHA inesperado")
-        if remote and j.get("intent") != sha:
-            raise RuntimeError("Rama preexistente sin intención de publicación")
-        self.update("publishing", intent=sha)
-        if not remote:
+        previous = remote.split()[0] if remote else ""
+        if previous and previous not in (j.get("intent"), j.get("previous_intent")):
+            raise RuntimeError("Rama remota con SHA inesperado o sin procedencia")
+        self.update("publishing", intent=sha, previous_intent=previous)
+        if previous != sha:
             self.git(
-                "push", "--force-with-lease=" + ref + ":", self.url, sha + ":" + ref
+                "push",
+                "--force-with-lease=" + ref + ":" + previous,
+                self.url,
+                sha + ":" + ref,
             )
         marker = f"<!-- masf:{self.owner} -->"
-        params = urlencode(
-            dict(
-                head=j["slug"].split("/")[0] + ":" + branch,
-                base=j["branch"],
-                state="all",
-            )
-        )
-        matches = api(f"repos/{j['slug']}/pulls?{params}")
+        matches = self.existing_pr()
         if matches:
             pr = matches[0]
         else:
@@ -271,15 +326,4 @@ class Worker:
                     stdin=json.dumps(payload),
                 )
             )
-        if (
-            marker not in pr["body"]
-            or pr["head"]["sha"] != sha
-            or pr["head"]["repo"]["full_name"] != j["slug"]
-        ):
-            raise RuntimeError("PR con procedencia o SHA inesperados")
-        state = (
-            "pr_open"
-            if pr["state"] == "open"
-            else ("merged" if pr["merged_at"] else "closed")
-        )
-        self.update(state, pr=pr["html_url"], pr_number=pr["number"], reason="")
+        self.record_pr(pr)

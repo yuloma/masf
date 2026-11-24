@@ -2,14 +2,63 @@ import hashlib
 import json
 import sqlite3
 import sys
+import time
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 
-from .system import command
+from .system import ProcessError, command
+
+
+_retry_at = 0
+
+
+def retry_delay():
+    return max(0, _retry_at - time.monotonic())
+
+
+def response_body(output):
+    headers = {}
+    while output.startswith("HTTP/"):
+        head, separator, output = output.replace("\r\n", "\n").partition("\n\n")
+        if not separator:
+            raise ValueError("Respuesta HTTP incompleta de GitHub")
+        for line in head.splitlines()[1:]:
+            key, sep, value = line.partition(":")
+            if sep:
+                headers[key.lower()] = value.strip()
+    return headers, output
 
 
 def api(endpoint, *opts):
-    output = command(["gh", "api", endpoint, *opts])
-    return json.loads(output)
+    global _retry_at
+    if retry_delay():
+        raise RuntimeError(
+            f"GitHub: límite de peticiones, esperar {retry_delay():.0f}s"
+        )
+    try:
+        output = command(["gh", "api", "--include", endpoint, *opts])
+    except ProcessError as exc:
+        headers, _ = response_body(exc.stdout)
+        if (
+            headers.get("x-ratelimit-remaining") == "0"
+            or "retry-after" in headers
+            or "HTTP 429" in exc.stderr
+        ):
+            wait = 60
+            if "retry-after" in headers:
+                try:
+                    wait = float(headers["retry-after"])
+                except ValueError:
+                    wait = (
+                        parsedate_to_datetime(headers["retry-after"]).timestamp()
+                        - time.time()
+                    )
+            elif "x-ratelimit-reset" in headers:
+                wait = float(headers["x-ratelimit-reset"]) - time.time()
+            _retry_at = time.monotonic() + max(1, wait)
+        raise
+    _, body = response_body(output)
+    return json.loads(body)
 
 
 def eligible(issue, repo):

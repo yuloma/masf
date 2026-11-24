@@ -53,9 +53,28 @@ def parse(provider, role, output):
             {k: event[k] for k in ("model", "usage", "total_cost_usd") if k in event}
         )
     if isinstance(payload, str):
-        payload = json.loads(
-            re.sub(r"^\x60\x60\x60(?:json)?\s*|\s*\x60\x60\x60$", "", payload.strip())
+        text = re.sub(
+            r"^\x60\x60\x60(?:json)?\s*|\s*\x60\x60\x60$", "", payload.strip()
         )
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            if provider != "cursor":
+                raise
+            # Cursor's JSON result concatenates progress text and the final answer.
+            decoder = json.JSONDecoder()
+            for match in re.finditer(r"\{", text):
+                try:
+                    candidate, end = decoder.raw_decode(text, match.start())
+                except json.JSONDecodeError:
+                    continue
+                if not text[end:].strip():
+                    payload = candidate
+                    break
+            else:
+                raise ValueError(
+                    "Cursor: falta un objeto JSON final completo"
+                ) from None
     if (
         not isinstance(payload, dict)
         or payload.get("version") != 1
@@ -174,7 +193,10 @@ def invoke(role, job, cfg, workspace, inputs, owner, *, guard=None):
                 "--mount",
                 f"type=bind,src={request.name},dst=/run/masf-task,readonly",
             ]
-            args.append("Read /run/masf-task and carry out the role described there.")
+            args.append(
+                "Read /run/masf-task and carry out the role described there. "
+                f"Your final answer must be only a JSON object matching {SHAPES[role]}."
+            )
         else:
             run += ["-i"]
             if provider == "codex":

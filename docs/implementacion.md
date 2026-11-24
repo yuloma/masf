@@ -64,3 +64,5 @@ La suite de Python usa un remoto Git temporal y dobles de los proveedores y de G
 ## Regresiones de operación autónoma
 
 Antes de entregar una actualización, los checks de `main` deben pasar dentro del runner instalado. Las aceptaciones incluyen una respuesta de Codex sin `turn.completed`, un timeout de infraestructura que preserve SHA y rondas, recuperación de un PR creado antes de avanzar la base, interrupción y limpieza de un check activo, plazo acumulado de checks y respeto de los tiempos de espera de GitHub. La CI ejecuta las pruebas con Engine mediante la imagen de runtime.
+
+La regresión de Cursor usa una muestra de la CLI `2026.11.11-b912975`, sin credenciales. Su envoltura JSON puede concatenar progreso y respuesta en `result`. El adaptador debe aceptar el objeto final completo y rechazar objetos truncados o seguidos de texto adicional.

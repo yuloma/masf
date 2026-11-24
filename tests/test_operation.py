@@ -128,3 +128,19 @@ class Monitoring(unittest.TestCase):
                 self.assertEqual(cli.tick(db, cfg, root / "config.toml", root, True), 1)
                 process.assert_called_once()
             db.close()
+
+
+class CursorOutput(unittest.TestCase):
+    def test_progress_and_final_object_from_real_cli(self):
+        from pathlib import Path
+
+        fixture = Path(__file__).parent / "fixtures/cursor-2026.11.11-b912975.json"
+        result, meta = parse("cursor", "plan", fixture.read_text())
+        self.assertEqual(result["version"], 1)
+        self.assertEqual(len(result["criteria"]), 1)
+        self.assertIn("usage", meta)
+
+    def test_rejects_truncated_or_nonterminal_object(self):
+        for payload in ('Progress {"version":1', 'Progress {"version":1} extra'):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                parse("cursor", "plan", json.dumps({"result": payload}))

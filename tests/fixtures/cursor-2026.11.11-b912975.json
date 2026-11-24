@@ -1,0 +1,18 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "duration_ms": 8094,
+  "duration_api_ms": 8094,
+  "result": "I'll inspect the workspace and README to draft a verification criterion for the MASF name.{\"version\":1,\"summary\":\"Comprobar en README.md que MASF se presenta como Multi Agent Software Factory.\",\"criteria\":[\"AC1 README.md declara que MASF corresponde a Multi Agent Software Factory\"]}",
+  "session_id": "fixture",
+  "request_id": "fixture",
+  "usage": {
+    "inputTokens": 9861,
+    "outputTokens": 356,
+    "cacheReadTokens": 26112,
+    "cacheWriteTokens": 0,
+    "reasoningTokens": 234
+  },
+  "cli_version": "2026.11.11-b912975"
+}

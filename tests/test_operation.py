@@ -207,3 +207,68 @@ class ProviderActivity(unittest.TestCase):
         )
         self.assertEqual(output, "done")
         self.assertEqual(lines, ["done"])
+
+
+class CursorReviewPermissions(unittest.TestCase):
+    def test_review_is_noninteractive_with_readonly_code_and_readable_diff(self):
+        import tempfile
+        from pathlib import Path
+        from masf import providers
+
+        diff = "diff --git a/file b/file\n+print(42)\n"
+        seen = {}
+
+        def run(args, **kwargs):
+            if args[-1] == "--version":
+                return "2026.11.22-e9042b2"
+            if args[:3] == ["docker", "rm", "-f"]:
+                return ""
+            seen["args"] = args
+            mount = next(value for value in args if "dst=/run/masf-task" in value)
+            source = mount.split("src=", 1)[1].split(",dst=", 1)[0]
+            seen["prompt"] = Path(source).read_text()
+            return json.dumps(
+                {
+                    "type": "result",
+                    "result": json.dumps(
+                        {
+                            "version": 1,
+                            "summary": "Reviewed",
+                            "verdict": "pass",
+                            "findings": [],
+                        }
+                    ),
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "code"
+            workspace.mkdir()
+            cfg = {
+                "providers": {"cursor": {"executable": "agent"}},
+                "service": {"step_timeout_seconds": 10},
+            }
+            job = {"repo": {"routing": {"review": "cursor"}, "runner_image": "runner"}}
+            with patch("masf.providers.command", side_effect=run):
+                providers.invoke("review", job, cfg, workspace, {"diff": diff}, "owner")
+            self.assertIn("--force", seen["args"])
+            self.assertNotIn("--mode", seen["args"])
+            self.assertIn(f"{workspace}:/workspace:ro", seen["args"])
+            self.assertIn(diff, seen["prompt"])
+
+
+class StreamingFailurePrivacy(unittest.TestCase):
+    def test_structured_payload_stays_out_of_error_message(self):
+        from masf.system import ProcessError
+
+        with self.assertRaises(ProcessError) as caught:
+            command(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys;print('private tool payload');sys.exit(2)",
+                ],
+                on_stdout_line=lambda line: None,
+            )
+        self.assertNotIn("private tool payload", str(caught.exception))
+        self.assertEqual(caught.exception.stdout, "")

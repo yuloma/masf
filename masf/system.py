@@ -120,9 +120,12 @@ def command(
             drain(final=True)
             raise
         if proc.returncode:
+            detail = stderr or (
+                "Consulta la actividad del proveedor" if on_stdout_line else stdout
+            )
             raise ProcessError(
-                f"{args[0]} ({proc.returncode}): " + clean(stderr or stdout)[-1800:],
-                stdout,
+                f"{args[0]} ({proc.returncode}): " + clean(detail)[-1800:],
+                "" if on_stdout_line else stdout,
                 stderr,
             )
         return stdout.rstrip("\n")

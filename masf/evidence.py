@@ -32,7 +32,7 @@ def digest(value):
 @lru_cache
 def revisions():
     sources = {path.name: path.read_text() for path in Path(__file__).parent.glob("*.py")}
-    policy = ("checks.py", "ci.py", "cli.py", "config.py", "github_ci.py", "observe.py",
+    policy = ("actions.py", "checks.py", "ci.py", "cli.py", "config.py", "github_ci.py", "observe.py",
               "providers.py", "queue.py", "recovery.py", "worker.py")
     return {"engine": "sha256:" + digest(sources),
             "policy": "sha256:" + digest({name: sources[name] for name in policy})}

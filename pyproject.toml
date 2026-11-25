@@ -14,3 +14,6 @@ masf = "masf.cli:main"
 
 [tool.setuptools]
 packages = ["masf"]
+
+[tool.setuptools.package-data]
+masf = ["dashboard/*.html", "dashboard/*.css", "dashboard/*.js"]

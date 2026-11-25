@@ -31,6 +31,12 @@ def saved_workspace(root, path):
     return folder
 
 
+class ProtectedPaths(RuntimeError):
+    def __init__(self, paths):
+        super().__init__("Ruta protegida: " + paths[0])
+        self.paths = paths
+
+
 class Worker:
     def __init__(self, db, cfg, config, state, jobs, job):
         self.db, self.cfg, self.config, self.job = db, cfg, config, job
@@ -80,8 +86,9 @@ class Worker:
         return folder
 
     @contextmanager
-    def stage(self, role, sha, *, provider=None, commands=(), evidence_files=()):
+    def stage(self, role, sha, *, provider=None, commands=(), evidence_files=(), settings=None):
         job = self.job
+        settings = self.cfg if settings is None else settings
         prior = stage_attempts(self.db, job, role=role) if self.db is not None else []
         previous = prior[-1] if prior else {}
         ident = uuid.uuid4().hex
@@ -102,7 +109,9 @@ class Worker:
             "finished_at": None, "duration_seconds": None, "status": "active",
             "model": model(self.cfg.get("providers", {}).get(provider, {}).get("model"),
                            applicable=provider is not None),
-            "usage": usage(), "provenance": provenance(self.cfg, job),
+            "usage": usage(), "provenance": provenance(settings, job),
+            "configured_timeout_seconds": settings["service"].get("step_timeout_seconds")
+                                          if provider or role == "checks" else None,
             "result": None, "error": None, "explanation": explanation(evidence=refs),
             "commands": list(commands), "evidence_file": file.name,
             "purpose": ("candidate" if sha == job.get("candidate") else "base")
@@ -183,7 +192,11 @@ class Worker:
         job = self.job
         require_lease(self.db, job)
         provider = job["repo"]["routing"][role]
-        with self.stage(role, sha, provider=provider) as stage:
+        settings = self.cfg
+        timeout = (job.get("stage_timeouts") or {}).get(role)
+        if timeout is not None:
+            settings = self.cfg | {"service": self.cfg["service"] | {"step_timeout_seconds": timeout}}
+        with self.stage(role, sha, provider=provider, settings=settings) as stage:
             stage["explanation"]["criteria"] = (inputs.get("plan") or {}).get("criteria", [])
             activity_file = self.evidence / f"{role}-{stage['id']}.activity.jsonl"
             last_activity_log = 0
@@ -216,8 +229,12 @@ class Worker:
                     last_activity_log = now
 
             try:
+                if role in (job.get("routing_override") or {}) and not settings["providers"].get(provider, {}).get("enabled"):
+                    raise RuntimeError("El proveedor asignado a este trabajo está deshabilitado")
+                if job.get("operator_feedback"):
+                    inputs["operator_feedback"] = job["operator_feedback"]
                 result = providers.invoke(
-                    role, job, self.cfg, folder,
+                    role, job, settings, folder,
                     dict(title=job["title"], body=job["body"], sha=sha, **inputs),
                     self.owner, guard=self.guard, on_activity=activity,
                 )
@@ -312,7 +329,8 @@ class Worker:
             planning = self.role("plan", j["base"], self.checkout(j["base"]))
             result = planning["result"]
             if "question" in result:
-                self.update("needs_input", reason=result["question"], plan_attempt=planning.get("stage_attempt"))
+                self.update("needs_input", reason=result["question"], retry="planning",
+                            plan_attempt=planning.get("stage_attempt"))
                 return
             self.update("building", plan=result, reason="", plan_attempt=planning.get("stage_attempt"))
         while self.admission():
@@ -322,7 +340,8 @@ class Worker:
                     return
                 recovery = j.get("build_recovery") or {}
                 checkpoint = j.get("build_workspace") or {}
-                if not checkpoint.get("result") and (
+                operator_resume = checkpoint.get("operator_resume")
+                if not operator_resume and not checkpoint.get("result") and (
                     recovery.get("started") or (
                         not recovery and checkpoint
                         and self.cfg["service"].get("max_recovery_attempts", 2)
@@ -332,10 +351,12 @@ class Worker:
                     recovery = {**(recovery or {"type": "retry"}), "started": False}
                     self.update("building", recoveries=history, build_recovery=recovery)
                 normal_rounds = j["rounds"] - j.get("recovery_builds", 0)
+                counts = ci.limits(j, self.cfg)
                 if (
                     not recovery
+                    and not operator_resume
                     and not j.get("pr_number")
-                    and normal_rounds >= self.cfg["service"]["max_build_rounds"]
+                    and normal_rounds >= counts["build_limit"]
                 ):
                     raise RuntimeError("Rondas de construcción agotadas")
                 start = candidate or j["base"]
@@ -344,9 +365,8 @@ class Worker:
                     and checkpoint.get("fingerprint") == j["fingerprint"]
                 )
                 same_round = bool(
-                    j.get("pr_number") and reused and checkpoint.get("round")
+                    (j.get("pr_number") or operator_resume) and reused and checkpoint.get("round")
                 )
-                counts = ci.limits(j, self.cfg)
                 if not recovery and not same_round and normal_rounds >= counts["build_limit"]:
                     if j.get("pr_number"):
                         self.update("needs_input", retry="building", ci_intervention=True,
@@ -363,7 +383,8 @@ class Worker:
                     "input_sha": start,
                     "fingerprint": j["fingerprint"],
                     "error": checkpoint.get("error") if reused else None,
-                    "round": j["rounds"] if same_round else j["rounds"] + 1,
+                    "round": checkpoint["round"] if operator_resume and same_round
+                             else j["rounds"] if same_round else j["rounds"] + 1,
                     **({"result": checkpoint["result"]} if same_round and "result" in checkpoint else {}),
                 }
                 if not same_round:
@@ -378,8 +399,9 @@ class Worker:
                     )
                 build = checkpoint.get("result")
                 if build is None:
-                    if same_round and recovery:
-                        self.update("building", build_recovery={**recovery, "started": True})
+                    if same_round:
+                        self.update("building", build_workspace=checkpoint,
+                                    build_recovery={**recovery, "started": True} if recovery else None)
                     build = self.role(
                         "build", start, workspace, plan=j["plan"], feedback=j.get("feedback"),
                         recovery={"workspace_reused": reused,
@@ -439,15 +461,13 @@ class Worker:
             paths = self.git(
                 "diff", "--no-renames", "--name-only", "-z", j["base"], candidate
             ).split("\0")
-            for path in paths:
-                approval = j.get("path_approvals", {}).get(path, {})
-                if approval.get("fingerprint") == j["fingerprint"]:
-                    continue
-                if any(
-                    fnmatch.fnmatchcase(path, pattern)
-                    for pattern in repo.get("protected_paths", [])
-                ):
-                    raise RuntimeError("Ruta protegida: " + path)
+            protected = [
+                path for path in paths if path
+                and j.get("path_approvals", {}).get(path, {}).get("fingerprint") != j["fingerprint"]
+                and any(fnmatch.fnmatchcase(path, pattern) for pattern in repo.get("protected_paths", []))
+            ]
+            if protected:
+                raise ProtectedPaths(protected)
             report = j.get("checks", {})
             if report.get("sha") != candidate or not report.get("passed"):
                 report = self.test(candidate)

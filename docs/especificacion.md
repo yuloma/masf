@@ -72,6 +72,14 @@ Un check con error puede aportar anotaciones, salida del check y un extracto del
 
 `masf observe-api` expone estas entidades, los trabajos, las intervenciones y la evidencia por intento mediante la [API local de observación v1](observacion.md). Los snapshots de esta API incluyen las fechas del sondeo y la última lectura correcta por origen.
 
+## Dashboard e intervención humana
+
+`masf observe-api` sirve `/dashboard/` en loopback. Las vistas consumen la API de observación v1 y distinguen cola, ejecución, bloqueo y terminación. El detalle enlaza intentos, ejecutores, modelos, decisiones y evidencia con el SHA correspondiente. Las lecturas de CI conservan el historial de heads e intentos. El panel muestra los fallos de sondeo junto con la última evidencia válida.
+
+Con `--actions-token-file FILE`, el mismo servidor habilita la API autenticada de acciones. El servidor ofrece operaciones para la revisión opaca vigente y exige confirmación explícita, evidencia e idempotencia. El controlador registra el operador, la decisión, el SHA y el estado resultante en la misma transacción que el recibo. La siguiente iteración de `masf serve` continúa el trabajo. Las decisiones de alcance revalidan la issue. Las autorizaciones de rutas verifican los archivos exactos del candidato y las reasignaciones verifican proveedores habilitados.
+
+El plazo ampliado se aplica al rol de construcción de ese trabajo. Las copias recuperables se identifican en eventos del propio trabajo, se vinculan con su intento fallido y se validan contra su directorio, SHA de entrada, huella de alcance y límite de rondas. El controlador retoma el plan y los archivos de una ronda contabilizada y registra el plazo efectivo en el nuevo intento. [Arranque y flujos del dashboard](dashboard.md). [Contrato HTTP](observacion.md#api-autenticada-de-acciones-v1).
+
 ## CI de un PR abierto
 
 La etapa del trabajo y la observación de CI se registran por separado. `status` muestra ambas, el SHA observado, los límites y la intervención pendiente. `status --json` expone el estado y los intentos en un objeto por trabajo. `history OWNER/REPO#N` devuelve las transiciones y los límites de cada intento en JSON por línea, con su evidencia. Los checks locales y la revisión conservan el SHA al que corresponden aunque avance el PR.

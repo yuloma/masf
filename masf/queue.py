@@ -7,12 +7,16 @@ import time
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 
-from .evidence import explanation, model, provenance, timestamp
+from .evidence import digest, explanation, model, provenance, timestamp
 from .system import ProcessError, TaskStopped, command, filtered
 
 
 _retry_at = 0
 _rate_lock = threading.Lock()
+
+
+class RevisionConflict(RuntimeError):
+    pass
 
 
 def retry_delay():
@@ -157,6 +161,8 @@ def connect(root):
         id TEXT PRIMARY KEY, repo_id INTEGER, number INTEGER, role TEXT, status TEXT, data TEXT)""")
     db.execute("""CREATE INDEX IF NOT EXISTS stage_attempts_job
         ON stage_attempts(repo_id, number, role)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS action_receipts (
+        key TEXT PRIMARY KEY, signature TEXT NOT NULL, data TEXT NOT NULL)""")
     return db
 
 
@@ -165,6 +171,15 @@ def write_event(db, job, state, updates):
         "INSERT INTO events(repo_id,number,attempt,state,detail) VALUES(?,?,?,?,?)",
         (job["repo_id"], job["number"], job.get("attempt"), state, json.dumps(filtered(updates))),
     )
+
+
+def revision(job, event_id):
+    return "v1:" + digest([job, event_id])
+
+
+def job_revision(db, identity, job):
+    event = db.execute("SELECT max(id) FROM events WHERE repo_id=? AND number=?", identity).fetchone()[0]
+    return revision(job, event)
 
 
 def store_stage(db, record):
@@ -218,13 +233,20 @@ def decision_details(entries, job):
     ]
 
 
-def save(db, job, state, **updates):
+def save(db, job, state, *, action_receipt=None, **updates):
     next_job = job | updates | {"state": state}
     persisted = {key: value for key, value in next_job.items() if key not in {"attempt", "_stage"}}
     with db:
         db.execute("BEGIN IMMEDIATE")
         if not lease_active(db, job):
             raise RuntimeError("La reserva del trabajo ha vencido")
+        if action_receipt is not None:
+            key, signature, receipt, expected = action_receipt
+            identity = job["repo_id"], job["number"]
+            row = db.execute("SELECT data FROM jobs WHERE repo_id=? AND number=?", identity).fetchone()
+            if not row or job_revision(db, identity, json.loads(row[0])) != expected:
+                raise RevisionConflict
+            db.execute("INSERT INTO action_receipts VALUES(?,?,?)", (key, signature, json.dumps(receipt)))
         detail = dict(updates)
         if "ci" in updates and state == job["state"] and not updates.get("ci_repair"):
             detail["kind"] = "ci_observation"

@@ -38,7 +38,7 @@ from .queue import (
 )
 from .system import TaskStopped, clean, command, docker_env, filtered
 from .recovery import schedule
-from .worker import Worker, saved_workspace
+from .worker import ProtectedPaths, Worker, saved_workspace
 
 
 RUNNABLE = ("queued", "planning", "building", "checking", "reviewing", "publishing", "retry_wait")
@@ -152,7 +152,9 @@ def process_task(cfg, config, root, job):
             else:
                 if len(job.get("recoveries", [])) >= cfg["service"].get("max_recovery_attempts", 2):
                     reason += " (sin presupuesto de recuperación automática)"
-                save(db, job, "blocked", retry=job["state"], reason=reason, failed_attempt=failed_attempt)
+                details = {"blocked_paths": exc.paths} if isinstance(exc, ProtectedPaths) else {}
+                save(db, job, "blocked", retry=job["state"], reason=reason,
+                     failed_attempt=failed_attempt, **details)
         except RuntimeError:
             if not lease_active(db, job):
                 return 0
@@ -347,9 +349,13 @@ def resume_job(db, cfg, j, allow_protected_paths, reuse_workspace,
                accept_head, add_rounds, evidence, resolved_commit=None):
     slug, number = j["slug"], j["number"]
     current = next(r for r in cfg["repositories"] if r["slug"] == slug)
-    if j["repo"]["routing"] != current["routing"]:
+    routing = current["routing"] | (j.get("routing_override") or {})
+    if any(not cfg["providers"].get(name, {}).get("enabled")
+           for name in (j.get("routing_override") or {}).values()):
+        raise ValueError("La asignación utiliza un proveedor deshabilitado")
+    if j["repo"]["routing"] != routing:
         j.setdefault("routing_history", []).append(j["repo"]["routing"])
-        j["repo"]["routing"] = current["routing"]
+        j["repo"]["routing"] = routing
         j.pop("review", None)
     issue = api(f"repos/{slug}/issues/{number}")
     if j.get("pr_number") and not eligible(issue, j["repo"]):
@@ -538,6 +544,7 @@ def resume_job(db, cfg, j, allow_protected_paths, reuse_workspace,
             rounds=0 if scope_changed or not j.get("pr_number") else j["rounds"],
             fingerprint=fingerprint(issue),
             scope_conflict=None,
+            scope_review=None,
             reason="",
         )
     else:
@@ -743,12 +750,13 @@ def main():
     subs.add_parser("serve")
     observation = subs.add_parser("observe-api", help="Sirve la API local de solo lectura")
     observation.add_argument("--port", type=port, default=DEFAULT_PORT, help="Puerto TCP (por defecto %(default)s)")
+    observation.add_argument("--actions-token-file", type=Path, help="Archivo privado de credenciales del operador")
     args = parser.parse_args()
     config = (args.config or xdg("CONFIG", ".config") / "config.toml").absolute()
     db = None
     try:
         if args.cmd == "observe-api":
-            serve_observation(xdg("STATE", ".local/state"), config, args.port)
+            serve_observation(xdg("STATE", ".local/state"), config, args.port, args.actions_token_file)
             return 0
         cfg = load(config)
         if args.cmd == "doctor":

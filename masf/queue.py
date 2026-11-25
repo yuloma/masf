@@ -133,6 +133,7 @@ def connect(root):
     db.execute("""CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY, at TEXT DEFAULT CURRENT_TIMESTAMP, repo_id INTEGER,
         number INTEGER, attempt TEXT, state TEXT, detail TEXT)""")
+    db.execute("""CREATE INDEX IF NOT EXISTS events_job_lookup ON events(repo_id, number, id)""")
     db.execute("""CREATE TABLE IF NOT EXISTS pull_requests (
         repo_id INTEGER, number INTEGER, slug TEXT, state TEXT, sha TEXT, data TEXT,
         PRIMARY KEY(repo_id, number))""")

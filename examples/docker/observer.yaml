@@ -1,0 +1,28 @@
+services:
+  observer:
+    image: "${MASF_CONTROLLER_IMAGE:-masf-controller:pilot}"
+    pull_policy: never
+    command: ["--config", "/etc/masf/config.toml", "observe-api", "--port", "${MASF_OBSERVER_PORT:-8765}"]
+    init: true
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    user: "${MASF_UID:?Define MASF_UID}:${MASF_GID:?Define MASF_GID}"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      XDG_STATE_HOME: /var/lib
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - type: bind
+        source: "${MASF_OBSERVER_CONFIG:?Define MASF_OBSERVER_CONFIG}"
+        target: /etc/masf/config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${MASF_STATE_DIR:?Define MASF_STATE_DIR}"
+        target: /var/lib/masf
+        read_only: true
+        bind:
+          create_host_path: false

@@ -215,3 +215,11 @@ Comprobar también el ciclo combinado de observación y reparación: el mismo so
 La clasificación debe ignorar tiempos como `4.429` y `5.503`, números aislados y nombres de pruebas aprobadas que contengan `quota` o `rate_limit`. Un log con esos datos y `FAIL: test_check_interrupted` debe producir una reparación funcional en el mismo PR. Mantener los bloqueos de cuota y acceso para mensajes explícitos, incluidos `HTTP 429` y `status code: 403`, y los reintentos técnicos para `HTTP/1.1 503`.
 
 **Aceptación de campo.** Ejecutar el [ensayo del PR 23](piloto.md#aceptación-de-ci-del-pr-23) con autorización del operador y conservar el PR abierto hasta que decida sobre la integración.
+
+## I5 · API local de observación
+
+Ejecuta `python3 -m unittest tests.test_observation_api -v`. La instalación temporal verifica por HTTP el arranque nativo en loopback con puerto predeterminado y personalizado, las lecturas concurrentes durante una escritura y la visibilidad después del commit. Compara los archivos de cola, registro, evidencia y trabajo antes y después de las solicitudes. Comprueba paginación, errores, proyecciones históricas y el rechazo de rutas manipuladas, enlaces y evidencia de otro trabajo.
+
+La misma suite contrasta dos intentos con modelos y proveedores distintos, un fallo, checks locales, actividades y decisiones humanas del controlador. Comprueba la revisión antes y después de reanudar, el resultado de una autorización y el historial de dos SHAs de un PR con un error de lectura de GitHub simulado. Valida los montajes y los permisos declarados en el manifiesto del observador.
+
+Con un Engine local en Linux y la imagen del controlador disponible, ejecuta el [ejemplo de despliegue](observacion.md#despliegue-en-docker) sobre una instalación temporal. Comprueba que `/v1/jobs` responde desde el host. Con `docker inspect` verifica que los dos montajes están en solo lectura, que el contenedor tiene sistema de archivos raíz de solo lectura y que los trabajos, el socket de Docker y las credenciales quedan fuera del contenedor.

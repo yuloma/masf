@@ -168,11 +168,17 @@ Para interrumpir un check real dentro de Compose, usa un Docker Engine local con
 MASF_TEST_ENGINE=1 python3 -m unittest tests.test_process_recovery.ComposeProcessRecovery -v
 ```
 
+Si el Engine ha agotado sus pools automáticos, el harness acepta las mismas variables de subred que el smoke. El proyecto de control usa `MASF_SMOKE_BASE_SUBNET` y los checks usan `MASF_SMOKE_CANDIDATE_SUBNET`; la recuperación debe retirar el check anterior antes de reutilizar su subred. Ambas subredes deben estar libres.
+
+```bash
+MASF_SMOKE_BASE_SUBNET=10.253.248.0/28 MASF_SMOKE_CANDIDATE_SUBNET=10.253.248.16/28 MASF_TEST_ENGINE=1 python3 -m unittest tests.test_process_recovery.ComposeProcessRecovery -v
+```
+
 El caso Compose espera una señal escrita por el check dentro del contenedor antes de matar el controlador. Después cambia el volumen declarado en el perfil del operador. El reemplazo retira el proyecto anterior con el manifiesto congelado, completa el check en un proyecto nuevo y retira sus recursos y su journal. La espera del reemplazo exige la señal de un checkout asociado a un journal distinto. La señal anterior permanece en su checkout tras la caída. Un proyecto Compose de control conserva su contenedor, su red y el dato guardado en su volumen durante y después de la recuperación.
 
-**Resultado local con Python 3.11.2.** `python3 -m unittest discover -v` descubrió 59 pruebas. Pasaron 49, incluidos los cinco casos de recuperación con `SIGKILL` sin Engine, y se omitieron 10 por requerir Docker Engine. Una comprobación local con journals y marcadores temporales confirmó que la espera solo acepta el marcador nuevo.
+**Resultado local del 25 de noviembre de 2026 con Python 3.14.4.** Tras integrar la base vigente, `python3 -m unittest discover -v` descubrió 115 pruebas. Pasaron 105, incluidos los cinco casos de recuperación con `SIGKILL` sin Engine, y se omitieron 10 por requerir Docker Engine. El proveedor simulado acepta el callback de actividad del motor actual, el servidor simula también la observación de PR y CI, y la sustitución de la reserva se contrasta con los tokens conservados en los eventos.
 
-**Resultado con Engine.** La ejecución previa de CI alcanzó el caso Compose y falló al identificar el proyecto de reemplazo, porque la espera aceptó la señal que dejó el controlador terminado. Queda pendiente ejecutar el caso corregido con Docker Engine.
+**Resultado con Engine del 25 de noviembre de 2026.** `ComposeProcessRecovery.test_check_interrupted` pasó con Docker Engine local en 45,35 segundos y las dos subredes explícitas del ejemplo. Se verificaron el SIGKILL del controlador durante el check, la retirada mediante el manifiesto congelado, una sola ejecución de reemplazo, la conservación del plan y la construcción, un único PR con checks y revisión del mismo SHA, la limpieza final y la identidad y el dato del proyecto de control. La espera del reemplazo excluye el journal y la señal que dejó el proceso terminado. Estos ensayos utilizan proveedores y GitHub simulados.
 
 La aceptación de I2 incluye autorizar con `resume --allow-protected-path RUTA` un archivo exacto de un trabajo bloqueado. La regresión debe conservar el candidato y las rondas, rechazar comodines y rutas no canónicas, mantener la comprobación de otros archivos e invalidar el permiso si cambia la huella de la issue.
 

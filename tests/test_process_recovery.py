@@ -62,6 +62,7 @@ class GitHubHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         url = urlsplit(self.path)
+        params = parse_qs(url.query)
         routes = {
             REPO_API: lambda: {"id": 42, "default_branch": "main"},
             REPO_API + "/issues": lambda: [ISSUE],
@@ -76,6 +77,22 @@ class GitHubHandler(BaseHTTPRequestHandler):
             == {"head": ["local:masf/issue-1"], "base": ["main"], "state": ["all"]}
         ):
             self.reply(200, self.server.prs)
+        elif url.path == REPO_API + "/pulls" and params == {
+            "state": ["open"], "per_page": ["100"], "page": ["1"],
+        }:
+            self.reply(200, self.server.prs)
+        elif url.path == REPO_API + "/pulls/17" and self.server.prs:
+            self.reply(200, self.server.prs[0])
+        elif url.path.startswith(REPO_API + "/commits/") and url.path.endswith("/check-runs"):
+            self.reply(200, {"check_runs": []})
+        elif url.path.startswith(REPO_API + "/commits/") and url.path.endswith("/statuses"):
+            self.reply(200, [])
+        elif url.path == REPO_API + "/actions/runs":
+            self.reply(200, {"workflow_runs": []})
+        elif url.path == REPO_API + "/branches/main/protection/required_status_checks":
+            self.reply(200, {"checks": [], "contexts": []})
+        elif url.path == REPO_API + "/rules/branches/main":
+            self.reply(200, [])
         else:
             self.reply(404, {"path": self.path})
 
@@ -91,11 +108,14 @@ class GitHubHandler(BaseHTTPRequestHandler):
             self.reply(422, {"path": self.path, "payload": payload})
             return
         pr = {
+            "id": 17,
             "number": 17,
             "state": "open",
             "html_url": f"http://127.0.0.1:{self.server.server_port}{REPO_API}/pulls/17",
-            "head": {"sha": self.server.ref(BRANCH), "repo": {"full_name": SLUG}},
-            "base": {"ref": payload["base"]},
+            "head": {"sha": self.server.ref(BRANCH), "ref": "masf/issue-1",
+                     "repo": {"id": 42, "full_name": SLUG}},
+            "base": {"ref": payload["base"], "sha": self.server.ref(MAIN),
+                     "repo": {"id": 42, "full_name": SLUG}},
             "body": payload["body"],
         }
         self.server.prs.append(pr)
@@ -329,9 +349,11 @@ checks = {json.dumps([check])}
         original = json.loads(before[0][-1])
         if "owner" in original:
             self.assertEqual(job["owner"], original["owner"])
-        self.assertNotEqual(job["attempt"], leases[0][2])
         self.assertEqual(events[:len(old_events)], old_events)
-        self.assertEqual({event[4] for event in events[len(old_events):]}, {job["attempt"]})
+        tokens = {event[4] for event in events[len(old_events):]}
+        self.assertEqual(len(tokens), 1, events)
+        self.assertNotIn(None, tokens)
+        self.assertNotIn(leases[0][2], tokens)
         self.assertEqual(live, [])
         self.assertEqual(job["rounds"], 1)
 
@@ -463,10 +485,14 @@ class ComposeProcessRecovery(RecoveryHarness):
             app["volumes"].append(
                 {"type": "bind", "source": "${MASF_WORKSPACE}", "target": "/workspace"}
             )
+        network = {"internal": True}
+        subnet = os.getenv("MASF_SMOKE_CANDIDATE_SUBNET" if checkout else "MASF_SMOKE_BASE_SUBNET")
+        if subnet:
+            network["ipam"] = {"config": [{"subnet": subnet}]}
         return json.dumps({
             "services": {"app": app},
             "volumes": {volume: {}},
-            "networks": {"default": {"internal": True}},
+            "networks": {"default": network},
         })
 
     def docker(self, *args, env=None):

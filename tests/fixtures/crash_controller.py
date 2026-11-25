@@ -70,7 +70,7 @@ def append(name, value):
         file.write(json.dumps(value) + "\n")
 
 
-def invoke(role, job, cfg, workspace, inputs, owner, *, guard=None):
+def invoke(role, job, cfg, workspace, inputs, owner, *, guard=None, on_activity=None):
     sha = inputs["sha"]
     append("calls.jsonl", [role, sha])
     if role == "plan":

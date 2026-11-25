@@ -200,4 +200,6 @@ El CI pendiente y el rerun en curso dejan la rama intacta. Un sondeo duplicado c
 
 Comprobar también el ciclo combinado de observación y reparación: el mismo sondeo conserva el snapshot de CI por SHA y despacha el trabajo a `building`; un trabajo en `checking` con espera técnica futura no se ejecuta ni duplica el diagnóstico. Mantener el sondeo concurrente durante los workers, las dos formas de `link-pr` documentadas y las salidas de `status --json`, `status --pr` y `logs --pr`.
 
+La clasificación debe ignorar tiempos como `4.429` y `5.503`, números aislados y nombres de pruebas aprobadas que contengan `quota` o `rate_limit`. Un log con esos datos y `FAIL: test_check_interrupted` debe producir una reparación funcional en el mismo PR. Mantener los bloqueos de cuota y acceso para mensajes explícitos, incluidos `HTTP 429` y `status code: 403`, y los reintentos técnicos para `HTTP/1.1 503`.
+
 **Aceptación de campo.** Ejecutar el [ensayo del PR 23](piloto.md#aceptación-de-ci-del-pr-23) con autorización del operador y conservar el PR abierto hasta que decida sobre la integración.

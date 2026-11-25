@@ -176,11 +176,16 @@ def observe(job, sha, lookup=api):
     return dict(sha=sha, state=state, checks=items, pending_runs=sorted(pending_runs)), failures
 
 
+HTTP_STATUS = (
+    r"\b(?:HTTP(?:/\d+(?:\.\d+)?)?\s+|"
+    r"(?:response(?:\s+(?:status|code))?|status(?:\s+code)?)\s*[:=]?\s*)"
+)
+
 SIGNALS = {
-    "quota": r"rate.limit|quota|too many requests|\b429\b",
-    "access": r"permission denied|access denied|unauthorized|bad credentials|\b40[13]\b",
+    "quota": r"\b(?:rate[ -]limit|quota|too many requests)\b|" + HTTP_STATUS + r"429\b",
+    "access": r"\b(?:permission denied|access denied|unauthorized|bad credentials)\b|" + HTTP_STATUS + r"40[13]\b",
     "configuration": r"invalid workflow|configuration error|workflow syntax|missing required (input|secret)",
-    "infrastructure": r"runner lost|runner unavailable|runner.*shut down|connection (reset|timed out)|service unavailable|\b50[234]\b",
+    "infrastructure": r"\b(?:runner lost|runner unavailable|runner.*shut down|connection (reset|timed out)|service unavailable)\b|" + HTTP_STATUS + r"50[234]\b",
     "functional": r"assertionerror|assertion failed|\bfailed test\b|\bFAIL(?:ED)?:?\s+test[_.:]|\btest_\w+.*\b(?:failed|error)\b|\b[1-9]\d* failed\b",
 }
 

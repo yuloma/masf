@@ -87,6 +87,8 @@ La etapa del trabajo y la observación de CI se registran por separado. `status`
 
 Se consultan las ejecuciones de GitHub Actions del head y la rama del PR, los check runs de otras integraciones y el último estado por contexto. Los jobs de Actions se toman del intento vigente. La evidencia enlaza los recursos consultados y guarda extractos de anotaciones y logs pertinentes. Un fallo sin señales suficientes requiere intervención. La configuración admite `service.max_ci_technical_retries` (2 por defecto) y `service.ci_retry_seconds` (60 por defecto). Las rondas de reparación funcional cuentan en `max_build_rounds` y se registran también por separado. El checkpoint permite retomar una ronda tras una interrupción y reutilizar el resultado de construcción cuando ya quedó persistido.
 
+Los códigos numéricos de cuota, acceso e infraestructura requieren contexto HTTP explícito, como `HTTP 429`, `status code: 403` o `response code: 503`. Los tiempos de construcción (`4.429`) y los nombres de pruebas aprobadas (`test_rate_limit`) no bastan para bloquear el trabajo. Con esos mensajes incidentales y un `AssertionError`, el diagnóstico sigue siendo funcional y permite reparar dentro del límite de rondas.
+
 ### Operaciones del controlador
 
 Ejecuta estos comandos con el TOML y el estado habituales de la instalación. La evidencia indica qué verificó el operador y qué autoriza. Las decisiones quedan asociadas a su identidad local, el trabajo, la huella de la issue y los SHAs correspondientes.

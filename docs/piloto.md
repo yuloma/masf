@@ -64,10 +64,150 @@ Para acreditar la combinación de proveedores de I3–I4 en una sola issue, sigu
 
 ### Segundo destino con aplicación y base de datos en Docker
 
-1. En el mismo host, ejecuta `bash examples/docker/smoke-profile.sh`. Este ejercicio ya puede ejecutarse sin el motor de MASF. Comprueba que salen con éxito los comandos SQL del servicio `app` y que el proyecto candidato tiene datos independientes del de la base. [Perfil utilizado](../examples/profiles/postgres.yaml).
-2. Con I2 implementado, registra un segundo repo de prueba mediante la entrada `example-org/masf-pilot-sql`. Usa un proyecto con `schema.sql` que cree `probe(id integer PRIMARY KEY)` y `tests/smoke.sql` que falle si la tabla contiene filas, como en el script. Estos archivos son el código y las pruebas del proyecto. El TOML y los manifiestos siempre están en la instalación central.
-3. Etiqueta una issue que pida añadir a `probe` una columna `label` obligatoria, con valor inicial `'nuevo'`, y comprobarlo en su prueba SQL. Ejecuta `masf_pilot run --once` con esa issue como único trabajo elegible pendiente. En `status` y en la evidencia del mismo SHA deben constar el servicio `app`, el resultado de `psql` y proyectos Compose distintos para base y candidato.
-4. Mantén otro stack de desarrollo abierto con un dato de control. Comprueba que conserva el dato y sus servicios después de una ejecución y de cancelar otra. Tras recrear el controlador en mitad de una verificación, debe recuperar la referencia, retirar solo los recursos de esa verificación y permitir terminar el trabajo. Anota cualquier red o volumen huérfano.
+El piloto de campo queda pendiente de que el operador autorice un segundo `OWNER/REPO` y confirme la rama base, la etiqueta, los manifiestos, el servicio Compose y los comandos de preparación y comprobación. Usa la instalación activa con el primer destino habilitado y conserva un trabajo suyo con PR abierto para la comparación final. El host debe tener acceso a Docker Engine y al plugin Compose, a las imágenes efectivas y a los proveedores por rol. En GitHub hacen falta lectura del repositorio y sus checks, gestión de la issue y su etiqueta, escritura de ramas y creación de PR en borrador. Usa los comandos de CI existentes cuando sean aplicables. [Contrato de Docker](docker.md#ciclo-de-una-verificación).
+
+#### Alta y comprobación de la base (AC1–AC2)
+
+Con la cola en reposo, define `sql_repo` con el segundo slug autorizado, `first_target` con el `OWNER/REPO#N` del primer trabajo y `sql_config` con la ruta absoluta al TOML externo efectivo. Define `sql_evidence` como un directorio privado en el host y usa el array `control` de la instalación activa, con la extensión del motor. Conserva de forma privada una copia del TOML anterior. Además del primer trabajo, conserva el historial de los demás trabajos existentes del primer destino enumerados por `status --json`.
+
+```bash
+umask 077
+mkdir -p "$sql_evidence"
+sql_masf() { "${control[@]}" exec -T controller masf --config /etc/masf/pilot.toml "$@"; }
+sql_masf status --json > "$sql_evidence/before-registration.status.jsonl"
+sql_masf history "$first_target" > "$sql_evidence/before-registration.first.history.jsonl"
+```
+
+Añade al TOML una entrada `[[repositories]]` como la siguiente y adapta el slug, la etiqueta, la rama opcional y los comandos al destino autorizado. Guarda los manifiestos aprobados junto al TOML según el contrato. Registra su orden y SHA-256, la asignación efectiva de proveedores y el servicio de ejecución. Para el ejemplo PostgreSQL, `schema.sql` contiene `CREATE TABLE probe (id integer PRIMARY KEY);` y `tests/smoke.sql` comprueba que `probe` está vacía. El [smoke del perfil](../examples/docker/smoke-profile.sh) incluye ambos archivos de ejemplo.
+
+```toml
+[[repositories]]
+slug = "OWNER/REPO"
+enabled = true
+label = "masf:ready"
+# base_branch = "main"
+setup = [["psql", "-X", "-v", "ON_ERROR_STOP=1", "-f", "schema.sql"]]
+checks = [["psql", "-X", "-v", "ON_ERROR_STOP=1", "-f", "tests/smoke.sql"]]
+
+[repositories.compose]
+files = ["profiles/postgres.yaml", "profiles/postgres-pilot.yaml"]
+service = "app"
+```
+
+Para este ejemplo, el segundo manifiesto da al volumen de datos declarado por la imagen de `app` un nombre propio del proyecto, de modo que Docker lo identifica junto al volumen de `db`. Usa el [perfil PostgreSQL](../examples/profiles/postgres.yaml) como primer manifiesto.
+
+```yaml
+services:
+  app:
+    volumes:
+      - app-data:/var/lib/postgresql/data
+volumes:
+  app-data: {}
+```
+
+Valida el registro con `sql_masf doctor --offline`. Con la issue SQL sin etiqueta, aplica el TOML mediante `"${control[@]}" up -d --force-recreate controller` con el mismo proyecto y los mismos montajes de configuración, estado y trabajos. Guarda `doctor`, `status --json` e `history "$first_target"` después del alta. Compara las entradas de configuración del primer destino y las claves y referencias de sus trabajos con la captura inicial. Los eventos y artefactos anteriores deben seguir disponibles. Registra cualquier evento añadido por los sondeos de la instalación.
+
+Define `sql_base_ref` como la rama configurada o la predeterminada de GitHub y `sql_checkout` como la ruta absoluta de un clon desechable del segundo destino, recién creado con permisos de lectura para el usuario del servicio Compose. Inicia la [captura de recursos](#evidencia-por-intento-y-numeración-coincidente-ac4ac5) antes de la comprobación. Desde el checkout de MASF, guarda `git rev-parse HEAD` y compara las huellas de `masf.evidence.revisions()` con las que devuelve el Python del controlador. Con Python y las dependencias de MASF disponibles en el host, ejecuta la misma función de verificación que usa el controlador. Usa el mismo Engine y las imágenes aprobadas. Si la instalación usa un socket Unix distinto del habitual, define `DOCKER_HOST` con su ruta en el host para el preflight y la captura. El preflight debe finalizar con código cero y cada entrada de `base-preflight/checks.json` debe mostrar código cero.
+
+```bash
+sql_preflight() (
+  sql_base=$(gh api --method GET "repos/$sql_repo/commits" -f "sha=$sql_base_ref" \
+    -F per_page=1 --jq '.[0].sha') || exit
+  test -n "$sql_base" && test "$sql_base" != null || exit 1
+  git -C "$sql_checkout" fetch --no-tags origin "$sql_base" || exit
+  git -C "$sql_checkout" switch --detach "$sql_base" || exit
+  sql_actual=$(git -C "$sql_checkout" rev-parse HEAD) || exit
+  test "$sql_actual" = "$sql_base" || exit 1
+  sql_dirty=$(git -C "$sql_checkout" status --porcelain --untracked-files=all) || exit
+  test -z "$sql_dirty" || exit 1
+  python3 - "$sql_config" "$sql_repo" "$sql_checkout" "$sql_base" "$sql_evidence" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+from masf.checks import verify
+from masf.config import load
+
+config, slug, checkout, sha, evidence = sys.argv[1:]
+config = Path(config).resolve()
+settings = load(config)
+repo = next(repo for repo in settings["repositories"] if repo["slug"] == slug)
+profile = repo["compose"]
+print(json.dumps({
+    "sha": sha, "service": profile["service"],
+    "manifests": [{"path": name, "sha256": hashlib.sha256(
+        (config.parent / name).read_bytes()).hexdigest()} for name in profile["files"]],
+    "setup": repo["setup"], "checks": repo["checks"],
+}), flush=True)
+report = verify(repo, config, Path(checkout).resolve(), sha,
+                Path(evidence).resolve() / "base-preflight", "sql-pilot",
+                settings["service"]["step_timeout_seconds"])
+sys.exit(0 if report["passed"] else 1)
+PY
+)
+if sql_preflight > "$sql_evidence/base-preflight.log" 2>&1; then
+  sql_base_rc=0
+else
+  sql_base_rc=$?
+fi
+printf '%s\n' "$sql_base_rc" > "$sql_evidence/base-preflight.exit"
+```
+
+Si falla la comprobación previa, conserva la salida y resuelve el fallo antes de etiquetar. Mantén estable la rama durante el ensayo. Si avanza antes de la admisión, archiva el directorio y los archivos `base-preflight*` y vuelve a comprobar el SHA vigente en otra copia limpia. Si existe CI para la base, registra también su SHA, ejecución, intento y conclusión.
+
+#### Admisión y PR SQL mediante `serve` (AC3)
+
+1. Crea la issue acordada sin etiqueta. Para el ejemplo, pide añadir a `probe` una columna `label` de texto `NOT NULL DEFAULT 'nuevo'` y verificar en `tests/smoke.sql` que un `INSERT INTO probe (id) VALUES (1)` sin `label` deja `label = 'nuevo'`. La prueba debe fallar si la fila o el valor esperado faltan. Mantén la comprobación de que la base empieza vacía antes del `INSERT` y ejecútala desde `app` contra `db`.
+2. Define `sql_issue` con su número, `sql_target="$sql_repo#$sql_issue"` y `sql_label` con la etiqueta del TOML. Guarda `sql_masf status --json` y `sql_masf scan --dry-run` con la issue sin etiqueta. Comprueba que `sql_target` está ausente de ambos resultados. Tras aprobar la base, aplica la etiqueta con `gh issue edit "$sql_issue" -R "$sql_repo" --add-label "$sql_label"` y registra actor y hora UTC. Repite `sql_masf scan --dry-run` y comprueba que aparece como elegible. `serve` puede admitirla entre las dos consultas, así que conserva el log `OWNER/REPO#N queued` y el cierre de sondeo sin errores.
+3. Sigue `sql_masf status --json` hasta `pr_open` y conserva `sql_masf history "$sql_target"`. Para el `pr_number` registrado, usa `gh pr view "$sql_pr" -R "$sql_repo" --json number,url,state,isDraft,body,baseRefName,baseRefOid,headRefName,headRefOid`. Comprueba `isDraft: true`, la rama base aprobada, la rama `masf/issue-N`, `Closes #N` y el diff de esquema y prueba SQL. Deja el borrador abierto.
+
+#### Evidencia por intento y numeración coincidente (AC4–AC5)
+
+En otra terminal del mismo host y con el mismo Engine, abre esta captura antes del preflight y mantenla activa hasta que concluya el último intento. Detén el observador con `Ctrl-C` al terminar. Correlaciona los eventos por la etiqueta de proyecto Compose. Incluye el proyecto de control en la comparación si se ejecuta en el mismo Engine.
+
+```bash
+umask 077
+docker events --filter label=com.docker.compose.project \
+  --format '{{.TimeNano}} {{.Type}} {{.Action}} {{.Actor.ID}} {{index .Actor.Attributes "com.docker.compose.project"}} {{index .Actor.Attributes "name"}}' \
+  > "$sql_evidence/docker-events.log"
+```
+
+Por intento, conserva los eventos de `history "$sql_target"`, la fila de `status --json` y el `checks.json` referenciado por `stage_attempts`. Registra propósito, ID de intento, SHA, `service`, `commands` con salida y códigos, `profile_sha256` y `name` de proyecto. La huella del modelo efectivo puede variar con el nombre del proyecto y la ruta del checkout. Usa las huellas de los manifiestos aprobados para identificar sus contenidos. Cruza el proyecto con la captura de Docker para anotar IDs de contenedores y redes, nombres de volúmenes y su retirada. Base, candidato y cada reintento deben usar proyectos, redes y volúmenes distintos. Si el piloto real termina al primer intento, conserva la evidencia de reintentos de la prueba controlada y marca su procedencia.
+
+Contrasta el SHA comprobado antes del etiquetado con `base`, `base_checked` y el SHA del intento con `purpose: base`. El `candidate` debe coincidir con el SHA del intento de checks aprobado, el `input_sha` de la revisión con `pass`, `published_head` y `headRefOid` de GitHub. Guarda el intento de publicación y cualquier CI del PR con su SHA, que puede corresponder a un commit de merge. [Campos por etapa](#admisión-borrador-y-trazabilidad).
+
+Si ambos destinos tienen una issue autorizada con el mismo número, compara sus filas tras los sondeos. Debe haber una sola fila por `(repo_id, number)`, con el mismo `number` y dos `repo_id` distintos. Si los números de campo difieren, reproduce el caso con GitHub simulado y conserva el resultado del comando.
+
+```bash
+python3 -m unittest -v tests.test_factory.Discovery.test_two_pages_two_repositories_concurrent_scans
+```
+
+#### Stack de control y recuperación (AC6)
+
+Con Docker Engine local, ejecuta los comandos siguientes desde la raíz de MASF. Ten disponibles las imágenes `postgres:17-alpine` y `masf-runner:pilot`. Guarda las salidas y códigos de retorno de cada comando.
+
+```bash
+bash examples/docker/smoke-profile.sh
+MASF_TEST_ENGINE=1 python3 -m unittest -v tests.test_engine
+MASF_TEST_ENGINE=1 python3 -m unittest -v tests.test_process_recovery.ComposeProcessRecovery
+```
+
+El smoke conserva una fila en el proyecto base mientras el candidato empieza vacío. `tests.test_engine.PrivateComposeChecks` levanta un proyecto de control independiente con servicios `app` y `db`, red, volumen y fila testigo `42`. Sus capturas `control_project` muestran la identidad de esos recursos y el dato después de cada resultado. Conserva también las capturas de cada `attempt` y comprueba el inventario de retirada tras éxito, salida provocada `7`, cancelación con el check activo e interrupción de la limpieza seguida de recuperación. El inventario del control debe mantenerse y el del intento debe quedar vacío. `ComposeProcessRecovery` añade la caída real del controlador durante el check, el uso del manifiesto congelado, un intento nuevo, un único PR simulado y la conservación del proyecto de control. Anota los recursos huérfanos si aparecen. [Pruebas con Engine y opciones de subred](implementacion.md#recuperación-tras-terminar-el-controlador).
+
+#### Persistencia de ambos destinos e informe (AC7–AC8)
+
+Con los dos trabajos en `pr_open`, toma tres capturas según el protocolo de [dos sondeos y recreación](#dos-sondeos-y-recreación-del-controlador). En cada captura incluye `sql_masf status --json`, `history` de ambos trabajos, `gh pr view` de ambos borradores y los listados de PR de las dos ramas en todos los estados. Para cada combinación de repositorio y número de issue ejecuta el siguiente comando con `capture_repo` y `capture_issue` correspondientes.
+
+```bash
+gh api --paginate --method GET "repos/$capture_repo/pulls" \
+  -f state=all -f "head=${capture_repo%%/*}:masf/issue-$capture_issue" -F per_page=100 \
+  --jq '.[] | {number, url: .html_url, draft, head: .head.sha}'
+```
+
+Toma la primera captura al abrirse el segundo PR, la segunda tras dos sondeos completos con `errores=0` y la tercera tras el primer sondeo sin errores posterior a `"${control[@]}" up -d --force-recreate controller`. Guarda antes los logs y los IDs de contenedor con `"${control[@]}" ps -q controller` antes y después. En cada captura debe aparecer un trabajo por clave y un PR por rama, con los mismos `repo_id`, `number`, `pr_number`, URL y head. Comprueba que el historial de ambos conserva sus intentos originales. Revisa también los vínculos de ambas issues por si apuntan a otro PR del piloto.
+
+Completa la [plantilla privada del operador](#plantilla-de-evidencia-del-operador) con los dos destinos autorizados, la revisión probada e instalada, las huellas del motor, la política y los manifiestos, los IDs efectivos de imágenes del controlador, runner y servicios, y los proveedores y versiones por rol. Añade los comandos, horas UTC, resultados y rutas de las capturas de registro, base, intentos Compose, stack de control y tres comparaciones de persistencia. Marca cada resultado según se observó en campo con el operador, en una simulación local o quedó pendiente. Guarda el informe y las capturas en la instalación del operador.
 
 ## Piloto I3–I4 de una sola issue mediante serve
 
@@ -204,6 +344,9 @@ Debe aparecer un único PR con el mismo número, URL y head en cada captura. Dej
 | Dos sondeos posteriores, recreación y primer sondeo nuevo (horas, comandos y resultados) | |
 | Comparación de las tres capturas (conteos, clave del trabajo, PR y head) | |
 | Intervenciones (hora, actor, motivo, comando y resultado) y criterios pendientes | |
+| Segundo destino SQL, si aplica (TOML e historial antes y después, manifiestos ordenados y huellas, servicio y comprobación previa de base) | |
+| Recursos Compose por intento SQL y stack de control, si aplica (proyecto, servicios, redes, volúmenes, fila testigo y retirada) | |
+| Procedencia y resultado por criterio del segundo destino, si aplica (campo, simulación local o pendiente) | |
 
 Guarda las credenciales y los registros originales en la instalación del operador. En la evidencia compartida, usa referencias a capturas depuradas.
 

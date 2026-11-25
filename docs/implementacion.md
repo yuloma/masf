@@ -154,6 +154,10 @@ La aceptación de I2 incluye autorizar con `resume --allow-protected-path RUTA` 
 
 La aceptación de recuperación de I2 incluye una construcción interrumpida tras escribir archivos. La reanudación debe reutilizar la copia registrada del mismo SHA y alcance, conservar el plan, contar el siguiente intento y pasar después por checks y revisión. `resume --reuse-workspace RUTA` permite recuperar una copia histórica del propio trabajo y rechaza rutas de otro trabajo o del almacén Git.
 
+La aceptación de diagnóstico de I3 incluye salida en streaming de Cursor con resultado terminal, rechazo de flujos incompletos y conservación de actividad anterior a un timeout. Un proceso que produce abundante stderr debe terminar y entregar su actividad sin bloquear la captura.
+
+La aceptación de Cursor comprueba además una revisión no interactiva capaz de utilizar Shell para lectura y verificación, con el código montado para lectura. El diff del candidato se entrega con sus saltos de línea y el contenido del transporte estructurado permanece fuera de los mensajes persistidos de error.
+
 ### Seguimiento y reparación de CI del mismo PR
 
 **Aceptación local.** Con la configuración de [ejemplo](../examples/factory.toml), verificar que `status` muestra etapa, CI, SHA, consumo e intervención. `status --json` e `history OWNER/REPO#N` deben mostrar la evidencia por SHA y las decisiones por intento. Un remoto Git temporal, GitHub simulado y un proveedor de prueba deben reproducir PR abierto, fallo confirmado, construcción, checks y revisión del mismo candidato, push condicionado al head observado y CI correcto del mismo PR.

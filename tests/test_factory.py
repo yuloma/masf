@@ -331,7 +331,7 @@ class Delivery(TemporaryTest):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def agent(self, role, job, cfg, workspace, inputs, owner, *, guard=None):
+    def agent(self, role, job, cfg, workspace, inputs, owner, *, guard=None, on_activity=None):
         self.roles.append(role)
         if role == "plan":
             result = {"criteria": ["AC1 greet"]}
@@ -750,10 +750,10 @@ class Delivery(TemporaryTest):
                     raise self.fail_push_response("simulated death after push")
             return result
 
-        def agent(role, job, cfg, workspace, inputs, owner, *, guard=None):
+        def agent(role, job, cfg, workspace, inputs, owner, *, guard=None, on_activity=None):
             if role == "build":
                 self.feedback.append(inputs)
-            return self.agent(role, job, cfg, workspace, inputs, owner, guard=guard)
+            return self.agent(role, job, cfg, workspace, inputs, owner, guard=guard, on_activity=on_activity)
 
         def check(sha):
             self.checks_seen.append(sha)

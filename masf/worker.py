@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import fnmatch
 import json
 import os
@@ -95,6 +96,37 @@ class Worker:
         require_lease(self.db, job)
         started = time.monotonic()
         file = self.evidence / f"{role}-{uuid.uuid4().hex}.json"
+        activity_file = file.with_suffix(".activity.jsonl")
+        activity_meta = {}
+        last_activity_log = 0
+
+        def activity(event):
+            nonlocal last_activity_log
+            activity_meta.update(event)
+            record = {
+                "at": datetime.now(timezone.utc).isoformat(),
+                "role": role,
+                "sha": sha,
+                "attempt": job.get("attempt"),
+                **event,
+            }
+            with activity_file.open("a") as stream:
+                stream.write(clean(json.dumps(record)) + "\n")
+            now = time.monotonic()
+            if (
+                event.get("event") == "cli_version"
+                or now - last_activity_log >= 15
+                or event.get("type") == "result"
+            ):
+                provider = job["repo"]["routing"][role]
+                label = event.get("type") or event.get("event")
+                tools = ",".join(event.get("tools", []))
+                print(
+                    f"{job['slug']}#{job['number']} {role} {provider} {label} {tools} ({now - started:.0f}s)",
+                    flush=True,
+                )
+                last_activity_log = now
+
         try:
             result = providers.invoke(
                 role,
@@ -104,6 +136,7 @@ class Worker:
                 dict(title=job["title"], body=job["body"], sha=sha, **inputs),
                 self.owner,
                 guard=self.guard,
+                on_activity=activity,
             )
         except Exception as exc:
             if role == "build" and job["state"] == "building":
@@ -117,6 +150,9 @@ class Worker:
                         "role": role,
                         "attempt": job.get("attempt"),
                         "provider": job["repo"]["routing"][role],
+                        "version": activity_meta.get("version"),
+                        "last_activity": activity_meta,
+                        "activity_file": str(activity_file),
                         "error": clean(str(exc)),
                         "seconds": round(time.monotonic() - started, 2),
                     },

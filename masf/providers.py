@@ -6,6 +6,8 @@ import uuid
 import tempfile
 
 from .system import command, docker_env
+from .recovery import RecoverableFailure, retryable
+from .system import ProcessError
 
 SHAPES = {
     "plan": '{"version":1,"summary":"...","criteria":["AC1 ..."]} or {"version":1,"summary":"...","question":"..."}',
@@ -254,7 +256,16 @@ def invoke(role, job, cfg, workspace, inputs, owner, *, guard=None, on_activity=
                 if provider == "cursor" and on_activity
                 else None,
             )
-            result, meta = parse(provider, role, output)
+            try:
+                result, meta = parse(provider, role, output)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise RecoverableFailure(
+                    f"{provider}: salida inválida o incompleta"
+                ) from exc
+            except RuntimeError as exc:
+                if retryable(ProcessError(str(exc))):
+                    raise RecoverableFailure(str(exc)) from exc
+                raise
         finally:
             command(["docker", "rm", "-f", name], env=docker_env())
     return {

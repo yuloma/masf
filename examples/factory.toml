@@ -10,6 +10,9 @@ max_ci_technical_retries = 2
 ci_retry_seconds = 60
 # Plazo total de cada etapa, incluida la suma de setup y checks.
 step_timeout_seconds = 900
+# Presupuesto compartido de reintentos y resolución de conflictos por trabajo.
+max_recovery_attempts = 2
+recovery_backoff_seconds = 30
 
 [runner]
 # Imagen que se construirá localmente durante la instalación del piloto.

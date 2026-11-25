@@ -143,6 +143,17 @@ def load(path):
             type(n) is int and n > 0, f"service.{key}", "se requiere un entero positivo"
         )
 
+    for key, default, minimum in (
+        ("max_recovery_attempts", 2, 0),
+        ("recovery_backoff_seconds", 30, 1),
+    ):
+        n = service.setdefault(key, default)
+        required(
+            type(n) is int and n >= minimum,
+            f"service.{key}",
+            f"se requiere un entero mayor o igual que {minimum}",
+        )
+
     for key, default in {"max_ci_technical_retries": 2, "ci_retry_seconds": 60}.items():
         n = service.setdefault(key, default)
         required(type(n) is int and n >= 0, f"service.{key}", "se requiere un entero no negativo")

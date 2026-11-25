@@ -4,6 +4,7 @@ import getpass
 from datetime import datetime, timezone
 import fcntl
 import json
+import re
 import os
 import sqlite3
 import sys
@@ -25,16 +26,18 @@ from .queue import (
     leased_job,
     lease_active,
     renew,
+    latest,
     retry_delay,
     save,
     save_link,
     scan,
 )
 from .system import TaskStopped, clean, command, docker_env
+from .recovery import schedule
 from .worker import Worker, saved_workspace
 
 
-RUNNABLE = ("queued", "planning", "building", "checking", "reviewing", "publishing")
+RUNNABLE = ("queued", "planning", "building", "checking", "reviewing", "publishing", "retry_wait")
 
 
 def doctor(cfg, offline):
@@ -92,6 +95,8 @@ TERMINAL = {"closed", "merged", "cancelled"}
 
 
 def process_task(cfg, config, root, job):
+    if job.get("state") == "retry_wait" and job["recovery_wait"]["until"] > time.time():
+        return 0
     token = uuid.uuid4().hex
     ttl = 90
     stop = threading.Event()
@@ -118,6 +123,10 @@ def process_task(cfg, config, root, job):
         if current is None or current["state"] not in RUNNABLE or current.get("ci_retry_at", 0) > time.time():
             return 0
         job = current | {"attempt": token}
+        if job["state"] == "retry_wait":
+            if job["recovery_wait"]["until"] > time.time():
+                return 0
+            save(db, job, job["recovery_wait"]["stage"], reason="")
         thread = threading.Thread(target=heartbeat, daemon=True)
         thread.start()
         jobs = Path(
@@ -130,7 +139,13 @@ def process_task(cfg, config, root, job):
     except Exception as exc:
         reason = clean(str(exc))
         try:
-            save(db, job, "blocked", retry=job["state"], reason=reason)
+            updates = schedule(job, cfg, exc, minimum_delay=retry_delay())
+            if updates is not None:
+                save(db, job, "retry_wait", **updates)
+            else:
+                if len(job.get("recoveries", [])) >= cfg["service"].get("max_recovery_attempts", 2):
+                    reason += " (sin presupuesto de recuperación automática)"
+                save(db, job, "blocked", retry=job["state"], reason=reason)
         except RuntimeError:
             if not lease_active(db, job):
                 return 0
@@ -216,7 +231,8 @@ def pending_jobs(db, cfg, running, limit):
         job = load_row(row)
         key = job["repo_id"], job["number"]
         if (job["slug"] in active and key not in running
-                and job.get("ci_retry_at", 0) <= time.time()):
+                and job.get("ci_retry_at", 0) <= time.time()
+                and (job["state"] != "retry_wait" or job["recovery_wait"]["until"] <= time.time())):
             yield key, job
             limit -= 1
             if limit == 0:
@@ -268,7 +284,7 @@ def tick(db, cfg, config, root, once, workers=None):
         workers.close()
 
 
-def resume(db, cfg, target, allow_protected_paths=(), reuse_workspace=None, *,
+def resume(db, cfg, target, allow_protected_paths=(), reuse_workspace=None, resolved_commit=None, *,
            accept_head=None, add_rounds=None, evidence=None):
     slug, number = target.rsplit("#", 1)
     row = db.execute(
@@ -286,7 +302,7 @@ def resume(db, cfg, target, allow_protected_paths=(), reuse_workspace=None, *,
         if job["state"] not in {"needs_input", "blocked"}:
             raise ValueError("Trabajo no reanudable")
         return resume_job(db, cfg, job, allow_protected_paths, reuse_workspace,
-                          accept_head, add_rounds, evidence)
+                          accept_head, add_rounds, evidence, resolved_commit)
     finally:
         with db:
             db.execute("DELETE FROM leases WHERE token=?", (token,))
@@ -319,7 +335,7 @@ def approved_head(job, sha):
 
 
 def resume_job(db, cfg, j, allow_protected_paths, reuse_workspace,
-               accept_head, add_rounds, evidence):
+               accept_head, add_rounds, evidence, resolved_commit=None):
     slug, number = j["slug"], j["number"]
     current = next(r for r in cfg["repositories"] if r["slug"] == slug)
     if j["repo"]["routing"] != current["routing"]:
@@ -407,6 +423,43 @@ def resume_job(db, cfg, j, allow_protected_paths, reuse_workspace,
                 "operator": operator_name(),
                 "evidence": ci.excerpt(evidence or j.get("reason") or path),
             }
+    resolution = None
+    if resolved_commit is not None:
+        if (
+            not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", resolved_commit)
+            or j["state"] != "blocked"
+            or j.get("retry") != "publishing"
+            or not j.get("candidate")
+            or j.get("pr_number")
+            or not eligible(issue, j["repo"])
+            or fingerprint(issue) != j["fingerprint"]
+        ):
+            raise ValueError(
+                "La resolución requiere un commit completo y una publicación bloqueada con alcance vigente"
+            )
+        jobs = Path(
+            os.environ.get("MASF_JOBS_DIR") or xdg("DATA", ".local/share") / "jobs"
+        )
+        store = jobs / f"{j['repo_id']}-{j['number']}" / "git"
+        git = ["git", "--git-dir", str(store)]
+        current_base = latest(slug, j["branch"])
+        command(git + ["rev-parse", "--verify", resolved_commit + "^{commit}"])
+        for ancestor in (j["candidate"], current_base):
+            try:
+                command(
+                    git + ["merge-base", "--is-ancestor", ancestor, resolved_commit]
+                )
+            except RuntimeError:
+                raise ValueError(
+                    "El commit resuelto debe incluir el candidato y la base actual"
+                ) from None
+        resolution = {
+            "previous_base": j["base"],
+            "previous_candidate": j["candidate"],
+            "base": current_base,
+            "candidate": resolved_commit,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
     if reuse_workspace is not None:
         if (
             j["state"] != "blocked"
@@ -478,7 +531,17 @@ def resume_job(db, cfg, j, allow_protected_paths, reuse_workspace,
             updates["path_approvals"] = approvals
         if reuse_workspace is not None:
             updates["build_workspace"] = checkpoint
-        save(db, j, j.get("retry", "queued"), **updates)
+        state = j.get("retry", "queued")
+        if resolution is not None:
+            for key in ("checks", "review", "base_checked", "base_conflict"):
+                j.pop(key, None)
+            updates.update(
+                base=resolution["base"],
+                candidate=resolved_commit,
+                base_resolutions=[*(j.get("base_resolutions") or []), resolution],
+            )
+            state = "checking"
+        save(db, j, state, **updates)
 
 
 
@@ -605,6 +668,10 @@ def main():
         type=Path,
         help="Recupera una copia conservada de este trabajo tras una interrupción",
     )
+    resume_parser.add_argument(
+        "--resolved-commit",
+        help="Selecciona un commit local que resuelve la actualización de base",
+    )
     decisions = resume_parser.add_argument_group("decisiones para CI")
     decisions.add_argument("--accept-head")
     decisions.add_argument("--add-rounds", type=int)
@@ -656,6 +723,9 @@ def main():
                         f"reintentos técnicos {counts['technical']}/{counts['technical_limit']}",
                         j.get("reason", ""),
                         j.get("ci_poll_error", ""),
+                        ("reintento=" + datetime.fromtimestamp(
+                            j["recovery_wait"]["until"], timezone.utc
+                        ).isoformat()) if j["state"] == "retry_wait" else "",
                     )
             if args.pr or not args.json:
                 pull_output(db, args.pr)
@@ -685,7 +755,7 @@ def main():
                         fcntl.flock(lock, fcntl.LOCK_EX)
                         if args.cmd == "resume":
                             if (args.accept_head or args.add_rounds is not None) and (
-                                args.allow_protected_path or args.reuse_workspace
+                                args.allow_protected_path or args.reuse_workspace or args.resolved_commit
                             ):
                                 raise ValueError("Ejecuta las autorizaciones de rutas y de CI por separado")
                             resume(
@@ -694,6 +764,7 @@ def main():
                                 args.issue,
                                 args.allow_protected_path,
                                 args.reuse_workspace,
+                                resolved_commit=args.resolved_commit,
                                 accept_head=args.accept_head,
                                 add_rounds=args.add_rounds,
                                 evidence=args.evidence,

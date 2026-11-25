@@ -156,7 +156,11 @@ La aceptación de recuperación de I2 incluye una construcción interrumpida tra
 
 La aceptación de diagnóstico de I3 incluye salida en streaming de Cursor con resultado terminal, rechazo de flujos incompletos y conservación de actividad anterior a un timeout. Un proceso que produce abundante stderr debe terminar y entregar su actividad sin bloquear la captura.
 
+La aceptación de recuperación autónoma de I2–I4 incluye provocar un timeout tras escribir archivos, persistir `retry_wait`, reiniciar el controlador y continuar sin intervención sobre la misma copia. Se conserva el SHA y los checks al repetir una revisión incompleta. Un conflicto real de Git debe volver al implementador y producir un candidato con ambos padres, checks y revisión nuevos y un solo PR. La espera debe respetar el reloj persistido y los límites de GitHub, sin impedir atender otra issue. Dos fallos adicionales consumen el presupuesto predeterminado y el siguiente deja un bloqueo diagnosticable. Acceso denegado y rutas protegidas siguen necesitando autorización. La configuración de ejemplo documenta `max_recovery_attempts` y `recovery_backoff_seconds`. Con un PR ya abierto, verificar que un timeout de reparación reutiliza la copia y la misma ronda, que los reinicios agotan el presupuesto persistido y que un conflicto de base conserva ambos ancestros, repite checks y revisión y actualiza el mismo PR.
+
 La aceptación de Cursor comprueba además una revisión no interactiva capaz de utilizar Shell para lectura y verificación, con el código montado para lectura. El diff del candidato se entrega con sus saltos de línea y el contenido del transporte estructurado permanece fuera de los mensajes persistidos de error.
+
+La aceptación de I2 incluye un conflicto real al avanzar la base y su resolución mediante `resume --resolved-commit SHA`. Se verifica que el commit integra candidato y base, que se rechazan referencias o commits ajenos, que se conserva el número de rondas y que se repiten los checks y la revisión sobre el SHA resuelto.
 
 ### Seguimiento y reparación de CI del mismo PR
 

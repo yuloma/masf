@@ -57,13 +57,14 @@ def set_retry(headers, *, limited=False):
         _retry_at = max(_retry_at, time.monotonic() + max(1, wait))
 
 
-def api(endpoint, *opts, raw=False, with_headers=False):
+def api(endpoint, *opts, stdin=None, raw=False, with_headers=False):
     if retry_delay():
         raise RuntimeError(
             f"GitHub: límite de peticiones, esperar {retry_delay():.0f}s"
         )
     try:
-        output = command(["gh", "api", "--include", endpoint, *opts])
+        options = {"stdin": stdin} if stdin is not None else {}
+        output = command(["gh", "api", "--include", endpoint, *opts], **options)
     except ProcessError as exc:
         headers, _ = response_body(exc.stdout)
         limited = (

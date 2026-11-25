@@ -41,6 +41,10 @@ class TaskStopped(RuntimeError):
     pass
 
 
+class CommandTimeout(RuntimeError):
+    pass
+
+
 def command(
     args,
     *,
@@ -111,7 +115,7 @@ def command(
                     guard()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise RuntimeError(f"{args[0]}: tiempo agotado ({timeout}s)")
+                    raise CommandTimeout(f"{args[0]}: tiempo agotado ({timeout}s)")
                 try:
                     if on_stdout_line:
                         proc.wait(timeout=min(1, remaining))

@@ -4,6 +4,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import ExitStack, closing
 from pathlib import Path
@@ -73,13 +74,20 @@ class Discovery(TemporaryTest):
         super().setUp()
         config_file = self.root / "config.toml"
         config_file.write_text(
-            CONFIG.read_text().replace("enabled = false\nlabel", "enabled = true\nlabel")
+            CONFIG.read_text().replace(
+                "enabled = false\nlabel", "enabled = true\nlabel"
+            )
         )
         profile = self.root / "profiles/postgres.yaml"
         profile.parent.mkdir()
         profile.write_bytes((CONFIG.parent / "profiles/postgres.yaml").read_bytes())
         self.scan_argv = [
-            sys.executable, "-m", "masf.cli", "--config", str(config_file), "scan"
+            sys.executable,
+            "-m",
+            "masf.cli",
+            "--config",
+            str(config_file),
+            "scan",
         ]
         self.state_home = self.root / "state"
         fake_bin = self.root / "bin"
@@ -110,7 +118,9 @@ class Discovery(TemporaryTest):
         for repo_id, slug in enumerate(self.slugs, start=1):
             endpoint = f"repos/{slug}"
             issues = f"{endpoint}/issues?state=open&labels={label}&per_page=100"
-            self.issue_queries.extend([endpoint, f"{issues}&page=1", f"{issues}&page=2"])
+            self.issue_queries.extend(
+                [endpoint, f"{issues}&page=1", f"{issues}&page=2"]
+            )
             self.responses[endpoint] = {"id": repo_id, "default_branch": "main"}
             self.responses[f"{endpoint}/commits/main"] = {"sha": "a" * 40}
             self.responses[f"{issues}&page=1"] = [
@@ -122,14 +132,14 @@ class Discovery(TemporaryTest):
             self.responses[f"{issues}&page=2"] = [self.issue | {"number": 2}]
 
     def run_scan(self, *args):
-        return subprocess.run(
-            [*self.scan_argv, *args], timeout=30, **self.scan_options
-        )
+        return subprocess.run([*self.scan_argv, *args], timeout=30, **self.scan_options)
 
     def jobs(self):
         database = self.state_home / "masf/queue.sqlite3"
         with closing(sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)) as db:
-            return db.execute("SELECT repo_id, number, slug, state FROM jobs").fetchall()
+            return db.execute(
+                "SELECT repo_id, number, slug, state FROM jobs"
+            ).fetchall()
 
     def state_snapshot(self):
         return {
@@ -331,7 +341,9 @@ class Delivery(TemporaryTest):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def agent(self, role, job, cfg, workspace, inputs, owner, *, guard=None, on_activity=None):
+    def agent(
+        self, role, job, cfg, workspace, inputs, owner, *, guard=None, on_activity=None
+    ):
         self.roles.append(role)
         if role == "plan":
             result = {"criteria": ["AC1 greet"]}
@@ -360,7 +372,11 @@ class Delivery(TemporaryTest):
             commands=[{"argv": ["test"], "code": int(failed)}],
         )
 
-    def api(self, endpoint):
+    def api(self, endpoint, *opts, stdin=None):
+        if stdin is not None:
+            return json.loads(
+                worker.command(["gh", "api", endpoint, *opts], stdin=stdin)
+            )
         return self.prs if "pulls?" in endpoint else self.issue
 
     def run_command(self, args, **kwargs):
@@ -679,6 +695,331 @@ class Delivery(TemporaryTest):
             with self.subTest(path=path), self.assertRaises(ValueError):
                 saved_workspace(self.worker.root, path)
 
+    def test_resolve_base_conflict_and_reverify_new_commit(self):
+        from masf.cli import resume
+
+        self.cfg["service"]["max_recovery_attempts"] = 0
+        self.changed = "README"
+        original = self.agent
+        advanced = False
+
+        def advance(role, job, cfg, workspace, inputs, owner, **kwargs):
+            nonlocal advanced
+            result = original(role, job, cfg, workspace, inputs, owner, **kwargs)
+            if role == "review" and not advanced:
+                advanced = True
+                (self.source / "README").write_text("new main")
+                command(["git", "add", "."], cwd=self.source)
+                command(
+                    [
+                        "git",
+                        "-c",
+                        "user.name=test",
+                        "-c",
+                        "user.email=test@example.org",
+                        "commit",
+                        "-m",
+                        "advance",
+                    ],
+                    cwd=self.source,
+                )
+                self.base = command(["git", "rev-parse", "HEAD"], cwd=self.source)
+            return result
+
+        with patch.object(worker.providers, "invoke", advance):
+            with self.assertRaisesRegex(
+                RuntimeError, "Recuperaciones automáticas agotadas"
+            ):
+                self.worker.process()
+        previous = self.job["candidate"]
+        self.assertEqual(self.job["base_conflict"]["paths"], ["README"])
+        workspace = self.worker.checkout(previous)
+        (workspace / "README").write_text("resolved")
+        self.worker.git("add", "-A", "--", ".", workspace=workspace)
+        tree = self.worker.git("write-tree")
+        resolved = self.worker.git(
+            "commit-tree", tree, "-p", previous, "-p", self.base, "-m", "resolve"
+        )
+        queue.save(self.worker.db, self.job, "blocked", retry="publishing")
+        with (
+            patch("masf.cli.api", self.api),
+            patch("masf.cli.latest", return_value=self.base),
+            patch.dict("os.environ", {"MASF_JOBS_DIR": str(self.root / "jobs")}),
+        ):
+            resume(
+                self.worker.db,
+                self.cfg,
+                f"{self.repo['slug']}#1",
+                resolved_commit=resolved,
+            )
+        restored = json.loads(
+            self.worker.db.execute("SELECT data FROM jobs").fetchone()[0]
+        )
+        self.assertEqual(restored["state"], "checking")
+        self.assertEqual(restored["rounds"], 1)
+        self.assertNotIn("checks", restored)
+        self.assertNotIn("review", restored)
+        self.assertEqual(
+            restored["base_resolutions"][0]["previous_candidate"], previous
+        )
+        self.job = restored
+        self.worker.job = restored
+        self.worker.process()
+        self.assertEqual(restored["state"], "pr_open")
+        self.assertEqual(restored["checks"]["sha"], resolved)
+        self.assertEqual(restored["review"]["sha"], resolved)
+
+    def test_resolved_commit_rejects_unrelated_and_invalid_commits(self):
+        from masf.cli import resume
+
+        self.deny = True
+        with self.assertRaisesRegex(RuntimeError, "403"):
+            self.worker.process()
+        queue.save(self.worker.db, self.job, "blocked", retry="publishing")
+        for value in ("HEAD", self.base):
+            with (
+                self.subTest(value=value),
+                patch("masf.cli.api", self.api),
+                patch("masf.cli.latest", return_value=self.base),
+                patch.dict("os.environ", {"MASF_JOBS_DIR": str(self.root / "jobs")}),
+            ):
+                with self.assertRaises(ValueError):
+                    resume(
+                        self.worker.db,
+                        self.cfg,
+                        f"{self.repo['slug']}#1",
+                        resolved_commit=value,
+                    )
+        stored = json.loads(
+            self.worker.db.execute("SELECT data FROM jobs").fetchone()[0]
+        )
+        self.assertEqual(stored["state"], "blocked")
+        self.assertEqual(stored["candidate"], self.job["candidate"])
+
+    def run_controller(self):
+        from masf import cli
+
+        def create(db, cfg, config, state, jobs, job):
+            self.job = job
+            previous = self.worker
+            self.worker = worker.Worker(previous.db, cfg, config, state, jobs, job)
+            self.worker.url = str(self.source)
+            self.worker.test = previous.test
+            self.worker.recover = previous.recover
+            return self.worker
+
+        due = max(time.time(), self.job.get("recovery_wait", {}).get("until", 0)) + 1
+        with (
+            patch.object(cli, "Worker", side_effect=create),
+            patch("masf.cli.time.time", return_value=due),
+        ):
+            result = cli.process_task(self.cfg, CONFIG, self.root / "state", self.job)
+        self.job = json.loads(
+            self.worker.db.execute("SELECT data FROM jobs").fetchone()[0]
+        )
+        self.worker.job = self.job
+        return result
+
+    def test_timeout_recovers_workspace_after_restart_with_exhausted_build_rounds(self):
+        from masf.system import CommandTimeout
+
+        self.cfg["service"]["max_build_rounds"] = 1
+        original = self.agent
+        seen = []
+
+        def interrupted(role, job, cfg, workspace, inputs, owner, **kwargs):
+            if role == "build":
+                seen.append(workspace)
+                if len(seen) == 1:
+                    (workspace / "partial").write_text("keep")
+                    raise CommandTimeout("docker: tiempo agotado (900s)")
+                self.assertEqual((workspace / "partial").read_text(), "keep")
+                self.assertTrue(inputs["recovery"]["workspace_reused"])
+            return original(role, job, cfg, workspace, inputs, owner, **kwargs)
+
+        with patch.object(worker.providers, "invoke", interrupted):
+            self.assertEqual(self.run_controller(), 1)
+            self.assertEqual(self.job["state"], "retry_wait")
+            self.assertGreater(self.job["recovery_wait"]["until"], time.time())
+            # Reload from SQLite as a fresh controller would after restarting.
+            self.assertEqual(self.run_controller(), 0)
+        self.assertEqual(seen[0], seen[1])
+        self.assertEqual(self.job["state"], "pr_open")
+        self.assertEqual(len(self.prs), 1)
+        self.assertEqual(len(self.job["recoveries"]), 1)
+
+    def test_review_recovery_keeps_sha_checks_and_build(self):
+        from masf.recovery import RecoverableFailure
+
+        original = self.agent
+        failed = False
+
+        def interrupted(role, *args, **kwargs):
+            nonlocal failed
+            if role == "review" and not failed:
+                failed = True
+                raise RecoverableFailure("Cursor: flujo incompleto")
+            return original(role, *args, **kwargs)
+
+        with patch.object(worker.providers, "invoke", interrupted):
+            self.run_controller()
+            sha = self.job["candidate"]
+            checks = self.job["checks"]
+            self.assertEqual(self.job["state"], "retry_wait")
+            self.run_controller()
+        self.assertEqual(self.job["state"], "pr_open")
+        self.assertEqual(self.job["candidate"], sha)
+        self.assertEqual(self.job["checks"], checks)
+        self.assertEqual(self.roles.count("build"), 1)
+
+    def test_repeated_timeout_stops_at_durable_budget(self):
+        from masf.system import CommandTimeout
+
+        with patch.object(
+            worker.providers, "invoke", side_effect=CommandTimeout("timeout")
+        ):
+            for _ in range(3):
+                self.run_controller()
+        self.assertEqual(self.job["state"], "blocked")
+        self.assertEqual(len(self.job["recoveries"]), 2)
+        self.assertIn("presupuesto", self.job["reason"])
+        self.assertFalse(self.prs)
+
+    def test_lost_publication_response_recovers_one_pr_automatically(self):
+        from masf.system import ProcessError
+
+        original = self.run_command
+        lost = False
+
+        def request(args, **kwargs):
+            nonlocal lost
+            result = original(args, **kwargs)
+            if args[0] == "gh" and not lost:
+                lost = True
+                raise ProcessError("gh: HTTP 502")
+            return result
+
+        with patch.object(worker, "command", request):
+            self.run_controller()
+            self.assertEqual(self.job["state"], "retry_wait")
+            self.run_controller()
+        self.assertEqual(self.job["state"], "pr_open")
+        self.assertEqual(len(self.prs), 1)
+        self.assertEqual(self.roles, ["plan", "build", "review"])
+
+    def test_issue_closed_during_wait_cancels_without_retrying_provider(self):
+        from masf.system import CommandTimeout
+
+        with patch.object(
+            worker.providers, "invoke", side_effect=CommandTimeout("timeout")
+        ):
+            self.run_controller()
+        self.issue["state"] = "closed"
+        with patch.object(worker.providers, "invoke") as agent:
+            self.run_controller()
+            agent.assert_not_called()
+        self.assertEqual(self.job["state"], "cancelled")
+
+    def test_interrupted_recovery_build_cannot_bypass_its_budget(self):
+        self.cfg["service"]["max_recovery_attempts"] = 1
+        original = self.agent
+
+        def interrupted(role, *args, **kwargs):
+            if role == "build":
+                raise KeyboardInterrupt()
+            return original(role, *args, **kwargs)
+
+        with patch.object(worker.providers, "invoke", interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.worker.process()
+            # A restart may reserve one recovery attempt, but another restart cannot renew it.
+            with self.assertRaises(KeyboardInterrupt):
+                self.worker.process()
+            with self.assertRaisesRegex(
+                RuntimeError, "Recuperaciones automáticas agotadas"
+            ):
+                self.worker.process()
+        self.assertEqual(len(self.job["recoveries"]), 1)
+        self.assertFalse(self.prs)
+
+    def test_auth_and_protected_paths_require_operator(self):
+        from masf.cli import resume
+        from masf.system import ProcessError
+
+        with patch.object(
+            worker.providers,
+            "invoke",
+            side_effect=ProcessError("HTTP 401 Unauthorized"),
+        ):
+            self.run_controller()
+        self.assertEqual(self.job["state"], "blocked")
+        self.assertFalse(self.job.get("recoveries"))
+        self.changed = ".github/workflows/ci.yml"
+        with patch("masf.cli.api", self.api):
+            resume(self.worker.db, self.cfg, f"{self.repo['slug']}#1")
+        self.run_controller()
+        self.assertEqual(self.job["state"], "blocked")
+        self.assertIn("Ruta protegida", self.job["reason"])
+        self.assertFalse(self.job.get("recoveries"))
+
+    def test_base_conflict_is_resolved_by_builder_then_rechecked_and_reviewed(self):
+        self.changed = "README"
+        self.cfg["service"]["max_build_rounds"] = 1
+        original = self.agent
+        advanced = False
+        previous = None
+        checks = []
+        original_check = self.check
+
+        def check(sha):
+            checks.append(sha)
+            return original_check(sha)
+
+        def agent(role, job, cfg, workspace, inputs, owner, **kwargs):
+            nonlocal advanced, previous
+            recovery = inputs.get("recovery", {})
+            if role == "build" and recovery.get("type") == "base_conflict":
+                self.assertIn("<<<<<<<", (workspace / "README").read_text())
+                self.assertEqual(recovery["paths"], ["README"])
+            result = original(role, job, cfg, workspace, inputs, owner, **kwargs)
+            if role == "review" and not advanced:
+                advanced = True
+                previous = job["candidate"]
+                (self.source / "README").write_text("advanced main\n")
+                command(["git", "add", "."], cwd=self.source)
+                command(
+                    [
+                        "git",
+                        "-c",
+                        "user.name=test",
+                        "-c",
+                        "user.email=test@example.org",
+                        "commit",
+                        "-m",
+                        "advance",
+                    ],
+                    cwd=self.source,
+                )
+                self.base = command(["git", "rev-parse", "HEAD"], cwd=self.source)
+            return result
+
+        with (
+            patch.object(worker.providers, "invoke", agent),
+            patch.object(self.worker, "test", check),
+        ):
+            self.assertEqual(self.run_controller(), 0)
+        self.assertEqual(self.job["state"], "pr_open")
+        self.assertEqual(self.roles, ["plan", "build", "review", "build", "review"])
+        self.assertIn(self.base, checks)
+        self.assertIn(self.job["candidate"], checks)
+        self.assertEqual(self.job["checks"]["sha"], self.job["review"]["sha"])
+        for ancestor in (previous, self.base):
+            self.worker.git(
+                "merge-base", "--is-ancestor", ancestor, self.job["candidate"]
+            )
+        self.assertEqual(len(self.prs), 1)
+        self.assertEqual(self.job["recoveries"][0]["action"], "resolve_base")
+
 
     def open_ci_pr(self):
         from masf import cli
@@ -939,6 +1280,88 @@ class Delivery(TemporaryTest):
         self.assertEqual(job["review"]["sha"], job["candidate"])
         self.assertEqual(self.worker.remote_head(), self.base)
         self.assertIsNone(job.get("repair_intent"))
+
+    def test_ci_timeout_recovers_workspace_without_spending_another_round(self):
+        from masf.system import CommandTimeout
+
+        self.open_ci_pr()
+        original = providers.invoke
+        workspaces = []
+
+        def interrupted(role, job, cfg, workspace, inputs, owner, **kwargs):
+            if role == "build":
+                workspaces.append(workspace)
+                if len(workspaces) == 1:
+                    (workspace / "partial").write_text("keep")
+                    raise CommandTimeout("build timeout")
+                self.assertEqual((workspace / "partial").read_text(), "keep")
+            return original(role, job, cfg, workspace, inputs, owner, **kwargs)
+
+        with patch.object(providers, "invoke", interrupted):
+            self.assertEqual(self.ci_tick(), 1)
+            waiting = self.ci_job()
+            self.assertEqual(waiting["state"], "retry_wait")
+            self.assertEqual(self.ci_tick(), 0)
+            self.assertEqual(len(workspaces), 1)
+            with patch("masf.cli.time.time", return_value=waiting["recovery_wait"]["until"] + 1):
+                self.assertEqual(self.ci_tick(), 0)
+        repaired = self.ci_job()
+        self.assertEqual(repaired["state"], "pr_open")
+        self.assertEqual(repaired["rounds"], waiting["rounds"])
+        self.assertEqual(repaired["ci_rounds"], 1)
+        self.assertEqual(workspaces[0], workspaces[1])
+        self.assertEqual(len(repaired["recoveries"]), 1)
+        self.assertEqual(len(self.prs), 1)
+
+    def test_ci_interrupted_build_recovery_is_bounded_across_restarts(self):
+        self.open_ci_pr()
+        self.cfg["service"]["max_recovery_attempts"] = 1
+        original = providers.invoke
+
+        def interrupted(role, *args, **kwargs):
+            if role == "build":
+                raise KeyboardInterrupt()
+            return original(role, *args, **kwargs)
+
+        with patch.object(providers, "invoke", interrupted):
+            for _ in range(2):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.ci_tick()
+            self.assertEqual(self.ci_tick(), 1)
+        stopped = self.ci_job()
+        self.assertEqual(stopped["state"], "blocked")
+        self.assertEqual(len(stopped["recoveries"]), 1)
+        self.assertEqual(stopped["ci_rounds"], 1)
+        self.assertEqual(self.worker.remote_head(), self.old_head)
+
+    def test_ci_base_conflict_preserves_current_base_and_previous_candidate(self):
+        self.open_ci_pr()
+        self.changed = "README"
+        original = providers.invoke
+        previous = None
+
+        def advance(role, job, cfg, workspace, inputs, owner, **kwargs):
+            nonlocal previous
+            result = original(role, job, cfg, workspace, inputs, owner, **kwargs)
+            if role == "review" and previous is None:
+                previous = job["candidate"]
+                (self.source / "README").write_text("advanced main\n")
+                command(["git", "add", "."], cwd=self.source)
+                command(["git", "-c", "user.name=test", "-c", "user.email=test@example.org",
+                         "commit", "-m", "advance"], cwd=self.source)
+                self.base = command(["git", "rev-parse", "HEAD"], cwd=self.source)
+            return result
+
+        with patch.object(providers, "invoke", advance):
+            self.assertEqual(self.ci_tick(), 0)
+        repaired = self.ci_job()
+        self.assertEqual(repaired["state"], "pr_open")
+        self.assertEqual(repaired["recoveries"][0]["action"], "resolve_base")
+        for ancestor in (previous, self.base):
+            self.worker.git("merge-base", "--is-ancestor", ancestor, repaired["candidate"])
+        self.assertEqual(repaired["checks"]["sha"], repaired["review"]["sha"])
+        self.assertEqual(self.worker.remote_head(), repaired["candidate"])
+        self.assertEqual(len(self.prs), 1)
 
     def test_ci_restart_after_build_result_reuses_round(self):
         self.open_ci_pr()

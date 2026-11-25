@@ -30,11 +30,33 @@ class Commands(unittest.TestCase):
         self.assertEqual(output, str(len(payload)))
 
     def test_guard_terminates_running_process(self):
+        for on_line in (None, lambda line: None):
+            calls = 0
+
+            def stop():
+                nonlocal calls
+                calls += 1
+                if calls > 1:
+                    raise TaskStopped("cancelled")
+
+            with self.subTest(streaming=on_line is not None), self.assertRaises(TaskStopped):
+                command(
+                    [sys.executable, "-c", "import time;time.sleep(30)"],
+                    guard=stop,
+                    on_stdout_line=on_line,
+                )
+
+    def test_cancelled_command_never_starts_with_or_without_streaming(self):
         def stop():
             raise TaskStopped("cancelled")
 
-        with self.assertRaises(TaskStopped):
-            command([sys.executable, "-c", "import time;time.sleep(30)"], guard=stop)
+        for on_line in (None, lambda line: None):
+            with self.subTest(streaming=on_line is not None), patch(
+                "masf.system.subprocess.Popen"
+            ) as launch:
+                with self.assertRaises(TaskStopped):
+                    command([sys.executable, "-c", "pass"], guard=stop, on_stdout_line=on_line)
+                launch.assert_not_called()
 
     def test_stream_requires_completion(self):
         payload = json.dumps({"version": 1, "summary": "Plan", "criteria": ["AC1"]})
@@ -111,6 +133,20 @@ class GitHubLimits(unittest.TestCase):
         ):
             self.assertEqual(queue.api("repos/test/test"), {"id": 42})
 
+    def test_publication_uses_rate_limit_headers_and_preserves_json_input(self):
+        from masf import queue
+        from masf.system import ProcessError
+
+        payload = '{"draft": true}'
+        error = ProcessError(
+            "gh: HTTP 403", "HTTP/2.0 403 Forbidden\nRetry-After: 120\n\n{}"
+        )
+        with patch("masf.queue.command", side_effect=error) as invoke:
+            with self.assertRaises(ProcessError):
+                queue.api("repos/org/repo/pulls", "--input", "-", stdin=payload)
+            self.assertEqual(invoke.call_args.kwargs["stdin"], payload)
+            self.assertGreater(queue.retry_delay(), 119)
+
 
 class Monitoring(unittest.TestCase):
     def test_failed_pr_lookup_does_not_stop_other_jobs(self):
@@ -126,7 +162,7 @@ class Monitoring(unittest.TestCase):
             for job, state in [(existing, "pr_open"), (queued, "queued")]:
                 db.execute(
                     "INSERT INTO jobs VALUES(?,?,?,?,?)",
-                    (1, job["number"], job["slug"], state, json.dumps(job)),
+                    (1, job["number"], job["slug"], state, json.dumps(job | {"state": state})),
                 )
             db.commit()
             cfg = {
@@ -138,7 +174,7 @@ class Monitoring(unittest.TestCase):
                 patch("masf.cli.api", side_effect=RuntimeError("403")),
                 patch("masf.cli.process_task", return_value=0) as process,
             ):
-                self.assertEqual(cli.tick(db, cfg, root / "config.toml", root, True), 1)
+                self.assertEqual(cli.tick(db, cfg, root / "config.toml", root, True), 2)
                 process.assert_called_once()
             db.close()
 
@@ -157,3 +193,118 @@ class CursorOutput(unittest.TestCase):
         for payload in ('Progress {"version":1', 'Progress {"version":1} extra'):
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 parse("cursor", "plan", json.dumps({"result": payload}))
+
+
+class ProviderActivity(unittest.TestCase):
+    def test_stream_result_and_incomplete_stream(self):
+        result = {
+            "version": 1,
+            "summary": "Reviewed",
+            "verdict": "pass",
+            "findings": [],
+        }
+        events = [
+            {"type": "system", "subtype": "init"},
+            {"type": "assistant", "message": {"content": []}},
+            {"type": "result", "subtype": "success", "result": json.dumps(result)},
+        ]
+        self.assertEqual(
+            parse("cursor", "review", "\n".join(json.dumps(e) for e in events))[0],
+            result,
+        )
+        with self.assertRaisesRegex(ValueError, "incompleto"):
+            parse("cursor", "review", "\n".join(json.dumps(e) for e in events[:-1]))
+
+    def test_progress_survives_timeout(self):
+        lines = []
+        with self.assertRaisesRegex(RuntimeError, "tiempo agotado"):
+            command(
+                [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    "import time;print('started',flush=True);time.sleep(30)",
+                ],
+                timeout=0.2,
+                on_stdout_line=lines.append,
+            )
+        self.assertEqual(lines, ["started"])
+
+    def test_spooled_stderr_does_not_block_progress(self):
+        lines = []
+        output = command(
+            [
+                sys.executable,
+                "-c",
+                "import sys;sys.stderr.write('x'*200000);print('done')",
+            ],
+            on_stdout_line=lines.append,
+            timeout=3,
+        )
+        self.assertEqual(output, "done")
+        self.assertEqual(lines, ["done"])
+
+
+class CursorReviewPermissions(unittest.TestCase):
+    def test_review_is_noninteractive_with_readonly_code_and_readable_diff(self):
+        import tempfile
+        from pathlib import Path
+        from masf import providers
+
+        diff = "diff --git a/file b/file\n+print(42)\n"
+        seen = {}
+
+        def run(args, **kwargs):
+            if args[-1] == "--version":
+                return "2026.11.22-e9042b2"
+            if args[:3] == ["docker", "rm", "-f"]:
+                return ""
+            seen["args"] = args
+            mount = next(value for value in args if "dst=/run/masf-task" in value)
+            source = mount.split("src=", 1)[1].split(",dst=", 1)[0]
+            seen["prompt"] = Path(source).read_text()
+            return json.dumps(
+                {
+                    "type": "result",
+                    "result": json.dumps(
+                        {
+                            "version": 1,
+                            "summary": "Reviewed",
+                            "verdict": "pass",
+                            "findings": [],
+                        }
+                    ),
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "code"
+            workspace.mkdir()
+            cfg = {
+                "providers": {"cursor": {"executable": "agent"}},
+                "service": {"step_timeout_seconds": 10},
+            }
+            job = {"repo": {"routing": {"review": "cursor"}, "runner_image": "runner"}}
+            with patch("masf.providers.command", side_effect=run):
+                providers.invoke("review", job, cfg, workspace, {"diff": diff}, "owner")
+            self.assertIn("--force", seen["args"])
+            self.assertNotIn("--mode", seen["args"])
+            self.assertIn(f"{workspace}:/workspace:ro", seen["args"])
+            self.assertIn(diff, seen["prompt"])
+
+
+class StreamingFailurePrivacy(unittest.TestCase):
+    def test_structured_payload_stays_out_of_error_message(self):
+        from masf.system import ProcessError
+
+        with self.assertRaises(ProcessError) as caught:
+            command(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys;print('private tool payload');sys.exit(2)",
+                ],
+                on_stdout_line=lambda line: None,
+            )
+        self.assertNotIn("private tool payload", str(caught.exception))
+        self.assertEqual(caught.exception.stdout, "")

@@ -1,15 +1,33 @@
+from datetime import datetime, timezone
 import fnmatch
 import json
 import os
+import re
 import tempfile
 import time
 import uuid
 from pathlib import Path
 from urllib.parse import urlencode
 
-from . import checks, providers
-from .queue import api, eligible, fingerprint, latest, save
-from .system import TaskStopped, clean, command, docker_env
+from . import checks, ci, providers
+from .queue import api, latest, require_lease, save
+from .recovery import RecoverableFailure, reserve
+from .system import ProcessError, TaskStopped, clean, command, docker_env
+
+
+def saved_workspace(root, path):
+    folder = Path(path).absolute()
+    expected = root.resolve()
+    if (
+        folder.resolve() != folder
+        or folder.parent != expected
+        or folder.name == "git"
+        or not folder.is_dir()
+    ):
+        raise ValueError(
+            "La copia recuperada debe ser un directorio directo del trabajo"
+        )
+    return folder
 
 
 class Worker:
@@ -29,12 +47,13 @@ class Worker:
         save(self.db, self.job, state, **fields)
 
     def guard(self):
+        require_lease(self.db, self.job)
         if time.monotonic() >= self.next_admission:
             self.next_admission = time.monotonic() + 5
-            if not self.admission():
+            if not self.admission() or (self.job.get("pr_number") and not self.pr_head()):
                 raise TaskStopped("La tarea dejó de ser elegible")
 
-    def git(self, *args, workspace=None, stdin=None):
+    def git(self, *args, workspace=None, stdin=None, guard=None):
         prefix = [
             "git",
             "-c",
@@ -50,7 +69,8 @@ class Worker:
         ]
         if workspace:
             prefix += ["--work-tree", str(workspace)]
-        return command(prefix + list(args), cwd=workspace or self.root, stdin=stdin)
+        options = {"guard": guard} if guard else {}
+        return command(prefix + list(args), cwd=workspace or self.root, stdin=stdin, **options)
 
     def checkout(self, sha):
         folder = Path(tempfile.mkdtemp(dir=self.root))
@@ -75,8 +95,40 @@ class Worker:
 
     def role(self, role, sha, folder, **inputs):
         job = self.job
+        require_lease(self.db, job)
         started = time.monotonic()
         file = self.evidence / f"{role}-{uuid.uuid4().hex}.json"
+        activity_file = file.with_suffix(".activity.jsonl")
+        activity_meta = {}
+        last_activity_log = 0
+
+        def activity(event):
+            nonlocal last_activity_log
+            activity_meta.update(event)
+            record = {
+                "at": datetime.now(timezone.utc).isoformat(),
+                "role": role,
+                "sha": sha,
+                "attempt": job.get("attempt"),
+                **event,
+            }
+            with activity_file.open("a") as stream:
+                stream.write(clean(json.dumps(record)) + "\n")
+            now = time.monotonic()
+            if (
+                event.get("event") == "cli_version"
+                or now - last_activity_log >= 15
+                or event.get("type") == "result"
+            ):
+                provider = job["repo"]["routing"][role]
+                label = event.get("type") or event.get("event")
+                tools = ",".join(event.get("tools", []))
+                print(
+                    f"{job['slug']}#{job['number']} {role} {provider} {label} {tools} ({now - started:.0f}s)",
+                    flush=True,
+                )
+                last_activity_log = now
+
         try:
             result = providers.invoke(
                 role,
@@ -86,8 +138,13 @@ class Worker:
                 dict(title=job["title"], body=job["body"], sha=sha, **inputs),
                 self.owner,
                 guard=self.guard,
+                on_activity=activity,
             )
         except Exception as exc:
+            if role == "build" and job["state"] == "building":
+                checkpoint = dict(job.get("build_workspace") or {})
+                checkpoint["error"] = clean(str(exc))
+                self.update("building", build_workspace=checkpoint)
             file.write_text(
                 json.dumps(
                     {
@@ -95,6 +152,9 @@ class Worker:
                         "role": role,
                         "attempt": job.get("attempt"),
                         "provider": job["repo"]["routing"][role],
+                        "version": activity_meta.get("version"),
+                        "last_activity": activity_meta,
+                        "activity_file": str(activity_file),
                         "error": clean(str(exc)),
                         "seconds": round(time.monotonic() - started, 2),
                     },
@@ -102,20 +162,12 @@ class Worker:
                 )
             )
             raise
-        result.update(sha=sha, attempt=job.get("attempt"))
+        result.update(sha=sha, attempt=job.get("attempt"), evidence_file=file.name)
         file.write_text(clean(json.dumps(result, indent=2)))
         return result
 
     def admission(self):
-        j = self.job
-        issue = api(f"repos/{j['slug']}/issues/{j['number']}")
-        if not eligible(issue, j["repo"]):
-            self.update("cancelled", reason="Issue cerrada o etiqueta retirada")
-        elif fingerprint(issue) != j["fingerprint"]:
-            self.update("needs_input", reason="El contenido de la issue ha cambiado")
-        else:
-            return True
-        return False
+        return ci.scope(self.db, self.job, api)
 
     def recover(self):
         ids = command(
@@ -134,41 +186,128 @@ class Worker:
         repo = j["repo"]
         self.update(j["state"])
         self.recover()
-        if j.get("intent") and self.reconcile_publication():
+        if j.get("pr_number"):
+            pr = ci.pull(j, api)
+            if pr["state"] != "open":
+                ci.validate(self.db, j, pr, set())
+                return
+            if not self.admission():
+                return
+            if j.get("repair_intent") and self.publish_repair(recover=True):
+                return
+            if not self.pr_head():
+                return
+            if j.get("ci_repair") and j["state"] in {"building", "checking"}:
+                try:
+                    if not ci.observe_and_route(self.db, j, self.cfg, api, revalidate=True):
+                        return
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+                    ci.poll_failed(self.db, j, self.cfg, ci.excerpt(str(exc)))
+                    return
+                if j.get("ci_retry_at", 0) > time.time():
+                    return
+        elif j.get("intent") and self.reconcile_publication():
             return
         if not self.admission():
             return
         if not self.store.exists():
             command(["git", "init", "--bare", str(self.store)])
         self.git("fetch", "--no-tags", self.url, j["base"])
+        if j.get("pr_number"):
+            self.git("fetch", "--no-tags", self.url, ci.expected_head(j))
         if j.get("base_checked") != j["base"]:
             report = self.test(j["base"])
             if not report["passed"]:
+                if report.get("retryable"):
+                    raise RecoverableFailure(
+                        "Infraestructura temporal al comprobar la base"
+                    )
                 raise RuntimeError(
                     "Fallan los checks de la base: " + str(report["commands"][-1])
                 )
-            self.update("planning", base_checked=j["base"])
+            self.update(j["state"] if j.get("pr_number") else "planning", base_checked=j["base"])
         if not j.get("plan"):
             result = self.role("plan", j["base"], self.checkout(j["base"]))["result"]
             if "question" in result:
                 self.update("needs_input", reason=result["question"])
                 return
-            self.update("building", plan=result)
+            self.update("building", plan=result, reason="")
         while self.admission():
             candidate = j.get("candidate")
             if not candidate or j["state"] == "building":
-                if j["rounds"] >= self.cfg["service"]["max_build_rounds"]:
+                if j.get("pr_number") and not self.pr_head():
+                    return
+                recovery = j.get("build_recovery") or {}
+                checkpoint = j.get("build_workspace") or {}
+                if not checkpoint.get("result") and (
+                    recovery.get("started") or (
+                        not recovery and checkpoint
+                        and self.cfg["service"].get("max_recovery_attempts", 2)
+                    )
+                ):
+                    history = reserve(j, self.cfg, "resume_build", candidate=candidate)
+                    recovery = {**(recovery or {"type": "retry"}), "started": False}
+                    self.update("building", recoveries=history, build_recovery=recovery)
+                normal_rounds = j["rounds"] - j.get("recovery_builds", 0)
+                if (
+                    not recovery
+                    and not j.get("pr_number")
+                    and normal_rounds >= self.cfg["service"]["max_build_rounds"]
+                ):
                     raise RuntimeError("Rondas de construcción agotadas")
                 start = candidate or j["base"]
-                workspace = self.checkout(start)
-                self.update("building", rounds=j["rounds"] + 1)
-                build = self.role(
-                    "build",
-                    start,
-                    workspace,
-                    plan=j["plan"],
-                    feedback=j.get("feedback"),
+                reused = (
+                    checkpoint.get("input_sha") == start
+                    and checkpoint.get("fingerprint") == j["fingerprint"]
                 )
+                same_round = bool(
+                    j.get("pr_number") and reused and checkpoint.get("round")
+                )
+                counts = ci.limits(j, self.cfg)
+                if not recovery and not same_round and normal_rounds >= counts["build_limit"]:
+                    if j.get("pr_number"):
+                        self.update("needs_input", retry="building", ci_intervention=True,
+                                    reason=f"Rondas agotadas ({j['rounds']}/{counts['build_limit']}). Usa resume --add-rounds N")
+                        return
+                    raise RuntimeError("Rondas de construcción agotadas")
+                workspace = (
+                    saved_workspace(self.root, checkpoint["path"])
+                    if reused
+                    else self.checkout(recovery.get("tree", start))
+                )
+                checkpoint = {
+                    "path": str(workspace),
+                    "input_sha": start,
+                    "fingerprint": j["fingerprint"],
+                    "error": checkpoint.get("error") if reused else None,
+                    "round": j["rounds"] if same_round else j["rounds"] + 1,
+                    **({"result": checkpoint["result"]} if same_round and "result" in checkpoint else {}),
+                }
+                if not same_round:
+                    fields = {}
+                    if j.get("pr_number"):
+                        fields["ci_rounds"] = j.get("ci_rounds", 0) + 1
+                    self.update(
+                        "building", rounds=checkpoint["round"], build_workspace=checkpoint,
+                        recovery_builds=j.get("recovery_builds", 0) + bool(recovery),
+                        build_recovery={**recovery, "started": True} if recovery else None,
+                        **fields,
+                    )
+                build = checkpoint.get("result")
+                if build is None:
+                    if same_round and recovery:
+                        self.update("building", build_recovery={**recovery, "started": True})
+                    build = self.role(
+                        "build", start, workspace, plan=j["plan"], feedback=j.get("feedback"),
+                        recovery={"workspace_reused": reused,
+                                  "previous_error": checkpoint.get("error"), **recovery},
+                    )
+                    if j.get("pr_number"):
+                        checkpoint["result"] = build
+                        self.update("building", build_workspace=checkpoint)
+                if j.get("pr_number") and (not self.admission() or not self.pr_head()):
+                    return
+                self.git("read-tree", start)
                 if any(
                     name.lower() == ".git"
                     for _, dirs, files in os.walk(workspace)
@@ -177,13 +316,43 @@ class Worker:
                     raise RuntimeError("Metadatos Git dentro de la copia del agente")
                 self.git("add", "-A", "--", ".", workspace=workspace)
                 tree = self.git("write-tree")
-                if tree == self.git("rev-parse", j["base"] + "^{tree}"):
+                if recovery.get("type") == "base_conflict":
+                    tracked = set(
+                        self.git("ls-tree", "-r", "--name-only", tree).splitlines()
+                    )
+                    for path in recovery["paths"]:
+                        content = (
+                            self.git("show", f"{tree}:{path}")
+                            if path in tracked
+                            else ""
+                        )
+                        if re.search(
+                            r"^(?:<<<<<<< |=======\s*$|>>>>>>> )", content, re.MULTILINE
+                        ):
+                            raise RecoverableFailure(
+                                "El agente conservó marcadores de conflicto"
+                            )
+                parent = start if j.get("pr_number") and recovery.get("type") != "base_conflict" else j["base"]
+                if tree == self.git("rev-parse", parent + "^{tree}"):
+                    if j.get("pr_number"):
+                        self.update("building", build=build, build_workspace=None,
+                                    feedback={"previous": j.get("feedback"),
+                                              "reason": "El agente no ha producido cambios"})
+                        continue
                     raise RuntimeError("El agente no ha producido cambios")
-                candidate = self.git(
-                    "commit-tree", tree, "-p", j["base"], "-m", j["title"]
-                )
+                parents = ["-p", parent]
+                if recovery.get("type") == "base_conflict":
+                    parents += ["-p", recovery["candidate"]]
+                candidate = self.git("commit-tree", tree, *parents, "-m", j["title"])
                 self.git("update-ref", "refs/heads/candidate", candidate)
-                self.update("checking", candidate=candidate, build=build)
+                self.update(
+                    "checking",
+                    candidate=candidate,
+                    build=build,
+                    build_workspace=None,
+                    build_recovery=None,
+                    base_conflict=None,
+                )
             paths = self.git(
                 "diff", "--no-renames", "--name-only", "-z", j["base"], candidate
             ).split("\0")
@@ -201,13 +370,36 @@ class Worker:
                 report = self.test(candidate)
                 if not report["passed"]:
                     if report.get("failure_kind") == "infrastructure":
+                        if j.get("pr_number"):
+                            counts = ci.limits(j, self.cfg)
+                            if counts["technical"] < counts["technical_limit"]:
+                                self.update("checking", checks=report,
+                                            ci_technical=counts["technical"] + 1,
+                                            ci_retry_at=time.time() + self.cfg["service"].get("ci_retry_seconds", 60),
+                                            reason="Fallo de infraestructura en checks. Reintento programado")
+                            else:
+                                self.update("blocked", checks=report, retry="checking",
+                                            reason="Reintentos técnicos agotados. Corrige los checks y usa resume")
+                            return
                         self.update("checking", checks=report)
+                        if report.get("retryable"):
+                            raise RecoverableFailure(
+                                "Infraestructura temporal en checks"
+                            )
                         raise RuntimeError(
                             "Fallo de infraestructura en checks, reanudar tras corregirlo"
                         )
                     self.update("building", feedback=report, checks=report)
                     continue
                 self.update("reviewing", checks=report)
+            repair = j.get("ci_repair") or {}
+            if candidate == ci.expected_head(j) and repair and all(
+                item["kind"] == "infrastructure" for item in repair["diagnostics"]
+            ):
+                self.update("needs_input", retry="pr_open", ci_intervention=True,
+                            checks=report, ci_retry_at=0,
+                            reason="Checks locales correctos. Relanza el CI del PR y usa resume")
+                return
             review = j.get("review", {})
             if review.get("sha") != candidate or review["result"]["verdict"] != "pass":
                 diff = self.git("diff", "--no-ext-diff", j["base"], candidate)
@@ -228,16 +420,168 @@ class Worker:
             current = latest(j["slug"], j["branch"])
             if current != j["base"]:
                 self.git("fetch", "--no-tags", self.url, current)
-                tree = self.git("merge-tree", "--write-tree", current, candidate)
-                rebased = self.git("commit-tree", tree, "-p", current, "-m", j["title"])
-                if not self.test(current)["passed"]:
+                try:
+                    tree = self.git("merge-tree", "--write-tree", current, candidate)
+                except ProcessError as exc:
+                    if "CONFLICT" not in exc.stdout:
+                        raise
+                    paths = sorted(
+                        set(
+                            re.findall(
+                                r"^\d+ [0-9a-f]+ [123]\t(.+)$", exc.stdout, re.MULTILINE
+                            )
+                        )
+                    )
+                    self.update(
+                        "publishing",
+                        base_conflict={
+                            "base": current,
+                            "candidate": candidate,
+                            "paths": paths,
+                        },
+                    )
+                    tree = exc.stdout.splitlines()[0]
+                    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", tree):
+                        raise RuntimeError(
+                            "Git no devolvió un árbol de conflicto válido"
+                        ) from None
+                    try:
+                        history = reserve(
+                            j,
+                            self.cfg,
+                            "resolve_base",
+                            base=current,
+                            candidate=candidate,
+                            paths=paths,
+                        )
+                    except RuntimeError as exhausted:
+                        raise RuntimeError(
+                            str(exhausted)
+                            + ". Conflicto en "
+                            + ", ".join(paths)
+                            + ". Revisa la resolución y usa resume --resolved-commit SHA"
+                        ) from None
+                    base_report = self.test(current)
+                    if not base_report["passed"]:
+                        if base_report.get("retryable"):
+                            raise RecoverableFailure(
+                                "Infraestructura temporal en la nueva base"
+                            )
+                        raise RuntimeError("Fallan los checks de la nueva base")
+                    self.update(
+                        "building",
+                        base=current,
+                        base_checked=current,
+                        recoveries=history,
+                        repair_intent=None,
+                        build_workspace=None,
+                        build_recovery={
+                            "type": "base_conflict",
+                            "tree": tree,
+                            "base": current,
+                            "candidate": candidate,
+                            "paths": paths,
+                        },
+                        feedback={
+                            "type": "base_conflict",
+                            "paths": paths,
+                            "instruction": "Resolve conflict markers preserving the issue criteria and current base behavior.",
+                        },
+                    )
+                    continue
+                prior = ["-p", candidate] if j.get("pr_number") else []
+                rebased = self.git("commit-tree", tree, "-p", current, *prior, "-m", j["title"])
+                history = reserve(
+                    j, self.cfg, "refresh_base", base=current, candidate=candidate
+                )
+                base_report = self.test(current)
+                if not base_report["passed"]:
+                    if base_report.get("retryable"):
+                        raise RecoverableFailure(
+                            "Infraestructura temporal en la nueva base"
+                        )
                     raise RuntimeError("Fallan los checks de la nueva base")
                 self.update(
-                    "checking", base=current, base_checked=current, candidate=rebased
+                    "checking",
+                    base=current,
+                    base_checked=current,
+                    candidate=rebased,
+                    recoveries=history,
+                    repair_intent=None,
                 )
                 continue
-            self.publish()
+            if j.get("pr_number"):
+                self.publish_repair()
+            else:
+                self.publish()
             return
+
+    def remote_head(self):
+        output = self.git("ls-remote", self.url, "refs/heads/" + ci.branch(self.job))
+        return output.split()[0] if output else None
+
+    def pr_head(self):
+        j = self.job
+        expected = ci.expected_head(j)
+        pr = ci.pull(j, api)
+        if not ci.validate(self.db, j, pr, {expected}):
+            return False
+        remote = self.remote_head()
+        if remote != expected:
+            ci.head_conflict(self.db, j, pr["head"]["sha"], remote)
+            return False
+        return True
+
+    def publish_repair(self, *, recover=False):
+        j = self.job
+        sha = j["candidate"]
+        expected = ci.expected_head(j)
+        require_lease(self.db, j)
+        pr = ci.pull(j, api)
+        if pr["state"] != "open":
+            ci.validate(self.db, j, pr, set())
+            return True
+        if not self.admission():
+            return True
+        intent = j.get("repair_intent")
+        if not (j.get("checks", {}).get("passed")
+                and j["checks"]["sha"] == j.get("review", {}).get("sha") == sha
+                and j["review"]["result"]["verdict"] == "pass"):
+            raise RuntimeError("Falta la aprobación del SHA reparado")
+        if not ci.validate(self.db, j, pr, {expected, sha} if intent else {expected}):
+            return True
+        remote = self.remote_head()
+        if intent:
+            if intent != {"pr": j["pr_number"], "expected": expected, "target": sha}:
+                raise RuntimeError("Intención de actualización incompatible con el trabajo")
+            if remote == sha:
+                if pr["head"]["sha"] == sha:
+                    self.update(
+                        "pr_open", published_head=sha, repair_intent=None, ci_repair=None,
+                        ci_intervention=False, ci_retry_at=0,
+                        ci={"sha": sha, "state": "waiting", "checks": [], "pending_runs": []},
+                        reason="",
+                    )
+                return True
+            if remote != expected or pr["head"]["sha"] != expected:
+                ci.head_conflict(self.db, j, pr["head"]["sha"], remote)
+                return True
+            if recover:
+                # Recheck base, approvals and admission before replaying a push.
+                return False
+        elif remote != expected:
+            ci.head_conflict(self.db, j, pr["head"]["sha"], remote)
+            return True
+
+        if sha == expected:
+            raise RuntimeError("La reparación no produjo un SHA nuevo")
+        if not self.admission() or not self.pr_head():
+            return True
+        self.update("publishing", repair_intent={"pr": j["pr_number"], "expected": expected, "target": sha})
+        ref = "refs/heads/" + ci.branch(j)
+        self.git("push", "--force-with-lease=" + ref + ":" + expected,
+                 self.url, sha + ":" + ref, guard=lambda: require_lease(self.db, j))
+        return self.publish_repair(recover=True)
 
     def existing_pr(self):
         j = self.job
@@ -264,7 +608,10 @@ class Worker:
             if pr["state"] == "open"
             else ("merged" if pr["merged_at"] else "closed")
         )
-        self.update(state, pr=pr["html_url"], pr_number=pr["number"], reason="")
+        sha = j["candidate"]
+        self.update(state, pr=pr["html_url"], pr_number=pr["number"], reason="",
+                    published_head=sha,
+                    ci={"sha": sha, "state": "waiting", "checks": [], "pending_runs": []})
 
     def reconcile_publication(self):
         j = self.job
@@ -300,6 +647,7 @@ class Worker:
             raise RuntimeError("Rama remota con SHA inesperado o sin procedencia")
         self.update("publishing", intent=sha, previous_intent=previous)
         if previous != sha:
+            require_lease(self.db, j)
             self.git(
                 "push",
                 "--force-with-lease=" + ref + ":" + previous,
@@ -323,10 +671,7 @@ class Worker:
                 head=branch,
                 draft=True,
             )
-            pr = json.loads(
-                command(
-                    ["gh", "api", f"repos/{j['slug']}/pulls", "--input", "-"],
-                    stdin=json.dumps(payload),
-                )
+            pr = api(
+                f"repos/{j['slug']}/pulls", "--input", "-", stdin=json.dumps(payload)
             )
         self.record_pr(pr)

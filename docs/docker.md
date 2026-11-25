@@ -99,7 +99,7 @@ Para verificar el motor desde Linux, instala el paquete en un entorno virtual co
 
 La imagen de runtime incluye PyYAML, requerido por el paquete y sus pruebas. Después de actualizar MASF, reconstruye también el runner para que los checks del nuevo código dispongan de sus dependencias. Comprueba la rama base con ese runner antes de admitir issues.
 
-Un fallo de infraestructura durante los checks conserva el candidato y deja el trabajo bloqueado en esa etapa. Tras corregir la causa, `resume OWNER/REPO#N` repite la comprobación del mismo SHA. Un resultado funcional fallido permite otra ronda de construcción dentro del límite configurado. El plazo `step_timeout_seconds` comprende el arranque del entorno y la suma de los comandos de preparación y comprobación. La limpieza dispone de su propio plazo para retirar los recursos.
+Un fallo temporal reconocido durante los checks conserva el candidato y programa un reintento. Un resultado funcional fallido permite otra ronda de construcción dentro del límite configurado. Un error permanente o el presupuesto agotado dejan el trabajo bloqueado. Tras corregir la causa, `resume OWNER/REPO#N` repite la etapa correspondiente. El plazo `step_timeout_seconds` comprende el arranque del entorno y la suma de los comandos de preparación y comprobación. La limpieza dispone de su propio plazo para retirar los recursos.
 
 Durante una etapa activa se consulta la issue cada cinco segundos, sujeto al tiempo de respuesta de GitHub. Si se cierra, pierde la etiqueta o cambia su contenido, se interrumpe el proceso y se retiran los recursos de comprobación. El estado registrado distingue cancelación de una petición que requiere confirmar el nuevo alcance.
 
@@ -116,3 +116,54 @@ Cuando un candidato modifica una ruta protegida, `status` muestra el archivo y e
 ```
 
 La opción se puede repetir para varios archivos. Cada autorización queda asociada al trabajo y a la huella vigente de la issue, con fecha y SHA del candidato autorizado. El servicio comprueba las demás rutas protegidas usando el perfil del trabajo. Un cambio del contenido de la issue requiere confirmar el alcance y volver a autorizar las rutas necesarias. La reanudación conserva el candidato y continúa desde la etapa bloqueada.
+
+## Recuperar una construcción interrumpida
+
+El controlador registra la copia de construcción antes de llamar al agente. Si la etapa termina por timeout, `resume OWNER/REPO#N` reutiliza esa copia cuando corresponde al SHA de entrada y a la huella vigente de la issue. El siguiente intento recibe el plan y el motivo de la interrupción y continúa sobre los archivos conservados. Cada intento cuenta dentro del límite de rondas configurado.
+
+Para trabajos creados por versiones anteriores que carezcan de esa referencia, el operador puede seleccionar una copia conservada dentro del directorio del trabajo.
+
+```bash
+"${control[@]}" run --rm controller resume OWNER/REPO#N --reuse-workspace /ruta/jobs/ID-N/tmpXXXX
+```
+
+La ruta debe ser un directorio directo del trabajo. El controlador valida su pertenencia y conserva el aislamiento de los metadatos Git. Si la tarea necesita más tiempo, ajusta `service.step_timeout_seconds` en el TOML antes de reanudarla.
+
+## Diagnosticar una etapa de agente
+
+Cada etapa conserva un archivo `<rol>-<id>.activity.jsonl` en su directorio de evidencia. Registra versión de CLI, tiempos y metadatos de actividad, como inicio y final de herramientas o resultado, asociados al intento y SHA. Los logs del controlador muestran una síntesis periódica de esa actividad.
+
+Cursor se ejecuta con salida `stream-json`. El adaptador exige un resultado terminal completo y valida su contrato. Los fallos conservan la referencia a la actividad y la versión conocida, de forma que un timeout permita contrastar la última señal recibida. El contenido de argumentos, salidas de herramientas y deltas internos queda limitado al transporte temporal del proceso; la actividad persistida contiene metadatos operativos.
+
+Al actualizar una CLI en el host, reconstruye el runner con `bash examples/docker/build-runner.sh codex cursor` para que el servicio utilice esa distribución.
+
+El modo no interactivo de Cursor permite ejecutar las herramientas necesarias durante la revisión; Docker monta el código para lectura en los roles plan y review. El encargo se presenta con metadatos legibles y el diff en líneas independientes para que las herramientas de lectura puedan inspeccionarlo sin truncar una única línea JSON extensa.
+
+## Resolver un conflicto de actualización de base
+
+Si la rama base avanza y Git detecta un conflicto, el servicio registra las rutas y devuelve el árbol combinado al implementador dentro del presupuesto de recuperación. El nuevo candidato incluye ambos padres y necesita checks y revisión propios. Cuando se agota el presupuesto o es necesaria una decisión humana, el operador puede resolver el merge en un clon independiente y traer el commit resultante al almacén Git del trabajo.
+
+El commit de resolución debe incluir como antecesores tanto el candidato conservado como la base actual. Tras revisar la resolución, se puede seleccionar con el comando siguiente.
+
+```bash
+"${control[@]}" run --rm controller resume OWNER/REPO#N --resolved-commit SHA_COMPLETO
+```
+
+Esta operación se aplica a una publicación bloqueada antes de registrar un PR. Conserva el plan y las rondas, registra los SHAs anteriores y la resolución, e inicia la comprobación de la nueva base y del candidato resuelto. El nuevo SHA recibe checks y revisión antes de publicarse.
+
+## Recuperación autónoma limitada
+
+El servicio utiliza estos valores opcionales de `[service]`. Las instalaciones existentes reciben los mismos valores por defecto.
+
+```toml
+max_recovery_attempts = 2
+recovery_backoff_seconds = 30
+```
+
+El presupuesto se comparte entre los reintentos de errores temporales, actualizaciones de base y resoluciones de conflictos del trabajo. Cada decisión se conserva en `recoveries` y en los eventos de SQLite. `max_recovery_attempts = 0` desactiva las recuperaciones automáticas. Los permisos, proveedor asignado y plazo máximo de etapa siguen siendo los del perfil del operador.
+
+Los timeouts, salidas de proveedor inválidas o incompletas y errores reconocidos de red o disponibilidad pueden pasar a `retry_wait`. La espera crece exponencialmente y respeta `Retry-After` o el reinicio de cuota de GitHub. `status` muestra la fecha UTC del siguiente intento. El siguiente sondeo disponible reclama el trabajo al cumplirse esa fecha, incluso después de reiniciar el controlador. Otros trabajos pueden ocupar su plaza durante la espera.
+
+Una construcción interrumpida reutiliza su copia del mismo SHA y alcance. Su continuación cuenta como intento adicional de recuperación y conserva la cuenta total de construcciones. Una revisión interrumpida conserva candidato y checks válidos y repite únicamente la revisión. La publicación conserva su protocolo de reconciliación para recuperar el PR único tras una respuesta perdida.
+
+Una pregunta o cambio de alcance, una ruta protegida, acceso denegado o presupuesto agotado requieren al operador. La recuperación automática no concede permisos ni modifica las credenciales o el límite de tiempo. Los errores desconocidos se conservan con su causa para su diagnóstico.

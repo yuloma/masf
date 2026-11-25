@@ -183,7 +183,9 @@ def operation(value):
         "model": model(None, applicable=False), "usage": usage(None, applicable=False),
         "decision": fields(entry, "id kind operator at evidence pr head candidate base rounds "
                            "result outcome status reason resume_state role provider previous_provider round_limit "
-                           "timeout_seconds previous_timeout_seconds workspace") | {"paths": strings(entry.get("paths"))},
+                           "timeout_seconds previous_timeout_seconds workspace origin expected_revision question "
+                           "question_attempt answer previous_base previous_candidate previous_fingerprint "
+                           "recoveries recovery_limit") | {"paths": strings(entry.get("paths"))},
         "explanation": explanation(value.get("explanation")),
     }
 

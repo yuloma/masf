@@ -103,7 +103,7 @@ Consulta los [contratos de evidencia de etapa y CI](especificacion.md) y la [ace
 
 El modo nativo con `--actions-token-file` añade `GET`, `HEAD` y `POST` en `/v1/jobs/{repo_id}/{issue}/actions`. El detalle del trabajo indica su disponibilidad en `actions_enabled`. Las credenciales, el arranque y la aceptación están en la [guía del dashboard](dashboard.md).
 
-Las acciones exigen `Authorization: Bearer TOKEN`. El servidor valida el host local y, si el cliente envía `Origin`, exige el mismo origen. El `GET` devuelve la revisión opaca, el operador, el número de copias compatibles y las acciones permitidas. Cada acción incluye `kind` y `resume_state`, con parámetros y contexto según corresponda. El contexto protegido contiene los archivos exactos y un resumen de cambios. El contexto de recuperación contiene referencias opacas a las copias compatibles del propio trabajo.
+Las acciones exigen `Authorization: Bearer TOKEN`. El servidor valida el host local y, si el cliente envía `Origin`, exige el mismo origen. El `GET` devuelve la revisión opaca, el operador, el número de copias compatibles y las acciones permitidas. Cada acción incluye `kind` y `resume_state`, con parámetros y contexto según corresponda. El contexto protegido contiene los archivos exactos y un resumen de cambios. El contexto de recuperación contiene referencias opacas a las copias compatibles del propio trabajo. Para un conflicto de base devuelve el candidato, la base registrada, las rutas, el prefijo de referencia local y los commits válidos si existen. El detalle del trabajo expone el estado y el historial de recuperación en `recovery`, con consumo, límite, construcciones, etapa y próximo intento.
 
 El `POST` exige `Content-Type: application/json` y una cabecera `Idempotency-Key` de 16 a 128 caracteres alfanuméricos, guiones o guiones bajos. Este ejemplo usa la revisión devuelta por el servicio.
 
@@ -115,11 +115,15 @@ El `POST` exige `Content-Type: application/json` y una cabecera `Idempotency-Key
 | --- | --- |
 | `answer`, `confirm_scope`, `resolve` | `{}` |
 | `allow_paths` | `{"paths":[".github/workflows/factory.yml"]}`, con la lista exacta ofrecida |
-| `assign_provider` | `{"provider":"cursor"}`, con un proveedor ofrecido para el rol |
+| `assign_provider` | `{"role":"plan","provider":"cursor"}`, con un proveedor ofrecido para el rol |
 | `add_rounds` | `{"extra":1}` |
+| `add_recoveries` | `{"extra":2}` |
+| `resolved_commit` | `{"sha":"SHA"}`, con un commit ofrecido |
+| `accept_head` | `{"sha":"SHA"}`, con el head observado y `extra` opcional para ampliar rondas |
+| `reuse_workspace` | `{"reference":"REFERENCIA"}`, con una referencia ofrecida |
 | `extend_timeout` | `{"seconds":1200,"reference":"REFERENCIA"}`, con una referencia ofrecida |
 
-La respuesta 200 contiene un recibo `data` con `id`, `operator`, `kind`, `status: "applied"`, `accepted_at`, `applied_at` y `state`. La escritura del recibo, la operación en la cronología y la transición son atómicas. Un reenvío de la misma decisión con la misma clave devuelve el mismo recibo. La revisión se compara en la escritura, después de adquirir la reserva compartida del trabajo. El servidor verifica además el alcance, la pertenencia de la copia, el SHA y los límites aplicables.
+La respuesta 200 contiene un recibo `data` con `id`, `operator`, `kind`, `status: "applied"`, `accepted_at`, `applied_at`, `revision`, `origin` y `state`. La escritura del recibo, la operación en la cronología y la transición son atómicas. Un reenvío de la misma decisión con la misma clave devuelve el mismo recibo. La revisión se compara en la escritura, después de adquirir la reserva compartida del trabajo. El servidor verifica además el alcance, la pertenencia de la copia, el SHA y los límites aplicables.
 
 | HTTP | Código |
 | --- | --- |

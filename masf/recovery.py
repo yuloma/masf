@@ -9,6 +9,11 @@ class RecoverableFailure(RuntimeError):
     pass
 
 
+class BudgetExhausted(RuntimeError):
+    pass
+
+
+EXHAUSTION_NOTE = " (sin presupuesto de recuperación automática)"
 OPERATOR_MARKERS = (
     "unauthorized",
     "unauthenticated",
@@ -20,11 +25,15 @@ OPERATOR_MARKERS = (
 )
 
 
+def limit(job, cfg):
+    return max(cfg["service"].get("max_recovery_attempts", 2), job.get("recovery_limit") or 0,
+               len(job.get("recoveries") or []))
+
+
 def reserve(job, cfg, action, **detail):
     history = list(job.get("recoveries", []))
-    limit = cfg["service"].get("max_recovery_attempts", 2)
-    if len(history) >= limit:
-        raise RuntimeError("Recuperaciones automáticas agotadas")
+    if len(history) >= limit(job, cfg):
+        raise BudgetExhausted("Recuperaciones automáticas agotadas")
     conflict = job.get("pr_conflict") or {}
     inputs = {key: conflict[key] for key in ("pr", "base", "head", "fingerprint", "paths")
               if key in conflict}
@@ -66,18 +75,23 @@ def retryable(exc):
     return transient
 
 
-def schedule(job, cfg, exc, *, minimum_delay=0):
-    """Return updates only for known transient failures, never grant permissions."""
+def can_schedule(exc, minimum_delay=0):
     text = clean(str(exc))
     if any(marker in text.lower() for marker in OPERATOR_MARKERS):
-        return None
+        return False
     rate_limited = minimum_delay > 0 and (
         "límite de peticiones" in text
         or "retry-after" in getattr(exc, "stdout", "").lower()
         or "x-ratelimit-remaining: 0" in getattr(exc, "stdout", "").lower()
     )
-    if not retryable(exc) and not rate_limited:
+    return retryable(exc) or rate_limited
+
+
+def schedule(job, cfg, exc, *, minimum_delay=0):
+    """Return updates only for known transient failures, never grant permissions."""
+    if not can_schedule(exc, minimum_delay):
         return None
+    text = clean(str(exc))
     conflict = job.get("pr_conflict")
     try:
         history = reserve(
@@ -88,11 +102,12 @@ def schedule(job, cfg, exc, *, minimum_delay=0):
             reason=text,
             candidate=job.get("candidate"),
         )
-    except RuntimeError:
+    except BudgetExhausted:
         return None
     updates = {
         "recoveries": history,
         "recovery_wait": wait(cfg, history, job["state"], minimum_delay),
+        "recovery_exhausted": False,
         "reason": text,
     }
     if job["state"] == "building":

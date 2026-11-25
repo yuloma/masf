@@ -13,7 +13,7 @@ from importlib.resources import files
 from itertools import islice
 from urllib.parse import parse_qsl
 
-from . import ci
+from . import ci, recovery
 from . import observation_data as public
 from .actions import ActionError, Actions
 from .config import ConfigError
@@ -82,6 +82,7 @@ def registry(path):
     return visible, {"service": {
         "max_build_rounds": service.get("max_build_rounds"),
         "max_ci_technical_retries": service.get("max_ci_technical_retries", 2),
+        "max_recovery_attempts": service.get("max_recovery_attempts", 2),
     }}
 
 
@@ -460,6 +461,9 @@ class View:
         ]}
         counts = ci.limits(limits_job, cfg) if type(cfg["service"]["max_build_rounds"]) is int else {}
         limits = public.fields(counts, "rounds functional build_limit technical technical_limit")
+        history = public.items(job.get("recoveries"))
+        wait = public.mapping(job.get("recovery_wait")) if row["state"] == "retry_wait" else {}
+        retry_at = public.scalar(wait.get("until") if wait else job.get("ci_retry_at")) or None
         pr_number = job.get("pr_number") if type(job.get("pr_number")) is int else None
         if pr_number is None:
             match = re.fullmatch(r"https://github\.com/" + re.escape(row["slug"]) + r"/pull/(\d+)",
@@ -510,9 +514,18 @@ class View:
             "repair": public.repair(job.get("ci_repair")),
             "merge_observation": public.conflict(job.get("merge_observation")),
             "pr_conflict": public.conflict(job.get("pr_conflict")),
+            "base_conflict": public.conflict(job.get("base_conflict")),
+            "observed_base": public.scalar(public.mapping(job.get("base_conflict")).get("observed_base")),
             "conflict_result": public.conflict(job.get("conflict_result")),
-            "retry_at": (public.scalar(public.mapping(job.get("recovery_wait")).get("until"))
-                         if row["state"] == "retry_wait" else public.scalar(job.get("ci_retry_at"))) or None,
+            "retry_at": retry_at,
+            "recovery": {
+                "used": len(history), "limit": recovery.limit(job, cfg),
+                "builds": public.scalar(job.get("recovery_builds", 0)),
+                "stage": JOB_STAGE.get(wait.get("stage")), "next_at": public.scalar(wait.get("until")),
+                "history": [public.fields(item, "action at stage reason base head candidate")
+                            | {"paths": public.strings(public.mapping(item).get("paths"))}
+                            for item in history],
+            },
         }
 
     def job_events(self, identity, query):

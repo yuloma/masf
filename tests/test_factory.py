@@ -1,3 +1,4 @@
+import os
 import json
 import re
 import sqlite3
@@ -294,6 +295,9 @@ class Delivery(TemporaryTest):
         self.worker = worker.Worker(
             db, self.cfg, CONFIG, self.root / "state", self.root / "jobs", self.job
         )
+        jobs_env = patch.dict(os.environ, {"MASF_JOBS_DIR": str(self.root / "jobs")})
+        jobs_env.start()
+        self.addCleanup(jobs_env.stop)
         self.worker.url = str(self.source)
         self.prs, self.roles = [], []
         self.reject_check = self.reject_review = self.deny = self.crash = False
@@ -309,6 +313,11 @@ class Delivery(TemporaryTest):
             patcher = patch.object(target, *value)
             patcher.start()
             self.addCleanup(patcher.stop)
+
+    def keep_resolution(self, sha, *, job=None):
+        job = job or self.job
+        prefix = f"refs/masf/resolutions/{job['fingerprint']}/{job['base_conflict']['base']}/"
+        self.worker.git("update-ref", prefix + sha, sha)
 
     def agent(
         self, role, job, cfg, workspace, inputs, owner, *, guard=None, on_activity=None
@@ -342,6 +351,8 @@ class Delivery(TemporaryTest):
         )
 
     def api(self, endpoint, *opts, stdin=None):
+        if "/commits/" in endpoint:
+            return {"sha": self.base}
         if stdin is not None:
             return json.loads(
                 worker.command(["gh", "api", endpoint, *opts], stdin=stdin)
@@ -693,7 +704,7 @@ class Delivery(TemporaryTest):
         self.assertEqual(self.job["rounds"], 2)
         self.assertIsNone(self.job["build_workspace"])
 
-    def test_resume_recovers_legacy_workspace(self):
+    def test_resume_rejects_unrecorded_workspace(self):
         from masf.cli import resume
 
         folder = (
@@ -709,6 +720,7 @@ class Delivery(TemporaryTest):
         with (
             patch("masf.cli.api", self.api),
             patch.dict("os.environ", {"MASF_JOBS_DIR": str(self.root / "jobs")}),
+            self.assertRaises(ValueError),
         ):
             resume(
                 self.worker.db,
@@ -717,9 +729,8 @@ class Delivery(TemporaryTest):
                 reuse_workspace=folder,
             )
         j = json.loads(self.worker.db.execute("SELECT data FROM jobs").fetchone()[0])
-        self.assertEqual(j["build_workspace"]["path"], str(folder))
-        self.assertEqual(j["build_workspace"]["input_sha"], self.base)
-        self.assertEqual(j["state"], "building")
+        self.assertNotIn("build_workspace", j)
+        self.assertEqual(j["state"], "blocked")
         self.assertEqual(j["rounds"], 0)
 
     def test_workspace_recovery_rejects_other_job_and_git_store(self):
@@ -776,6 +787,7 @@ class Delivery(TemporaryTest):
         resolved = self.worker.git(
             "commit-tree", tree, "-p", previous, "-p", self.base, "-m", "resolve"
         )
+        self.keep_resolution(resolved)
         queue.save(self.worker.db, self.job, "blocked", retry="publishing")
         with (
             patch("masf.cli.api", self.api),
@@ -793,8 +805,8 @@ class Delivery(TemporaryTest):
         )
         self.assertEqual(restored["state"], "checking")
         self.assertEqual(restored["rounds"], 1)
-        self.assertNotIn("checks", restored)
-        self.assertNotIn("review", restored)
+        self.assertEqual(restored["checks"], {})
+        self.assertEqual(restored["review"], {})
         self.assertEqual(
             restored["base_resolutions"][0]["previous_candidate"], previous
         )
@@ -1501,6 +1513,7 @@ class Delivery(TemporaryTest):
         incomplete = self.worker.git("commit-tree", tree, "-p", self.base, "-m", "missing head")
         stale_base = self.worker.git("commit-tree", tree, "-p", self.old_head, "-m", "missing base")
         resolved = self.worker.git("commit-tree", tree, "-p", self.old_head, "-p", self.base, "-m", "resolved")
+        self.keep_resolution(resolved, job=blocked)
         with (patch.object(cli, "latest", return_value=self.base),
               patch.dict("os.environ", {"MASF_JOBS_DIR": str(self.root / "jobs")})):
             for invalid in (incomplete, stale_base):

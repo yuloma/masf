@@ -239,6 +239,8 @@ def save(db, job, state, *, action_receipt=None, **updates):
     with db:
         db.execute("BEGIN IMMEDIATE")
         if not lease_active(db, job):
+            if action_receipt is not None:
+                raise RevisionConflict
             raise RuntimeError("La reserva del trabajo ha vencido")
         if action_receipt is not None:
             key, signature, receipt, expected = action_receipt
@@ -247,6 +249,8 @@ def save(db, job, state, *, action_receipt=None, **updates):
             if not row or job_revision(db, identity, json.loads(row[0])) != expected:
                 raise RevisionConflict
             db.execute("INSERT INTO action_receipts VALUES(?,?,?)", (key, signature, json.dumps(receipt)))
+            db.execute("DELETE FROM leases WHERE repo_id=? AND number=? AND token=?",
+                       (*identity, job["attempt"]))
         detail = dict(updates)
         if "ci" in updates and state == job["state"] and not updates.get("ci_repair"):
             detail["kind"] = "ci_observation"
@@ -272,7 +276,8 @@ def save(db, job, state, *, action_receipt=None, **updates):
             (state, json.dumps(filtered(persisted)), job["repo_id"], job["number"]),
         )
     job.update(next_job)
-    print(f"{job['slug']}#{job['number']} {state}", flush=True)
+    if action_receipt is None:
+        print(f"{job['slug']}#{job['number']} {state}", flush=True)
 
 
 def save_link(db, job, approval):

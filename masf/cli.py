@@ -1,5 +1,4 @@
 import argparse
-import fnmatch
 import getpass
 from datetime import datetime, timezone
 import fcntl
@@ -12,9 +11,10 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, wait
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
-from . import ci
+from . import ci, recovery
+from .actions import ActionError, Decisions, recorded_question
 from .config import ConfigError, load, xdg
 from .evidence import UNKNOWN_PROVENANCE, historical_role, provenance
 from .observation_api import DEFAULT_PORT, port, serve as serve_observation
@@ -34,11 +34,9 @@ from .queue import (
     save_link,
     scan,
     stage_attempts,
-    interrupt_stages,
 )
 from .system import TaskStopped, clean, command, docker_env, filtered
-from .recovery import schedule
-from .worker import ProtectedPaths, Worker, saved_workspace
+from .worker import ProtectedPaths, Worker
 
 
 RUNNABLE = ("queued", "planning", "building", "checking", "reviewing", "publishing", "retry_wait")
@@ -130,7 +128,7 @@ def process_task(cfg, config, root, job):
         if job["state"] == "retry_wait":
             if job["recovery_wait"]["until"] > time.time():
                 return 0
-            save(db, job, job["recovery_wait"]["stage"], reason="")
+            save(db, job, job["recovery_wait"]["stage"], reason="", recovery_wait={})
         thread = threading.Thread(target=heartbeat, daemon=True)
         thread.start()
         jobs = Path(
@@ -146,15 +144,22 @@ def process_task(cfg, config, root, job):
             failures = [stage for stage in stage_attempts(db, job)
                         if stage["lease"] == token and stage["status"] == "failed"]
             failed_attempt = failures[-1]["id"] if failures else None
-            updates = schedule(job, cfg, exc, minimum_delay=retry_delay())
+            delay = retry_delay()
+            updates = recovery.schedule(job, cfg, exc, minimum_delay=delay)
             if updates is not None:
                 save(db, job, "retry_wait", **updates, failed_attempt=failed_attempt)
             else:
-                if len(job.get("recoveries", [])) >= cfg["service"].get("max_recovery_attempts", 2):
-                    reason += " (sin presupuesto de recuperación automática)"
+                exhausted = None
+                if isinstance(exc, recovery.BudgetExhausted):
+                    exhausted = "reserve"
+                elif (recovery.can_schedule(exc, delay)
+                      and len(job.get("recoveries", [])) >= recovery.limit(job, cfg)):
+                    exhausted = "retry"
+                if exhausted:
+                    reason += recovery.EXHAUSTION_NOTE
                 details = {"blocked_paths": exc.paths} if isinstance(exc, ProtectedPaths) else {}
                 save(db, job, "blocked", retry=job["state"], reason=reason,
-                     failed_attempt=failed_attempt, **details)
+                     failed_attempt=failed_attempt, recovery_exhausted=exhausted, **details)
         except RuntimeError:
             if not lease_active(db, job):
                 return 0
@@ -301,29 +306,69 @@ def tick(db, cfg, config, root, once, workers=None):
         workers.close()
 
 
-def resume(db, cfg, target, allow_protected_paths=(), reuse_workspace=None, resolved_commit=None, *,
-           accept_head=None, add_rounds=None, evidence=None):
+def decision_target(db, cfg, target):
     slug, number = target.rsplit("#", 1)
-    row = db.execute(
-        "SELECT data FROM jobs WHERE slug=? AND number=? AND state IN ('needs_input','blocked')",
-        (slug, int(number)),
-    ).fetchone()
-    if not row or slug not in {r["slug"] for r in cfg["repositories"] if r["enabled"]}:
-        raise ValueError("Trabajo no reanudable")
-    token = uuid.uuid4().hex
-    job = json.loads(row[0])
-    if not claim(db, job, token, 300):
-        raise ValueError("El trabajo tiene un intento activo")
-    try:
-        job = leased_job(db, job, token)
-        if job["state"] not in {"needs_input", "blocked"}:
-            raise ValueError("Trabajo no reanudable")
-        interrupt_stages(db, job)
-        return resume_job(db, cfg, job, allow_protected_paths, reuse_workspace,
-                          accept_head, add_rounds, evidence, resolved_commit)
-    finally:
-        with db:
-            db.execute("DELETE FROM leases WHERE token=?", (token,))
+    row = db.execute("SELECT repo_id,number FROM jobs WHERE slug=? AND number=?",
+                     (slug, int(number))).fetchone()
+    if not row:
+        raise ValueError("Trabajo desconocido")
+    root = Path(db.execute("PRAGMA database_list").fetchone()[2]).parent
+    return Decisions(root, cfg, operator_name(), "cli", lookup=api, latest=latest), tuple(row)
+
+
+def resume(db, cfg, target, allow_protected_paths=(), reuse_workspace=None, resolved_commit=None, *,
+           accept_head=None, add_rounds=None, evidence=None, revision=None, idempotency_key=None,
+           answer=False, confirm_scope=False, role_provider=None, timeout=None, workspace_reference=None,
+           add_recoveries=None):
+    operation, identity = decision_target(db, cfg, target)
+    job, current = operation.read_job(db, identity)
+    explicit = any(value is not None for value in (revision, idempotency_key))
+    if explicit and not (revision and idempotency_key and evidence):
+        raise ValueError("Indica --revision, --idempotency-key y --evidence juntos")
+    if timeout is not None and not workspace_reference:
+        raise ValueError("--timeout-seconds requiere --workspace-reference")
+    if reuse_workspace is not None and workspace_reference:
+        raise ValueError("Selecciona una sola referencia de copia")
+    choices = []
+    if allow_protected_paths:
+        choices.append(("allow_paths", {"paths": list(allow_protected_paths)}))
+    if workspace_reference:
+        if timeout is None:
+            choices.append(("reuse_workspace", {"reference": workspace_reference}))
+        else:
+            choices.append(("extend_timeout", {"seconds": timeout, "reference": workspace_reference}))
+    if reuse_workspace is not None:
+        choices.append(("reuse_workspace", {"path": str(Path(reuse_workspace).absolute())}))
+    if resolved_commit is not None:
+        choices.append(("resolved_commit", {"sha": resolved_commit}))
+    if accept_head is not None:
+        choices.append(("accept_head", {"sha": accept_head} | (
+            {"extra": add_rounds} if add_rounds is not None else {})))
+    elif add_rounds is not None:
+        choices.append(("add_rounds", {"extra": add_rounds}))
+    if add_recoveries is not None:
+        choices.append(("add_recoveries", {"extra": add_recoveries}))
+    if role_provider is not None:
+        role, provider = role_provider
+        choices.append(("assign_provider", {"role": role, "provider": provider}))
+    if answer:
+        choices.append(("answer", {}))
+    if confirm_scope:
+        choices.append(("confirm_scope", {}))
+    if len(choices) > 1:
+        raise ValueError("Selecciona una sola decisión")
+    kind, options = choices[0] if choices else ("resolve", {})
+    if not choices and not explicit:
+        if job.get("scope_conflict"):
+            kind = "confirm_scope"
+        elif job["state"] == "needs_input" and recorded_question(db, job):
+            kind = "answer"
+    if kind == "answer" and not evidence:
+        raise ValueError("Escribe la respuesta mediante --evidence")
+    return operation.submit(db, identity, idempotency_key or uuid.uuid4().hex, {
+        "kind": kind, "revision": revision or current, "confirm": True, "options": options,
+        "evidence": evidence or job.get("reason") or "Reanudación autorizada desde la CLI",
+    })
 
 
 def operator_name():
@@ -350,261 +395,6 @@ def approved_head(job, sha):
     if ref["object"]["sha"] != sha:
         raise ValueError("La referencia remota debe coincidir con el SHA autorizado")
     return pr
-
-
-def resume_job(db, cfg, j, allow_protected_paths, reuse_workspace,
-               accept_head, add_rounds, evidence, resolved_commit=None):
-    slug, number = j["slug"], j["number"]
-    current = next(r for r in cfg["repositories"] if r["slug"] == slug)
-    routing = current["routing"] | (j.get("routing_override") or {})
-    if any(not cfg["providers"].get(name, {}).get("enabled")
-           for name in (j.get("routing_override") or {}).values()):
-        raise ValueError("La asignación utiliza un proveedor deshabilitado")
-    if j["repo"]["routing"] != routing:
-        j.setdefault("routing_history", []).append(j["repo"]["routing"])
-        j["repo"]["routing"] = routing
-        j.pop("review", None)
-    issue = api(f"repos/{slug}/issues/{number}")
-    if j.get("pr_number") and not eligible(issue, j["repo"]):
-        save(db, j, "cancelled", reason="Issue cerrada o etiqueta retirada")
-        return
-    if j.get("pr_number"):
-        pr = ci.pull(j, api)
-        if pr["state"] != "open":
-            ci.validate(db, j, pr, set())
-            return
-    if accept_head or add_rounds is not None:
-        if (not j.get("pr_number") or fingerprint(issue) != j["fingerprint"]):
-            raise ValueError("La decisión requiere un PR vinculado y el alcance vigente")
-    if accept_head:
-        if not j.get("head_conflict") or j["head_conflict"]["observed"] != accept_head:
-            raise ValueError("Autoriza el SHA del conflicto visible en status")
-        approved_head(j, accept_head)
-        entry = decision(j, "head", evidence, previous=ci.expected_head(j), head=accept_head,
-                         candidate=j.get("candidate"), pr=j["pr_number"],
-                         conflict=j["head_conflict"])
-        additions = [entry]
-        if add_rounds is not None:
-            additions.append(rounds_decision(j, cfg, add_rounds, evidence, accept_head))
-        save(db, j, "pr_open", decisions=[*j.get("decisions", []), *additions],
-             published_head=accept_head, candidate=accept_head, head_conflict=None,
-             repair_intent=None, ci_repair=None, ci_retry_at=0, ci_intervention=False,
-             checks={}, review={}, build_workspace=None, reason="",
-             pr_conflict=None, base_conflict=None, build_recovery=None, integration_approval=None,
-             ci={"sha": accept_head, "state": "waiting", "checks": [], "pending_runs": []})
-        return
-    scope_changed = fingerprint(issue) != j["fingerprint"]
-    if j.get("head_conflict") and not scope_changed:
-        raise ValueError("La discrepancia de head requiere resume --accept-head SHA --evidence TEXTO")
-    if add_rounds is not None:
-        head = ci.expected_head(j)
-        approved_head(j, head)
-        entry = rounds_decision(j, cfg, add_rounds, evidence, head)
-        repair = j.get("ci_repair") or {}
-        if j.get("retry") == "pr_open" and repair:
-            ci_handled = [item for item in j.get("ci_handled", [])
-                          if (item["sha"], item["key"]) != (repair["sha"], repair["key"])]
-            save(db, j, "pr_open", decisions=[*j.get("decisions", []), entry],
-                 ci_handled=ci_handled, ci_repair=None, ci_intervention=False, reason="")
-        else:
-            save(db, j, j.get("retry", "building"), decisions=[*j.get("decisions", []), entry],
-                 ci_intervention=False, reason="")
-        return
-    if allow_protected_paths:
-        if (
-            j["state"] != "blocked"
-            or not j.get("candidate")
-            or not eligible(issue, j["repo"])
-            or fingerprint(issue) != j["fingerprint"]
-        ):
-            raise ValueError(
-                "La autorización requiere un trabajo bloqueado con candidato y alcance vigente"
-            )
-        if j.get("pr_number"):
-            approved_head(j, ci.expected_head(j))
-        approvals = dict(j.get("path_approvals", {}))
-        for path in allow_protected_paths:
-            normalized = PurePosixPath(path)
-            if (
-                not path
-                or normalized.is_absolute()
-                or str(normalized) != path
-                or any(part in (".", "..", ".git") for part in normalized.parts)
-                or any(char in path for char in "*?[]\\")
-                or not any(
-                    fnmatch.fnmatchcase(path, pattern)
-                    for pattern in j["repo"].get("protected_paths", [])
-                )
-            ):
-                raise ValueError(
-                    "Indica una ruta protegida exacta relativa al repositorio"
-                )
-            approvals[path] = {
-                "candidate": j["candidate"],
-                "fingerprint": j["fingerprint"],
-                "at": datetime.now(timezone.utc).isoformat(),
-                "operator": operator_name(),
-                "evidence": ci.excerpt(evidence or j.get("reason") or path),
-            }
-    resolution = None
-    if resolved_commit is not None:
-        pull_conflict = j.get("pr_conflict") if j.get("pr_number") else None
-        if (
-            not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", resolved_commit)
-            or j["state"] != "blocked"
-            or (not pull_conflict and j.get("retry") != "publishing")
-            or not j.get("candidate")
-            or (j.get("pr_number") and not pull_conflict)
-            or not eligible(issue, j["repo"])
-            or fingerprint(issue) != j["fingerprint"]
-        ):
-            raise ValueError(
-                "La resolución requiere un commit completo y una publicación bloqueada con alcance vigente"
-            )
-        jobs = Path(
-            os.environ.get("MASF_JOBS_DIR") or xdg("DATA", ".local/share") / "jobs"
-        )
-        resolver = Worker(db, cfg, None, xdg("STATE", ".local/state"), jobs, j)
-        current_base = latest(slug, j["branch"])
-        ancestor = j["candidate"]
-        paths = (j.get("base_conflict") or {}).get("paths", [])
-        if pull_conflict:
-            ancestor = ci.expected_head(j)
-            pr = approved_head(j, ancestor)
-            if pr["base"].get("sha") != current_base:
-                raise ValueError("GitHub aún no refleja la base vigente del PR")
-            _, paths = resolver.merge_tree(current_base, ancestor)
-        resolver.git("rev-parse", "--verify", resolved_commit + "^{commit}")
-        try:
-            resolver.check_resolution(resolved_commit, current_base, ancestor, paths)
-        except RuntimeError as exc:
-            raise ValueError(f"El commit resuelto debe incluir el candidato y la base actual. {exc}") from None
-        resolver.git("update-ref", "refs/heads/candidate", resolved_commit)
-        resolution = {
-            "previous_base": j["base"],
-            "previous_candidate": j["candidate"],
-            "base": current_base,
-            "candidate": resolved_commit,
-            "at": datetime.now(timezone.utc).isoformat(),
-        }
-    if reuse_workspace is not None:
-        if (
-            j["state"] != "blocked"
-            or j.get("retry") != "building"
-            or not eligible(issue, j["repo"])
-            or fingerprint(issue) != j["fingerprint"]
-        ):
-            raise ValueError(
-                "La recuperación requiere construcción bloqueada y alcance vigente"
-            )
-        jobs = Path(
-            os.environ.get("MASF_JOBS_DIR") or xdg("DATA", ".local/share") / "jobs"
-        )
-        folder = saved_workspace(
-            jobs / f"{j['repo_id']}-{j['number']}", reuse_workspace
-        )
-        checkpoint = {
-            "path": str(folder),
-            "input_sha": j.get("candidate") or j["base"],
-            "fingerprint": j["fingerprint"],
-            "error": j.get("reason"),
-        }
-    if not eligible(issue, j["repo"]):
-        save(db, j, "cancelled")
-    elif j.get("pr_number") and not scope_changed and j.get("ci_intervention") and j.get("retry") != "planning":
-        if j.get("retry") == "building" or (
-            (j.get("ci_repair") or {}).get("diagnostics")
-            and all(item["kind"] == "functional" for item in j["ci_repair"]["diagnostics"])
-        ):
-            raise ValueError("El flujo necesita resume --add-rounds N --evidence TEXTO")
-        entry = decision(j, "resume", evidence or j["reason"], pr=j["pr_number"],
-                         head=ci.expected_head(j), candidate=j.get("candidate"))
-        save(db, j, "pr_open", decisions=[*j.get("decisions", []), entry],
-             ci_repair=None, ci_intervention=False, ci_retry_at=0, reason="")
-    elif scope_changed or j["state"] == "needs_input":
-        published = ci.expected_head(j)
-        for key in (
-            "plan",
-            "plan_attempt",
-            "candidate",
-            "checks",
-            "review",
-            "feedback",
-            "build_workspace",
-        ):
-            j.pop(key, None)
-        linked = {}
-        if j.get("pr_number"):
-            repair = j.get("ci_repair") or {}
-            linked = dict(candidate=published, published_head=published, ci_repair=None,
-                          ci_intervention=False, repair_intent=None, ci_retry_at=0, ci_handled=[])
-            linked.update(ci.restart_conflict(j))
-            if not scope_changed and repair:
-                linked["feedback"] = {"source": "CI", "sha": repair["sha"],
-                                      "diagnostics": repair["diagnostics"]}
-        entry = decision(j | {"fingerprint": fingerprint(issue)}, "resume_planning",
-                         evidence or j.get("reason") or "Alcance de la issue actualizado",
-                         previous_fingerprint=j["fingerprint"], pr=j.get("pr_number"),
-                         head=published)
-        save(
-            db,
-            j,
-            "planning",
-            **linked,
-            decisions=[*j.get("decisions", []), entry],
-            title=issue["title"],
-            body=issue["body"],
-            rounds=0 if scope_changed or not j.get("pr_number") else j["rounds"],
-            **({"recovery_builds": 0, "ci_rounds": 0} if scope_changed else {}),
-            fingerprint=fingerprint(issue),
-            scope_conflict=None,
-            scope_review=None,
-            reason="",
-        )
-    else:
-        updates = {"reason": "", "ci_retry_at": 0}
-        if allow_protected_paths:
-            updates["path_approvals"] = approvals
-        if reuse_workspace is not None:
-            updates["build_workspace"] = checkpoint
-            if j.get("pr_conflict"):
-                checkpoint["operator_resume"] = True
-        state = j.get("retry", "queued")
-        if resolution is not None:
-            for key in ("checks", "review", "base_checked", "base_conflict"):
-                j.pop(key, None)
-            updates.update(
-                base=resolution["base"],
-                candidate=resolved_commit,
-                build_workspace=None,
-                build_recovery=None,
-                repair_intent=None,
-                base_resolutions=[*(j.get("base_resolutions") or []), resolution],
-            )
-            if j.get("pr_conflict"):
-                updates.update(integration_approval=None, pr_conflict=j["pr_conflict"] | {
-                    "base": resolution["base"], "head": ci.expected_head(j), "paths": paths,
-                    "status": "resolved", "candidate": resolved_commit,
-                    "decision": "Resolución autorizada por el operador",
-                })
-            state = "checking"
-        kind = ("resolved_commit" if resolution else "allow_paths" if allow_protected_paths
-                else "reuse_workspace" if reuse_workspace is not None else "resume")
-        entry = decision(j, kind, evidence or j.get("reason") or f"resume: {state}",
-                         candidate=updates.get("candidate", j.get("candidate")),
-                         base=updates.get("base", j.get("base")), pr=j.get("pr_number"),
-                         paths=list(allow_protected_paths))
-        updates["decisions"] = [*j.get("decisions", []), entry]
-        save(db, j, state, **updates)
-
-
-
-def rounds_decision(job, cfg, count, evidence, head):
-    counts = ci.limits(job, cfg)
-    if count <= 0 or counts["rounds"] < counts["build_limit"]:
-        raise ValueError("Indica rondas adicionales positivas para un límite agotado")
-    return decision(job, "rounds", evidence, rounds=count, pr=job["pr_number"], head=head,
-                    candidate=job.get("candidate"), counters=counts)
 
 
 def link_pr(db, cfg, target, pr_number, sha, evidence):
@@ -754,7 +544,16 @@ def main():
         "--resolved-commit",
         help="Selecciona un commit local que resuelve la actualización de base",
     )
-    decisions = resume_parser.add_argument_group("decisiones para CI")
+    decisions = resume_parser.add_argument_group("decisiones del operador")
+    decisions.add_argument("--decision-context", action="store_true", help="Muestra la revisión y opciones vigentes")
+    decisions.add_argument("--revision", help="Revisión esperada del trabajo")
+    decisions.add_argument("--idempotency-key", help="Clave estable de 16 a 128 caracteres")
+    decisions.add_argument("--answer", action="store_true", help="Usa --evidence como respuesta a la pregunta")
+    decisions.add_argument("--confirm-scope", action="store_true", help="Confirma el alcance observado")
+    decisions.add_argument("--assign-provider", nargs=2, metavar=("ROL", "PROVEEDOR"))
+    decisions.add_argument("--timeout-seconds", type=int)
+    decisions.add_argument("--workspace-reference")
+    decisions.add_argument("--add-recoveries", type=int)
     decisions.add_argument("--accept-head")
     decisions.add_argument("--add-rounds", type=int)
     decisions.add_argument("--evidence")
@@ -845,6 +644,22 @@ def main():
                         detail.setdefault("historical_stages", []).append(historical_role(role, record))
                 print(json.dumps(filtered(dict(row) | {"detail": detail}), ensure_ascii=False))
             return 0
+        if args.cmd == "resume":
+            if args.decision_context:
+                operation, identity = decision_target(db, cfg, args.issue)
+                result = operation.context(db, identity)
+            else:
+                result = resume(
+                    db, cfg, args.issue, args.allow_protected_path, args.reuse_workspace,
+                    resolved_commit=args.resolved_commit, accept_head=args.accept_head,
+                    add_rounds=args.add_rounds, evidence=args.evidence, revision=args.revision,
+                    idempotency_key=args.idempotency_key, answer=args.answer,
+                    confirm_scope=args.confirm_scope, role_provider=args.assign_provider,
+                    timeout=args.timeout_seconds, workspace_reference=args.workspace_reference,
+                    add_recoveries=args.add_recoveries,
+                )
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
         if args.cmd == "serve":
             print(
                 f"MASF serve activo, configuración {config}, sondeo cada {cfg['service']['poll_seconds']}s",
@@ -857,23 +672,6 @@ def main():
                     started = time.monotonic()
                     try:
                         fcntl.flock(lock, fcntl.LOCK_EX)
-                        if args.cmd == "resume":
-                            if (args.accept_head or args.add_rounds is not None) and (
-                                args.allow_protected_path or args.reuse_workspace or args.resolved_commit
-                            ):
-                                raise ValueError("Ejecuta las autorizaciones de rutas y de CI por separado")
-                            resume(
-                                db,
-                                cfg,
-                                args.issue,
-                                args.allow_protected_path,
-                                args.reuse_workspace,
-                                resolved_commit=args.resolved_commit,
-                                accept_head=args.accept_head,
-                                add_rounds=args.add_rounds,
-                                evidence=args.evidence,
-                            )
-                            return 0
                         if args.cmd == "link-pr":
                             if args.linked_issue is not None:
                                 if args.pr is not None or args.head or args.evidence:
@@ -904,6 +702,10 @@ def main():
                     time.sleep(delay)
         finally:
             workers.close()
+    except ActionError as exc:
+        print(json.dumps({"error": {"code": exc.code, "message": exc.message}}, ensure_ascii=False),
+              file=sys.stderr)
+        return 1
     except ConfigError as exc:
         print(clean(f"{exc} ({config})"), file=sys.stderr)
         return 1

@@ -164,8 +164,7 @@ class DashboardBrowser(unittest.TestCase):
         self.decision("Permiso reparado")
         self.applied("Publicación")
         self.assertEqual(app.run_ready(), 0)
-        self.refresh()
-        self.expect(self.page.get_by_text("PR abierto", exact=True).first).to_be_visible()
+        self.expect(self.page.get_by_text("PR abierto", exact=True).first).to_be_visible(timeout=15000)
         for expected in ("fixture-plan-1", "fixture-plan-2", "No comunicado", "cursor", "codex"):
             self.expect(self.page.get_by_text(expected, exact=True).first).to_be_visible()
         self.expect(self.page.get_by_text("0 tokens", exact=False).first).to_be_visible()

@@ -26,6 +26,70 @@ def pull(job, lookup=api):
     return lookup(f"repos/{job['slug']}/pulls/{job['pr_number']}")
 
 
+def merge_status(pr):
+    if pr.get("mergeable_state") == "unknown":
+        return "pending"
+    if pr.get("mergeable") is True:
+        return "compatible"
+    if pr.get("mergeable") is False and pr.get("mergeable_state") == "dirty":
+        return "conflicting"
+    return "pending"
+
+
+def merge_poll_failed(db, job, cfg, exc):
+    error = excerpt(str(exc))
+    reason = "Observación del PR pendiente. Se volverá a consultar GitHub"
+    state = job["state"]
+    updates = {}
+    if re.search(SIGNALS["access"], error, re.I) and not retry_delay():
+        reason = "Acceso al PR insuficiente. Revisa permisos y credenciales y usa resume"
+        updates["retry"] = state
+        state = "blocked"
+    save(db, job, state, reason=reason, ci_poll_error=error,
+         ci_retry_at=time.time() + max(retry_delay(), cfg["service"].get("ci_retry_seconds", 60)),
+         merge_observation=(job.get("merge_observation") or {}) | {"status": "pending"},
+         **updates)
+
+
+def observe_merge(db, job, pr, lookup):
+    base, head = pr["base"].get("sha"), pr["head"]["sha"]
+    status = merge_status(pr)
+    observation = {"pr": pr["number"], "base": base, "head": head,
+                   "fingerprint": job["fingerprint"], "status": status}
+    if status != "pending":
+        # The PR snapshot can lag behind its branches.
+        root = f"repos/{job['slug']}/git/ref/heads/"
+        remote_head = lookup(root + branch(job))["object"]["sha"]
+        if remote_head != head:
+            head_conflict(db, job, head, remote_head)
+            return True
+        remote_base = lookup(root + job["branch"])["object"]["sha"]
+        if remote_base != base or not base:
+            observation["status"] = "pending"
+        elif not re.fullmatch(r"(?:[a-f0-9]{40}|[a-f0-9]{64})", base or ""):
+            raise ValueError("SHA de base del PR inválido")
+        elif status == "conflicting":
+            previous = job.get("conflict_result") or {}
+            if previous.get("status") == "disagreement" and all(
+                previous.get(key) == observation[key] for key in ("pr", "base", "head", "fingerprint")
+            ):
+                observation["status"] = "pending"
+            else:
+                reason = "Conflicto de integración observado. Verificación con Git pendiente"
+                save(db, job, "building", merge_observation=observation,
+                     pr_conflict=observation | {"status": "queued", "decision": reason},
+                     reason=reason, ci_repair=None, ci_retry_at=0, ci_poll_error=None,
+                     ci_intervention=False, repair_intent=None, build_workspace=None,
+                     build_recovery=None, integration_approval=None)
+                return True
+    if observation != job.get("merge_observation"):
+        previous = job.get("merge_observation") or {}
+        invalid = any(previous.get(key) != observation[key] for key in ("base", "head", "fingerprint"))
+        save(db, job, job["state"], merge_observation=observation, pr_conflict=None,
+             **({"integration_approval": None} if invalid else {}))
+    return False
+
+
 def provenance(job, pr):
     head, base = pr.get("head") or {}, pr.get("base") or {}
     return (
@@ -43,7 +107,13 @@ def provenance(job, pr):
 
 def validate(db, job, pr, heads):
     if pr["state"] != "open":
-        save(db, job, "merged" if pr.get("merged_at") else "closed", reason="")
+        if pr["state"] != "closed":
+            raise ValueError("Estado de PR desconocido")
+        state = "merged" if pr.get("merged_at") or pr.get("merged") else "closed"
+        conflict = job.get("pr_conflict")
+        save(db, job, state, reason="", integration_approval=None,
+             **({"pr_conflict": None, "conflict_result": conflict | {"status": state}}
+                if conflict else {}))
     elif not provenance(job, pr):
         reason = "Verifica el repositorio, la rama y la procedencia del PR"
         if job.get("reason") != reason:
@@ -60,6 +130,8 @@ def validate(db, job, pr, heads):
 
 def head_conflict(db, job, observed, remote=None):
     expected = expected_head(job)
+    if observed == expected and remote and remote != expected:
+        observed = remote
     prior = job.get("head_conflict") or {}
     if (
         job["state"] == "needs_input"
@@ -68,17 +140,43 @@ def head_conflict(db, job, observed, remote=None):
         and (remote is None or prior.get("remote") == remote)
     ):
         return
+    action = f"Usa resume --accept-head {observed} --evidence TEXTO tras revisar los cambios"
+    reason = "Falta la rama del PR. Restaura la referencia" if observed == expected else "Head inesperado"
     save(
         db, job, "needs_input",
-        reason=f"Head inesperado. Usa resume --accept-head {observed} tras revisar los cambios",
+        reason=f"{reason}. {action}",
         retry="pr_open", head_conflict={"expected": expected, "observed": observed, "remote": remote},
+        integration_approval=None,
     )
+
+
+def restart_conflict(job):
+    conflict = job.get("pr_conflict")
+    if not conflict:
+        return {}
+    return {"pr_conflict": conflict | {"status": "queued"}, "base_conflict": None,
+            "build_recovery": None, "integration_approval": None}
+
+
+def conflict_action(job):
+    if not job.get("pr_conflict") or job["state"] not in {"blocked", "needs_input"}:
+        return None
+    if job.get("head_conflict") or job.get("scope_conflict"):
+        return job.get("reason")
+    if job.get("blocked_paths") and (job.get("reason") or "").startswith("Ruta protegida"):
+        return "Revisa los cambios y autoriza cada ruta con resume --allow-protected-path RUTA"
+    if job["state"] == "blocked" and job.get("base_conflict"):
+        return "Si el bloqueo persiste, resuelve sobre la base y el head vigentes y usa resume --resolved-commit SHA"
+    return job.get("reason")
 
 
 def scope(db, job, lookup=api):
     issue = lookup(f"repos/{job['slug']}/issues/{job['number']}")
     if not eligible(issue, job["repo"]):
-        save(db, job, "cancelled", reason="Issue cerrada o etiqueta retirada")
+        conflict = job.get("pr_conflict")
+        save(db, job, "cancelled", reason="Issue cerrada o etiqueta retirada", integration_approval=None,
+             **({"pr_conflict": None, "conflict_result": conflict | {"status": "cancelled"}}
+                if conflict else {}))
         return False
     observed = fingerprint(issue)
     if observed == job["fingerprint"]:
@@ -88,6 +186,7 @@ def scope(db, job, lookup=api):
             db, job, "needs_input", retry="planning", scope_conflict=observed,
             reason="El contenido de la issue ha cambiado. Confirma el alcance actualizado con resume",
             scope_review=scope_review(job, issue),
+            integration_approval=None,
         )
     return False
 
@@ -336,7 +435,7 @@ def observe_and_route(db, job, cfg, lookup=api, *, revalidate=False):
                   pr=job.get("pr_number"), id=digest([job["repo_id"], job["number"],
                                                      job.get("pr_number"), sha, key]))
     kinds = {item["kind"] for item in diagnostics}
-    fields = dict(ci=observation, ci_repair=repair, ci_poll_error=None,
+    fields = dict(ci=observation, ci_repair=repair, ci_poll_error=None, pr_conflict=None,
                   ci_handled=[*job.get("ci_handled", []), {"sha": sha, "key": key}])
     if kinds == {"functional"} and job.get("plan") and counts["rounds"] < counts["build_limit"]:
         repair["decision"] = "Reparación funcional con el plan vigente"

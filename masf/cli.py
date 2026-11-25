@@ -191,6 +191,7 @@ def poll_ci_jobs(db, cfg):
                 raise TaskStopped("La reserva del sondeo ha vencido")
             return api(endpoint, **kwargs)
 
+        observing_pr = True
         try:
             job = leased_job(db, job, token)
             if job["state"] in TERMINAL:
@@ -204,7 +205,10 @@ def poll_ci_jobs(db, cfg):
                 if not ci.validate(db, job, pr, {ci.expected_head(job)}):
                     continue
                 if job["state"] == "pr_open":
-                    ci.observe_and_route(db, job, cfg, lookup)
+                    recovering = ci.observe_merge(db, job, pr, lookup)
+                    observing_pr = False
+                    if not recovering:
+                        ci.observe_and_route(db, job, cfg, lookup)
                 elif job.get("ci_intervention") and not job.get("head_conflict"):
                     observation, _ = ci.observe(job, ci.expected_head(job), lookup)
                     observation = filtered(observation)
@@ -216,7 +220,10 @@ def poll_ci_jobs(db, cfg):
             reason = clean(str(exc))
             if (job.get("state") == "pr_open" and job.get("ci_retry_at", 0) <= time.time()
                     and lease_active(db, job)):
-                ci.poll_failed(db, job, cfg, reason)
+                if observing_pr:
+                    ci.merge_poll_failed(db, job, cfg, exc)
+                else:
+                    ci.poll_failed(db, job, cfg, reason)
             print(f"{job['slug']}: {reason}", file=sys.stderr, flush=True)
             errors += 1
         finally:
@@ -383,6 +390,7 @@ def resume_job(db, cfg, j, allow_protected_paths, reuse_workspace,
              published_head=accept_head, candidate=accept_head, head_conflict=None,
              repair_intent=None, ci_repair=None, ci_retry_at=0, ci_intervention=False,
              checks={}, review={}, build_workspace=None, reason="",
+             pr_conflict=None, base_conflict=None, build_recovery=None, integration_approval=None,
              ci={"sha": accept_head, "state": "waiting", "checks": [], "pending_runs": []})
         return
     scope_changed = fingerprint(issue) != j["fingerprint"]
@@ -440,12 +448,13 @@ def resume_job(db, cfg, j, allow_protected_paths, reuse_workspace,
             }
     resolution = None
     if resolved_commit is not None:
+        pull_conflict = j.get("pr_conflict") if j.get("pr_number") else None
         if (
             not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", resolved_commit)
             or j["state"] != "blocked"
-            or j.get("retry") != "publishing"
+            or (not pull_conflict and j.get("retry") != "publishing")
             or not j.get("candidate")
-            or j.get("pr_number")
+            or (j.get("pr_number") and not pull_conflict)
             or not eligible(issue, j["repo"])
             or fingerprint(issue) != j["fingerprint"]
         ):
@@ -455,19 +464,22 @@ def resume_job(db, cfg, j, allow_protected_paths, reuse_workspace,
         jobs = Path(
             os.environ.get("MASF_JOBS_DIR") or xdg("DATA", ".local/share") / "jobs"
         )
-        store = jobs / f"{j['repo_id']}-{j['number']}" / "git"
-        git = ["git", "--git-dir", str(store)]
+        resolver = Worker(db, cfg, None, xdg("STATE", ".local/state"), jobs, j)
         current_base = latest(slug, j["branch"])
-        command(git + ["rev-parse", "--verify", resolved_commit + "^{commit}"])
-        for ancestor in (j["candidate"], current_base):
-            try:
-                command(
-                    git + ["merge-base", "--is-ancestor", ancestor, resolved_commit]
-                )
-            except RuntimeError:
-                raise ValueError(
-                    "El commit resuelto debe incluir el candidato y la base actual"
-                ) from None
+        ancestor = j["candidate"]
+        paths = (j.get("base_conflict") or {}).get("paths", [])
+        if pull_conflict:
+            ancestor = ci.expected_head(j)
+            pr = approved_head(j, ancestor)
+            if pr["base"].get("sha") != current_base:
+                raise ValueError("GitHub aún no refleja la base vigente del PR")
+            _, paths = resolver.merge_tree(current_base, ancestor)
+        resolver.git("rev-parse", "--verify", resolved_commit + "^{commit}")
+        try:
+            resolver.check_resolution(resolved_commit, current_base, ancestor, paths)
+        except RuntimeError as exc:
+            raise ValueError(f"El commit resuelto debe incluir el candidato y la base actual. {exc}") from None
+        resolver.git("update-ref", "refs/heads/candidate", resolved_commit)
         resolution = {
             "previous_base": j["base"],
             "previous_candidate": j["candidate"],
@@ -526,6 +538,7 @@ def resume_job(db, cfg, j, allow_protected_paths, reuse_workspace,
             repair = j.get("ci_repair") or {}
             linked = dict(candidate=published, published_head=published, ci_repair=None,
                           ci_intervention=False, repair_intent=None, ci_retry_at=0, ci_handled=[])
+            linked.update(ci.restart_conflict(j))
             if not scope_changed and repair:
                 linked["feedback"] = {"source": "CI", "sha": repair["sha"],
                                       "diagnostics": repair["diagnostics"]}
@@ -542,6 +555,7 @@ def resume_job(db, cfg, j, allow_protected_paths, reuse_workspace,
             title=issue["title"],
             body=issue["body"],
             rounds=0 if scope_changed or not j.get("pr_number") else j["rounds"],
+            **({"recovery_builds": 0, "ci_rounds": 0} if scope_changed else {}),
             fingerprint=fingerprint(issue),
             scope_conflict=None,
             scope_review=None,
@@ -553,6 +567,8 @@ def resume_job(db, cfg, j, allow_protected_paths, reuse_workspace,
             updates["path_approvals"] = approvals
         if reuse_workspace is not None:
             updates["build_workspace"] = checkpoint
+            if j.get("pr_conflict"):
+                checkpoint["operator_resume"] = True
         state = j.get("retry", "queued")
         if resolution is not None:
             for key in ("checks", "review", "base_checked", "base_conflict"):
@@ -560,8 +576,17 @@ def resume_job(db, cfg, j, allow_protected_paths, reuse_workspace,
             updates.update(
                 base=resolution["base"],
                 candidate=resolved_commit,
+                build_workspace=None,
+                build_recovery=None,
+                repair_intent=None,
                 base_resolutions=[*(j.get("base_resolutions") or []), resolution],
             )
+            if j.get("pr_conflict"):
+                updates.update(integration_approval=None, pr_conflict=j["pr_conflict"] | {
+                    "base": resolution["base"], "head": ci.expected_head(j), "paths": paths,
+                    "status": "resolved", "candidate": resolved_commit,
+                    "decision": "Resolución autorizada por el operador",
+                })
             state = "checking"
         kind = ("resolved_commit" if resolution else "allow_paths" if allow_protected_paths
                 else "reuse_workspace" if reuse_workspace is not None else "resume")
@@ -775,9 +800,13 @@ def main():
                     observed = j.get("ci") or {}
                     if args.json:
                         print(json.dumps(filtered(j | job_evidence(db, j, root) |
-                                                  {"limits": ci.limits(j, cfg)}), ensure_ascii=False))
+                                                  {"limits": ci.limits(j, cfg),
+                                                   "conflict_action": ci.conflict_action(j)}),
+                                         ensure_ascii=False))
                         continue
                     counts = ci.limits(j, cfg)
+                    conflict = j.get("pr_conflict") or j.get("merge_observation") or {}
+                    next_action = ci.conflict_action(j)
                     print(
                         f"{j['slug']}#{j['number']} {j['state']}",
                         j.get("candidate", ""),
@@ -785,7 +814,11 @@ def main():
                         f"CI {observed.get('state', '—')} {observed.get('sha', '')}",
                         f"rondas {counts['rounds']}/{counts['build_limit']}",
                         f"reintentos técnicos {counts['technical']}/{counts['technical_limit']}",
+                        (f"merge {conflict['status']} base={conflict.get('base') or '—'} "
+                         f"head={conflict.get('head') or '—'} "
+                         f"{', '.join(conflict.get('paths', []))}") if conflict else "",
                         j.get("reason", ""),
+                        next_action if next_action and next_action != j.get("reason") else "",
                         j.get("ci_poll_error", ""),
                         ("reintento=" + datetime.fromtimestamp(
                             j["recovery_wait"]["until"], timezone.utc

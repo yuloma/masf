@@ -204,6 +204,18 @@ La aceptación de Cursor comprueba además una revisión no interactiva capaz de
 
 La aceptación de I2 incluye un conflicto real al avanzar la base y su resolución mediante `resume --resolved-commit SHA`. Se verifica que el commit integra candidato y base, que se rechazan referencias o commits ajenos, que se conserva el número de rondas y que se repiten los checks y la revisión sobre el SHA resuelto.
 
+### Recuperación de conflictos tras abrir el PR
+
+Con un remoto Git temporal, GitHub simulado y un proveedor de prueba, abrir un PR y avanzar la base. Confirmar que el sondeo reclama un conflicto de contenido o de modificación/eliminación, que el implementador recibe el árbol combinado y los criterios y que el mismo PR recibe un nuevo head con ambos ancestros, checks y revisión nuevos y su propio CI. Comprobar que una base compatible, un CI pendiente, la protección de rama, la mergeabilidad desconocida y los errores temporales del sondeo dejan intacto el presupuesto de resolución.
+
+Simular que GitHub sigue devolviendo `dirty` para una base que Git integra limpiamente. Comprobar que el PR permanece en `pr_open`, que se vuelve a consultar la mergeabilidad y que el CI del mismo SHA pasa de pendiente a correcto durante el desacuerdo. Confirmar que se conserva el diagnóstico, la mergeabilidad queda pendiente y los sondeos repetidos dejan intacto el presupuesto y la cola de resolución.
+
+Durante la recuperación, provocar otro avance de base, un cambio ajeno de head, cierre, merge, retirada de etiqueta y edición de alcance. Verificar la espera persistente y la revalidación antes de actualizar. Provocar dos workers concurrentes, una interrupción del implementador, un reinicio después del push y una respuesta perdida. Comprobar que el mismo PR y los cambios de terceros se conservan. Con presupuesto cero o agotado, marcadores, ascendencia incompleta, ruta protegida o push denegado, comprobar el diagnóstico y las intervenciones por alcance, ruta, head, permisos o commit resuelto. Los intentos, las decisiones y los resultados quedan disponibles por SHA en `status --json`, `history` y la API v1.
+
+Los casos `test_open_pr_*` de `tests.test_factory.Delivery` ejecutan estas comprobaciones locales con Git real y dobles de GitHub y proveedor. Los resultados del piloto con servicios reales se registran por separado en [el piloto](piloto.md).
+
+En el entorno local, `python3 -m unittest discover -v` ejecutó 155 casos. Pasaron 141 y se omitieron 14 que requieren Docker Engine o Playwright y Chromium. También pasaron `doctor --offline` y la lectura de los TOML con Python.
+
 ### Seguimiento y reparación de CI del mismo PR
 
 **Aceptación local.** Con la configuración de [ejemplo](../examples/factory.toml), verificar que `status` muestra etapa, CI, SHA, consumo e intervención. `status --json` e `history OWNER/REPO#N` deben mostrar la evidencia por SHA y las decisiones por intento. Un remoto Git temporal, GitHub simulado y un proveedor de prueba deben reproducir PR abierto, fallo confirmado, construcción, checks y revisión del mismo candidato, push condicionado al head observado y CI correcto del mismo PR.

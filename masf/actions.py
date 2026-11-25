@@ -25,6 +25,7 @@ JOB_STATES = {"needs_input", "blocked"}
 RESUME_STATES = {"queued", "planning", "building", "checking", "reviewing", "publishing", "pr_open"}
 GIT_SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 KEY = re.compile(r"[a-zA-Z0-9_-]{16,128}")
+TIMEOUT = re.compile(r"tiempo agotado \((\d+)s\)")
 
 
 class ActionError(ValueError):
@@ -65,6 +66,26 @@ def functional_intervention(job):
     )
 
 
+def build_timeout(db, job):
+    if job["state"] not in JOB_STATES or job.get("retry") != "building":
+        return None
+    checkpoint = job.get("build_workspace") or {}
+    match = TIMEOUT.search(checkpoint.get("error") or job.get("reason") or "")
+    if match:
+        return int(match[1])
+    attempt = job.get("failed_attempt") or checkpoint.get("failed_attempt")
+    if not attempt:
+        return None
+    row = db.execute("""SELECT data FROM stage_attempts WHERE id=? AND repo_id=? AND number=?
+        AND role='build' AND status='failed'""", (attempt, job["repo_id"], job["number"])).fetchone()
+    if row:
+        failure = json.loads(row[0])
+        seconds = failure.get("configured_timeout_seconds")
+        if failure.get("error_type") == "CommandTimeout" and type(seconds) is int:
+            return seconds
+    return None
+
+
 def describe(kind, state, **details):
     return {"kind": kind, "resume_state": state, **details}
 
@@ -81,7 +102,7 @@ def recorded_question(db, job):
                 return {"text": text, "attempt_id": job["plan_attempt"]}
     plan = public.mapping(job.get("plan"))
     text = public.scalar(public.mapping(plan.get("result")).get("question") or plan.get("question"))
-    return {"text": text, "attempt_id": job.get("plan_attempt")} if text else None
+    return {"text": text, "attempt_id": None} if text else None
 
 
 class Decisions:
@@ -104,6 +125,7 @@ class Decisions:
 
     def checkpoints(self, db, job, counts):
         # A directory can be reused and mutated. Only its last recorded identity is selectable.
+        plan = digest(job.get("plan"))
         records = {}
         for row in db.execute(
             """SELECT json_extract(detail,'$.build_workspace') FROM events WHERE repo_id=? AND number=?
@@ -124,6 +146,7 @@ class Decisions:
                     or record.get("input_sha") != (job.get("candidate") or job.get("base"))
                     or record["input_sha"] != failures[attempt].get("input_sha")
                     or record.get("fingerprint") != job["fingerprint"]
+                    or record.get("plan_digest", plan) != plan
                     or type(record.get("round")) is not int
                     or not 0 < record["round"] <= min(counts["rounds"], counts["build_limit"])):
                 continue
@@ -157,7 +180,7 @@ class Decisions:
         offers = {}
         copies = {}
         checkpoint = job.get("build_workspace") or {}
-        timeout = re.search(r"tiempo agotado \((\d+)s\)", checkpoint.get("error") or job.get("reason") or "")
+        timeout = build_timeout(db, job)
         paths = public.protected_paths(job.get("reason"))
         if job["state"] == "blocked" and job.get("candidate") and (
             paths or (job.get("reason") or "").startswith("Ruta protegida")
@@ -169,12 +192,12 @@ class Decisions:
         elif job["state"] == "needs_input" and (question := recorded_question(db, job)):
             return {"answer": describe("answer", "planning", question=question["text"],
                                        question_attempt=question["attempt_id"])}, {}
-        elif state == "building" and timeout and job.get("plan"):
+        elif timeout is not None and job.get("plan"):
             copies = self.checkpoints(db, job, counts)
-            if copies and int(timeout[1]) < MAX_TIMEOUT:
+            if copies and timeout < MAX_TIMEOUT:
                 offers["extend_timeout"] = describe(
-                    "extend_timeout", "building", previous_seconds=int(timeout[1]),
-                    minimum_seconds=int(timeout[1]) + 1, maximum_seconds=MAX_TIMEOUT,
+                    "extend_timeout", "building", previous_seconds=timeout,
+                    minimum_seconds=timeout + 1, maximum_seconds=MAX_TIMEOUT,
                     copies=self.copy_choices(copies, checkpoint),
                 )
         elif (not functional_intervention(job) or state == "planning") and not self.base_conflict(job):
@@ -278,12 +301,27 @@ class Decisions:
             offer = offers["allow_paths"]
             offer["changes"] = self.changed_paths(job, offer["paths"])
         conflict = self.base_conflict(job) if job["state"] == "blocked" else None
-        return {"revision": revision, "operator": self.operator, "actions": list(offers.values()),
+        pending = db.execute("""SELECT data FROM pending_actions JOIN action_receipts USING(key)
+                             WHERE repo_id=? AND number=?""", identity).fetchone()
+        receipt = json.loads(pending[0]) if pending else None
+        timeout = build_timeout(db, job)
+        timeout_context = None
+        if timeout is not None:
+            counts = ci.limits(job, self.cfg)
+            timeout_context = {"stage": "build", "seconds": timeout, "rounds": counts["rounds"],
+                               "round_limit": counts["build_limit"]}
+        return {"revision": revision, "operator": self.operator, "state": job["state"],
+                "reason": public.scalar(job.get("reason")),
+                "resume_state": resume_state(job) if job["state"] in JOB_STATES else None,
+                "candidate_sha": public.scalar(job.get("candidate")),
+                "pending": pending is not None, "actions": [] if pending else list(offers.values()),
+                "pending_receipt": receipt if receipt and receipt["operator"] == self.operator else None,
                 "base_conflict": public.conflict(conflict),
                 "resolution_ref_prefix": self.resolution_prefix(job, conflict) if conflict else None,
+                "build_timeout": timeout_context,
                 "compatible_build_copies": len(copies)}
 
-    def submit(self, db, identity, key, payload):
+    def submit(self, db, identity, key, payload, *, defer=False, redact=lambda value: value):
         if not KEY.fullmatch(key or "") or not isinstance(payload, dict):
             raise invalid("Indica una clave de idempotencia y una decisión válidas.")
         if set(payload) != {"kind", "revision", "evidence", "confirm", "options"} or (
@@ -298,6 +336,7 @@ class Decisions:
             if not isinstance(paths, list) or not paths or not all(exact_path(path) for path in paths):
                 raise invalid("Indica una ruta protegida exacta relativa al repositorio.")
         signature = digest([self.operator, identity, payload])
+        payload = payload | {"evidence": ci.excerpt(redact(payload["evidence"]), limit=4000)}
         receipt = self.duplicate(db, key, signature)
         if receipt is not None:
             return receipt
@@ -319,19 +358,20 @@ class Decisions:
             if revision != payload["revision"]:
                 raise stale()
             job["attempt"] = token
-            cfg = self.cfg
-            offers, copies = self.describe(db, cfg, job)
-            offer = offers.get(payload["kind"])
-            if not offer:
-                if payload["kind"] == "resolved_commit":
-                    raise invalid("Selecciona un commit conservado por el trabajo con ambos ancestros vigentes.")
-                raise invalid("La acción no está permitida para este trabajo.")
-            self.validate_options(offer, payload["options"], copies)
-            receipt = self.apply(db, cfg, job, offer, copies, payload)
-            updates = receipt.pop("updates")
+            if db.execute("SELECT 1 FROM pending_actions WHERE repo_id=? AND number=?", identity).fetchone():
+                raise ActionError(409, "decision_in_progress", "Ya hay una decisión aceptada para este trabajo.")
+            receipt = {"id": uuid.uuid4().hex, "operator": self.operator, "kind": payload["kind"],
+                       "status": "accepted", "accepted_at": timestamp(), "revision": revision,
+                       "origin": self.origin, "repo_id": identity[0], "number": identity[1]}
             try:
-                queue.save(db, job, receipt["state"],
-                           action_receipt=(key, signature, receipt, revision), **updates)
+                state, updates = self.prepare(db, job, payload, receipt)
+                if defer:
+                    entry = self.audit_entry(receipt, payload, job, "accepted") | {"resume_state": state}
+                    receipt["resume_state"] = state
+                    queue.accept_action(db, job, key, signature, receipt, payload, entry)
+                else:
+                    receipt = self.applied(receipt, state)
+                    queue.save(db, job, state, action_receipt=(key, signature, receipt, revision), **updates)
             except queue.RevisionConflict:
                 raise stale() from None
             except sqlite3.IntegrityError:
@@ -358,8 +398,8 @@ class Decisions:
                 valid = (set(options) == {"paths"} and len(options["paths"]) == len(offer["paths"])
                          and set(options["paths"]) == set(offer["paths"]))
             case "assign_provider":
-                role = options.get("role", offer["role"])
-                valid = (set(options) in ({"provider"}, {"role", "provider"}) and isinstance(role, str)
+                role = options.get("role")
+                valid = (set(options) == {"role", "provider"} and isinstance(role, str)
                          and options["provider"] in offer["roles"].get(role, ()))
             case "add_rounds" | "add_recoveries":
                 valid = (set(options) == {"extra"} and type(options["extra"]) is int
@@ -386,13 +426,39 @@ class Decisions:
                 raise invalid("Selecciona un commit conservado por el trabajo con ambos ancestros vigentes.")
             raise invalid("Los valores elegidos no coinciden con las opciones del trabajo.")
 
-    def apply(self, db, cfg, job, offer, copies, payload):
-        kind, state = offer["kind"], offer["resume_state"]
-        options = payload["options"]
-        accepted = timestamp()
+    def audit_entry(self, receipt, payload, job, result):
+        kind = payload["kind"]
+        return dict(id=receipt["id"], kind="rounds" if kind == "add_rounds" else kind,
+                    operator=self.operator, at=timestamp(), evidence=payload["evidence"],
+                    reason=job.get("reason"), fingerprint=job.get("fingerprint"),
+                    candidate=job.get("candidate"), pr=job.get("pr_number"), origin=self.origin,
+                    expected_revision=payload["revision"], result=result)
+
+    def applied(self, receipt, state):
+        return receipt | {"status": "applied", "applied_at": timestamp(), "state": state}
+
+    def prepare(self, db, job, payload, receipt):
+        cfg = self.cfg
+        kind, options = payload["kind"], payload["options"]
+        if job["state"] not in JOB_STATES:
+            raise ActionError(409, "incompatible_state", "El estado del trabajo no admite intervenciones.")
+        offers, copies = self.describe(db, cfg, job)
+        offer = offers.get(kind)
+        if not offer:
+            if kind == "resolved_commit":
+                raise invalid("Selecciona un commit conservado por el trabajo con ambos ancestros vigentes.")
+            raise invalid("La acción no está permitida para este trabajo.")
+        self.validate_options(offer, options, copies)
+        state, accepted = offer["resume_state"], receipt["accepted_at"]
         repo = next(repo for repo in cfg["repositories"] if repo["slug"] == job["slug"])
-        issue = self.lookup(f"repos/{job['slug']}/issues/{job['number']}")
-        if not queue.eligible(issue, repo) or not queue.eligible(issue, job["repo"]):
+        try:
+            issue = self.lookup(f"repos/{job['slug']}/issues/{job['number']}")
+        except ProcessError as exc:
+            if queue.http_status(exc) in {404, 410}:
+                raise stale("La issue ya no está disponible para este trabajo.") from None
+            raise
+        if (issue.get("number", job["number"]) != job["number"]
+                or not queue.eligible(issue, repo) or not queue.eligible(issue, job["repo"])):
             raise stale("La issue ya no está habilitada para este trabajo.")
         scope = queue.fingerprint(issue)
         expected_scope = job.get("scope_conflict") if kind == "confirm_scope" else job["fingerprint"]
@@ -415,11 +481,9 @@ class Decisions:
                 if remote != head:
                     ci.head_conflict(db, job, pr["head"]["sha"], remote=remote)
                     raise stale("La referencia del PR cambió. Revisa el contexto.")
-        entry = dict(id=uuid.uuid4().hex, kind="rounds" if kind == "add_rounds" else kind,
-                     operator=self.operator, at=accepted, evidence=ci.excerpt(payload["evidence"], limit=4000),
-                     reason=job.get("reason"), fingerprint=scope, candidate=job.get("candidate"),
-                     pr=job.get("pr_number"), resume_state=state, origin=self.origin,
-                     expected_revision=payload["revision"], result="applied")
+        entry = self.audit_entry(receipt, payload, job, "applied") | {
+            "fingerprint": scope, "resume_state": state,
+        }
         updates = {"reason": "", "ci_retry_at": 0, "retry": None, "recovery_wait": {}}
         additions = [entry]
         overrides = (job.get("routing_override") or {}).copy()
@@ -449,7 +513,7 @@ class Decisions:
                                blocked_paths=None)
                 entry["paths"] = offer["paths"]
             case "assign_provider":
-                role, provider = options.get("role", offer["role"]), options["provider"]
+                role, provider = options["role"], options["provider"]
                 overrides[role] = provider
                 updates["routing_override"] = overrides
                 entry.update(role=role, provider=provider, previous_provider=offer["routing"][role])
@@ -524,10 +588,37 @@ class Decisions:
                                         "type": kind, "sha": entry["candidate"], "question": entry.get("question"),
                                         "question_attempt": entry.get("question_attempt"), "answer": entry.get("answer")}
         updates["decisions"] = [*job.get("decisions", []), *additions]
-        return {"id": entry["id"], "operator": self.operator, "kind": kind, "status": "applied",
-                "accepted_at": accepted, "applied_at": timestamp(), "state": state,
-                "revision": payload["revision"], "origin": self.origin,
-                "updates": updates}
+        return state, updates
+
+    def apply_pending(self, db, key, identity):
+        job, _ = self.read_job(db, identity)
+        token = uuid.uuid4().hex
+        if not queue.claim(db, job, token, 600):
+            return
+        try:
+            row = db.execute("""SELECT payload,data FROM pending_actions JOIN action_receipts USING(key)
+                WHERE key=?""", (key,)).fetchone()
+            if row is None:
+                return
+            receipt, payload = json.loads(row["data"]), json.loads(row["payload"])
+            job, revision = self.read_job(db, identity)
+            job["attempt"] = token
+            try:
+                if revision != receipt["revision"]:
+                    raise stale()
+                state, updates = self.prepare(db, job, payload, receipt)
+                if state != receipt["resume_state"]:
+                    raise stale()
+                queue.save(db, job, state, pending_action=(key, self.applied(receipt, state)), **updates)
+            except ActionError as exc:
+                entry = self.audit_entry(receipt, payload, job, "rejected") | {"error_code": exc.code}
+                receipt |= {"status": "rejected", "rejected_at": entry["at"],
+                            "error": {"code": exc.code, "message": ci.excerpt(exc.message)}}
+                # Validation may have recorded a newly observed scope or PR conflict.
+                queue.reject_action(db, job, key, receipt, entry)
+        finally:
+            with db:
+                db.execute("DELETE FROM leases WHERE token=?", (token,))
 
     def apply_resolution(self, db, cfg, job, pr, entry, updates, sha):
         conflict = self.base_conflict(job)
@@ -589,6 +680,23 @@ class Decisions:
         return [changes[path] for path in (paths or changes)]
 
 
+def process_pending(db, cfg, root, *, lookup=None, latest=None):
+    errors = 0
+    rows = db.execute("""SELECT key,repo_id,number,data FROM pending_actions
+        JOIN action_receipts USING(key) ORDER BY pending_actions.rowid""").fetchall()
+    for row in rows:
+        if queue.retry_delay():
+            break
+        receipt = json.loads(row["data"])
+        operation = Decisions(root, cfg, receipt["operator"], receipt["origin"], lookup=lookup, latest=latest)
+        try:
+            operation.apply_pending(db, row["key"], (row["repo_id"], row["number"]))
+        except (OSError, RuntimeError, ValueError, sqlite3.Error, KeyError, TypeError):
+            # Keep the accepted receipt available for retry. Upstream errors can contain secrets.
+            errors += 1
+    return errors
+
+
 class Actions:
     def __init__(self, root, config, token_file):
         self.root, self.config = root, config
@@ -602,23 +710,49 @@ class Actions:
                 or len(operator) > 100 or public.scalar(operator) != operator
                 or not isinstance(token, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{32,256}", token)):
             raise ValueError("Identidad o token de acciones inválido")
-        self.operator = operator
+        if token in operator:
+            raise ValueError("Identidad de operador inválida")
+        permissions = credentials.get("permissions", ["intervene"])
+        if not isinstance(permissions, list) or any(value != "intervene" for value in permissions):
+            raise ValueError("Permisos de acciones inválidos")
+        self.operator, self.token = operator, token
+        self.can_intervene = "intervene" in permissions
         self.authorization = hashlib.sha256(("Bearer " + token).encode()).digest()
 
     def authorize(self, headers, host):
         origins = headers.get_all("Origin") or []
+        fetch_sites = headers.get_all("Sec-Fetch-Site") or []
         if ((origins and origins != ["http://" + host])
-                or headers.get("Sec-Fetch-Site") == "cross-site"):
+                or fetch_sites not in ([], ["same-origin"], ["none"])):
             raise ActionError(403, "invalid_origin", "Origen de la solicitud inválido")
         values = headers.get_all("Authorization") or []
         if len(values) != 1 or not hmac.compare_digest(
             hashlib.sha256(values[0].encode()).digest(), self.authorization
         ):
             raise ActionError(401, "authentication_required", "Token de operador inválido")
+        if not self.can_intervene:
+            raise ActionError(403, "insufficient_permissions", "La credencial carece del permiso de intervención.")
 
     def context(self, db, identity):
         return Decisions(self.root, load(self.config), self.operator, "api").context(db, identity)
 
     def submit(self, identity, key, payload):
         with closing(queue.connect(self.root)) as db:
-            return Decisions(self.root, load(self.config), self.operator, "api").submit(db, identity, key, payload)
+            return Decisions(self.root, load(self.config), self.operator, "api").submit(
+                db, identity, key, payload, defer=True, redact=lambda value: value.replace(self.token, "[redacted]"))
+
+    def receipt(self, db, identity, identifier):
+        row = db.execute("SELECT data FROM action_receipts WHERE json_extract(data,'$.id')=?",
+                         (identifier,)).fetchone()
+        if row:
+            data = json.loads(row[0])
+            if data["operator"] == self.operator:
+                if (data.get("repo_id"), data.get("number")) == identity:
+                    return data
+                if "repo_id" not in data and db.execute(
+                    """SELECT 1 FROM events AS event, json_each(event.detail, '$.operations') AS operation
+                    WHERE event.repo_id=? AND event.number=?
+                    AND json_extract(operation.value,'$.decision.id')=? LIMIT 1""", (*identity, identifier),
+                ).fetchone():
+                    return data
+        raise ActionError(404, "not_found", "Recibo desconocido")

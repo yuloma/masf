@@ -1,6 +1,7 @@
 """Dashboard acceptance against loopback HTTP and the controller's temporary queue."""
 
 import http.client
+import io
 import json
 import os
 import signal
@@ -9,12 +10,12 @@ import sys
 import threading
 import unittest
 import uuid
-from contextlib import closing
+from contextlib import closing, redirect_stderr, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from masf import cli, observe, queue, recovery, worker
-from masf.actions import ActionError
+from masf.actions import ActionError, Actions, process_pending
 from masf.evidence import digest, model, usage
 from masf.observation_api import ObservationServer
 from masf.queue import api as queue_api
@@ -75,8 +76,16 @@ class DashboardFixture:
 
     def submit(self, kind, **kwargs):
         status, result = self.request(JOB + "/actions", self.payload(kind, **kwargs))
-        self.assertEqual(status, 200, result)
+        self.assertEqual(status, 202, result)
+        self.assertEqual(result["data"]["status"], "accepted")
         return result["data"]
+
+    def receipt(self, receipt):
+        return self.data(JOB + "/actions/" + receipt["id"])
+
+    def apply_pending(self, db=None):
+        return process_pending(db or self.worker.db, self.cfg, self.root / "state",
+                               lookup=worker.api, latest=lambda *_: self.base)
 
     def scenario(self):
         self.changed = ".github/workflows/new.yml"
@@ -106,6 +115,7 @@ class DashboardFixture:
         self.addCleanup(patcher.stop)
 
     def run_ready(self):
+        self.assertEqual(self.apply_pending(), 0)
         # Use the same runnable filter as the central controller.
         ready = list(cli.pending_jobs(self.worker.db, self.cfg, {}, 1))
         self.assertEqual(len(ready), 1)
@@ -150,6 +160,8 @@ class DashboardAPI(unittest.TestCase):
         app = self.fixture
         app.scenario()
         self.assertIn('lang="es"', app.request("/dashboard/")[1])
+        self.assertEqual(app.request(JOB + "/actions", app.payload("resolve"))[1]["error"]["code"],
+                         "incompatible_state")
         self.assertEqual(app.run_ready(), 0)
         self.assertEqual(app.data()["state"], "needs_input")
         question, = app.data()["intervention"]["questions"]
@@ -169,27 +181,36 @@ class DashboardAPI(unittest.TestCase):
         self.assertEqual(app.request(path, data, key)[1]["error"]["code"], "revision_conflict")
         data = app.payload("answer", evidence="Para Ana")
         response = app.request(path, data, key)
-        self.assertEqual(response[0], 200, response)
+        self.assertEqual(response[0], 202, response)
         self.assertEqual(app.request(path, data, key), response)
+        accepted = response[1]["data"]
+        self.assertEqual(app.receipt(accepted), accepted)
+        self.assertEqual(app.data()["state"], "needs_input")
+        self.assertEqual(app.request(JOB + "/actions/" + accepted["id"], token=None)[0], 401)
+        self.assertEqual(app.request("/v1/jobs/123/2/actions/" + accepted["id"])[0], 404)
         self.assertEqual(app.request(path, data | {"evidence": "Otro"}, key)[1]["error"]["code"],
                          "idempotency_conflict")
 
         self.assertEqual(app.run_ready(), 1)
+        applied = app.receipt(accepted)
+        self.assertEqual((applied["status"], applied["state"]), ("applied", "planning"))
+        self.assertEqual(app.request(path, data, key), (200, {"version": 1, "data": applied}))
         self.assertEqual(app.data()["state"], "blocked")
         offer, = app.context()["actions"]
         self.assertEqual(offer["paths"], [app.changed])
         self.assertEqual(app.request(path, app.payload("allow_paths", options={"paths": ["*"]}))[0], 422)
         self.assertEqual(app.request(path, app.payload("allow_paths", options={"paths": offer["paths"]},
                                                      confirm=False))[0], 422)
-        self.assertEqual(app.submit("allow_paths", options={"paths": offer["paths"]})["state"], "checking")
+        self.assertEqual(app.submit("allow_paths", options={"paths": offer["paths"]})["resume_state"], "checking")
         self.assertEqual(app.run_ready(), 1)
         self.assertEqual(app.data()["checks"]["sha"], app.data()["candidate_sha"])
 
         app.deny = False
-        self.assertEqual(app.submit("resolve")["state"], "publishing")
+        self.assertEqual(app.submit("resolve")["resume_state"], "publishing")
         self.assertEqual(app.run_ready(), 0)
         self.assertEqual(app.data()["state"], "pr_open")
-        operations = [entry["decision"] for event in app.data(JOB + "/events") for entry in event["operations"]]
+        operations = [entry["decision"] for event in app.data(JOB + "/events") for entry in event["operations"]
+                      if entry["decision"]["result"] == "applied"]
         self.assertEqual([(entry["kind"], entry["resume_state"]) for entry in operations],
                          [("answer", "planning"), ("allow_paths", "checking"), ("resolve", "publishing")])
         self.assertTrue(all(entry["operator"] == OPERATOR for entry in operations))
@@ -227,13 +248,18 @@ class DashboardAPI(unittest.TestCase):
                 self.assertEqual(busy.exception.code, "decision_in_progress")
             finally:
                 release.set()
-            self.assertEqual(response.result()[0], 200)
-            with self.assertRaises(ActionError) as stale:
+            status, body = response.result()
+            self.assertEqual(status, 202, body)
+            with self.assertRaises(ActionError) as pending:
                 cli.resume(app.worker.db, app.cfg, target, **kwargs)
-            self.assertEqual(stale.exception.code, "revision_conflict")
+            self.assertEqual(pending.exception.code, "decision_in_progress")
         self.assertEqual(app.run_ready(), 1)
-        events = app.data(JOB + "/events")
-        self.assertEqual([op["decision"]["origin"] for event in events for op in event["operations"]], ["api"])
+        with self.assertRaises(ActionError) as stale:
+            cli.resume(app.worker.db, app.cfg, target, **kwargs)
+        self.assertEqual(stale.exception.code, "revision_conflict")
+        operations = [op["decision"] for event in app.data(JOB + "/events") for op in event["operations"]]
+        self.assertEqual([(op["origin"], op["result"], op["id"]) for op in operations],
+                         [("api", result, body["data"]["id"]) for result in ("accepted", "applied")])
         self.assertEqual(app.plan_calls, 2)
         self.assertEqual(list(cli.pending_jobs(app.worker.db, app.cfg, {}, 1)), [])
 
@@ -289,6 +315,104 @@ with (queue.connect(Path(root)) as db,
         self.assertEqual(len([op for event in app.data(JOB + "/events") for op in event["operations"]]), 1)
         self.assertEqual(app.worker.db.execute("SELECT count(*) FROM action_receipts").fetchone()[0], 1)
         self.assertEqual(list(cli.pending_jobs(app.worker.db, app.cfg, {}, 1)), [])
+        legacy = {name: value for name, value in response[1]["data"].items() if name not in {"repo_id", "number"}}
+        with app.worker.db:
+            app.worker.db.execute("UPDATE action_receipts SET data=? WHERE key=?", (json.dumps(legacy), key))
+        self.assertEqual(app.receipt(legacy), legacy)
+        self.assertEqual(app.request("/v1/jobs/123/2/actions/" + legacy["id"])[0], 404)
+
+    def test_http_acceptance_survives_controller_restart_and_dispatches_once(self):
+        app = self.fixture
+        app.scenario()
+        self.assertEqual(app.run_ready(), 0)
+        path = JOB + "/actions"
+        payload = app.payload("answer", evidence="Para Ana")
+        key = "restart-after-http-acceptance"
+        status, body = app.request(path, payload, key)
+        self.assertEqual(status, 202, body)
+        accepted = body["data"]
+        self.assertEqual(app.context()["pending_receipt"], accepted)
+        self.assertEqual(app.data()["revision"], payload["revision"])
+        app.worker.db.close()
+        root = app.root / "state"
+        before_apply = """
+import os, signal, sys
+from pathlib import Path
+from unittest.mock import patch
+from masf import cli, queue
+from masf.config import load
+
+root, config = map(Path, sys.argv[1:])
+with (queue.connect(root) as db,
+      patch.object(cli, "process_pending", side_effect=lambda *a, **kw:
+                   os.kill(os.getpid(), signal.SIGKILL))):
+    cli.tick(db, load(config), config, root, True)
+"""
+        interrupted = subprocess.run([sys.executable, "-c", before_apply, str(root), str(app.server.config)],
+                                     capture_output=True, text=True, timeout=10)
+        self.assertEqual(interrupted.returncode, -signal.SIGKILL, interrupted.stderr)
+        self.assertEqual(app.receipt(accepted)["status"], "accepted")
+
+        def create(*args):
+            instance = worker.Worker(*args)
+            instance.url = str(app.source)
+            instance.recover = lambda: None
+            instance.test = app.check
+            return instance
+
+        with (closing(queue.connect(root)) as restarted,
+              patch.multiple(cli, api=app.api, Worker=create, scan=lambda *_, **__: 0,
+                             observe=lambda *_: 0, poll_ci_jobs=lambda *_: 0)):
+            self.assertEqual(app.request(path, payload, key), (status, body))
+            self.assertEqual(cli.tick(restarted, app.cfg, app.server.config, root, True), 1)
+            self.assertEqual(cli.tick(restarted, app.cfg, app.server.config, root, True), 0)
+            self.assertEqual(restarted.execute("SELECT count(*) FROM action_receipts").fetchone()[0], 1)
+            self.assertEqual(restarted.execute("SELECT count(*) FROM pending_actions").fetchone()[0], 0)
+        self.assertEqual(app.plan_calls, 2)
+        self.assertEqual(app.data()["state"], "blocked")
+        self.assertEqual(app.receipt(accepted)["status"], "applied")
+        operations = [op["decision"] for event in app.data(JOB + "/events") for op in event["operations"]]
+        self.assertEqual([(op["id"], op["result"]) for op in operations],
+                         [(accepted["id"], "accepted"), (accepted["id"], "applied")])
+
+    def test_pending_scope_change_rejects_and_filters_feedback_and_errors(self):
+        app = self.fixture
+        app.scenario()
+        app.run_ready()
+        headers = {"Sec-Fetch-Site": "same-site"}
+        self.assertEqual(app.request(JOB + "/actions", app.payload("answer"), **headers)[0], 403)
+        auth = app.root / "actions.json"
+        auth.write_text(json.dumps({"operator": OPERATOR, "token": TOKEN, "permissions": []}))
+        with patch.object(app.server, "actions", Actions(app.server.root, app.server.config, auth)):
+            status, body = app.request(JOB + "/actions", app.payload("answer"))
+            self.assertEqual((status, body["error"]["code"]), (403, "insufficient_permissions"))
+            self.assertEqual(app.request(JOB, token=None)[0], 200)
+        evidence = f"Respuesta: {TOKEN} password=fixture-private-secret"
+        logs = io.StringIO()
+        with redirect_stderr(logs), redirect_stdout(logs):
+            with patch.object(worker, "api", side_effect=ProcessError(evidence)):
+                status, unavailable = app.request(JOB + "/actions", app.payload("answer", evidence=evidence))
+                self.assertEqual((status, unavailable["error"]["code"]), (503, "unavailable"))
+            receipt = app.submit("answer", evidence=evidence)
+            with patch.object(worker, "api", side_effect=ProcessError(evidence)):
+                self.assertEqual(app.apply_pending(), 1)
+            self.assertEqual(app.receipt(receipt)["status"], "accepted")
+            app.issue["body"] = "Alcance actualizado después de la aceptación"
+            self.assertEqual(app.apply_pending(), 0)
+        rejected = app.receipt(receipt)
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(rejected["error"]["code"], "revision_conflict")
+        self.assertEqual(app.data()["state"], "needs_input")
+        self.assertEqual(app.context()["actions"][0]["kind"], "confirm_scope")
+        self.assertEqual(list(cli.pending_jobs(app.worker.db, app.cfg, {}, 1)), [])
+        events = app.data(JOB + "/events")
+        entries = [op["decision"] for event in events for op in event["operations"]]
+        self.assertEqual([(op["id"], op["result"]) for op in entries],
+                         [(receipt["id"], "accepted"), (receipt["id"], "rejected")])
+        self.assertIn("[redacted]", entries[0]["evidence"])
+        for output in (json.dumps([receipt, rejected, events, unavailable]), logs.getvalue()):
+            self.assertNotIn(TOKEN, output)
+            self.assertNotIn("fixture-private-secret", output)
 
     def test_timeout_resumes_compatible_history_on_same_round(self):
         app = self.fixture
@@ -300,7 +424,7 @@ with (queue.connect(Path(root)) as db,
                 copies.append(workspace)
                 if len(copies) == 1:
                     (workspace / "partial").write_text("retained plan and files")
-                    raise CommandTimeout("docker: tiempo agotado (900s)")
+                    raise CommandTimeout("El proceso de construcción excedió el plazo")
                 self.assertEqual(cfg["service"]["step_timeout_seconds"], 1200)
                 self.assertEqual((workspace / "partial").read_text(), "retained plan and files")
                 self.assertEqual(inputs["plan"]["criteria"], ["AC1 greet"])
@@ -321,6 +445,9 @@ with (queue.connect(Path(root)) as db,
             offer, = app.context()["actions"]
             self.assertEqual(offer["kind"], "extend_timeout")
             self.assertEqual(offer["previous_seconds"], 900)
+            self.assertEqual(app.context()["build_timeout"], {
+                "stage": "build", "seconds": 900, "rounds": 1, "round_limit": app.cfg["service"]["max_build_rounds"],
+            })
             self.assertEqual(len(offer["copies"]), 2)
             historical, = [copy for copy in offer["copies"] if not copy["current"]]
             path = JOB + "/actions"
@@ -328,6 +455,11 @@ with (queue.connect(Path(root)) as db,
                 identifier = digest([123, 1, str(invalid_copy), old["failed_attempt"]])
                 bad = app.payload("extend_timeout", options={"seconds": 1200, "reference": identifier})
                 self.assertEqual(app.request(path, bad)[0], 422)
+            for seconds in (900, 86401, 1200.5):
+                invalid_timeout = app.payload("extend_timeout", options={
+                    "seconds": seconds, "reference": historical["reference"],
+                })
+                self.assertEqual(app.request(path, invalid_timeout)[0], 422)
             app.submit("extend_timeout", options={"seconds": 1200, "reference": historical["reference"]})
             self.assertEqual(app.run_ready(), 0)
         self.assertEqual(copies, [copies[0], copies[0]])
@@ -342,12 +474,14 @@ with (queue.connect(Path(root)) as db,
         app.issue["body"] = "Alcance más reciente"
         path = JOB + "/actions"
         self.assertEqual(app.request(path, app.payload("confirm_scope"))[1]["error"]["code"], "revision_conflict")
-        self.assertEqual(app.submit("confirm_scope")["state"], "planning")
+        self.assertEqual(app.submit("confirm_scope")["resume_state"], "planning")
         with patch("masf.providers.invoke", side_effect=ProcessError("HTTP 401 Unauthorized")):
             self.assertEqual(app.run_ready(), 1)
         offer, = [item for item in app.context()["actions"] if item["kind"] == "assign_provider"]
         self.assertEqual((offer["role"], offer["providers"]), ("plan", ["cursor"]))
-        self.assertEqual(app.submit("assign_provider", options={"provider": "cursor"})["state"], "planning")
+        disabled = app.payload("assign_provider", options={"role": "plan", "provider": "claude"})
+        self.assertEqual(app.request(path, disabled)[0], 422)
+        self.assertEqual(app.submit("assign_provider", options={"role": "plan", "provider": "cursor"})["resume_state"], "planning")
         self.assertEqual(app.run_ready(), 0)
         self.assertEqual(app.data(JOB + "/attempts")[1]["provider"], "cursor")
 
@@ -359,7 +493,9 @@ with (queue.connect(Path(root)) as db,
                    reason="Rondas de construcción agotadas", plan={"criteria": ["AC1 greet"]})
         offer, = [item for item in app.context()["actions"] if item["kind"] == "add_rounds"]
         self.assertEqual(offer["current_limit"], 2)
-        self.assertEqual(app.submit("add_rounds", options={"extra": 1})["state"], "building")
+        for extra in (True, 0, 26):
+            self.assertEqual(app.request(JOB + "/actions", app.payload("add_rounds", options={"extra": extra}))[0], 422)
+        self.assertEqual(app.submit("add_rounds", options={"extra": 1})["resume_state"], "building")
         self.assertEqual(app.run_ready(), 0)
         self.assertEqual(app.data()["limits"]["build_limit"], 3)
 
@@ -396,8 +532,9 @@ with (queue.connect(Path(root)) as db,
         data = app.payload("resolved_commit", options={"sha": resolved})
         key = "repeat-resolved-commit"
         receipt = app.request(path, data, key)
-        self.assertEqual(receipt[0], 200, receipt)
+        self.assertEqual(receipt[0], 202, receipt)
         self.assertEqual(app.request(path, data, key), receipt)
+        self.assertEqual(app.apply_pending(), 0)
         applied = app.ci_job()
         self.assertEqual((applied["state"], applied["candidate"]), ("checking", resolved))
         self.assertEqual((applied["base_checked"], applied["checks"], applied["review"]), (None, {}, {}))
@@ -435,8 +572,9 @@ with (queue.connect(Path(root)) as db,
             self.assertEqual((blocked["recovery"]["used"], blocked["recovery"]["limit"]), (1, 1))
             self.assertEqual(blocked["recovery"]["history"][0]["action"], "retry")
             response = app.submit("add_recoveries", options={"extra": 1})
-            self.assertEqual(response["state"], "reviewing")
+            self.assertEqual(response["resume_state"], "reviewing")
             with closing(queue.connect(app.root / "state")) as reopened:
+                self.assertEqual(app.apply_pending(reopened), 0)
                 job = json.loads(reopened.execute("SELECT data FROM jobs").fetchone()[0])
                 self.assertEqual(recovery.limit(job, app.cfg), 2)
                 self.assertEqual(len(job["recoveries"]), 2)
@@ -463,7 +601,8 @@ with (queue.connect(Path(root)) as db,
         with patch("masf.cli.time.time", return_value=app.ci_job()["ci_retry_at"] + 1):
             self.assertEqual(app.ci_tick(), 0)
         self.assertTrue(app.data()["intervention"]["ci"])
-        self.assertEqual(app.submit("resolve")["state"], "pr_open")
+        self.assertEqual(app.submit("resolve")["resume_state"], "pr_open")
+        self.assertEqual(app.apply_pending(), 0)
 
         app.action_attempt = 2
         app.annotation = app.ci_logs = "FAIL: test_ci_repair"

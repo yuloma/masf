@@ -163,6 +163,11 @@ def connect(root):
         ON stage_attempts(repo_id, number, role)""")
     db.execute("""CREATE TABLE IF NOT EXISTS action_receipts (
         key TEXT PRIMARY KEY, signature TEXT NOT NULL, data TEXT NOT NULL)""")
+    db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS action_receipts_id
+        ON action_receipts(json_extract(data,'$.id'))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS pending_actions (
+        key TEXT PRIMARY KEY, repo_id INTEGER NOT NULL, number INTEGER NOT NULL,
+        payload TEXT NOT NULL, UNIQUE(repo_id,number))""")
     return db
 
 
@@ -177,9 +182,14 @@ def revision(job, event_id):
     return "v1:" + digest([job, event_id])
 
 
+def revision_event(db, identity):
+    # Acceptance is auditable without invalidating the decision's expected revision.
+    return db.execute("""SELECT max(id) FROM events WHERE repo_id=? AND number=?
+        AND json_extract(detail,'$.kind') IS NOT 'decision_accepted'""", identity).fetchone()[0]
+
+
 def job_revision(db, identity, job):
-    event = db.execute("SELECT max(id) FROM events WHERE repo_id=? AND number=?", identity).fetchone()[0]
-    return revision(job, event)
+    return revision(job, revision_event(db, identity))
 
 
 def store_stage(db, record):
@@ -233,24 +243,66 @@ def decision_details(entries, job):
     ]
 
 
-def save(db, job, state, *, action_receipt=None, **updates):
+def check_action_revision(db, job, expected):
+    identity = job["repo_id"], job["number"]
+    row = db.execute("SELECT data FROM jobs WHERE repo_id=? AND number=?", identity).fetchone()
+    if not lease_active(db, job) or not row or job_revision(db, identity, json.loads(row[0])) != expected:
+        raise RevisionConflict
+
+
+def release_action(db, job):
+    db.execute("DELETE FROM leases WHERE repo_id=? AND number=? AND token=?",
+               (job["repo_id"], job["number"], job["attempt"]))
+
+
+def write_action_result(db, key, receipt):
+    if not db.execute("DELETE FROM pending_actions WHERE key=?", (key,)).rowcount:
+        raise RevisionConflict
+    db.execute("UPDATE action_receipts SET data=? WHERE key=?", (json.dumps(receipt), key))
+
+
+def accept_action(db, job, key, signature, receipt, payload, entry):
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        check_action_revision(db, job, receipt["revision"])
+        db.execute("INSERT INTO action_receipts VALUES(?,?,?)", (key, signature, json.dumps(receipt)))
+        db.execute("INSERT INTO pending_actions VALUES(?,?,?,?)",
+                   (key, job["repo_id"], job["number"], json.dumps(payload)))
+        write_event(db, job, job["state"], {"kind": "decision_accepted",
+                                          "operations": decision_details([entry], job)})
+        release_action(db, job)
+
+
+def reject_action(db, job, key, receipt, entry):
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        if not lease_active(db, job):
+            raise RevisionConflict
+        write_action_result(db, key, receipt)
+        write_event(db, job, job["state"], {"kind": "decision_rejected",
+                                          "operations": decision_details([entry], job)})
+        release_action(db, job)
+
+
+def save(db, job, state, *, action_receipt=None, pending_action=None, **updates):
     next_job = job | updates | {"state": state}
     persisted = {key: value for key, value in next_job.items() if key not in {"attempt", "_stage"}}
     with db:
         db.execute("BEGIN IMMEDIATE")
         if not lease_active(db, job):
-            if action_receipt is not None:
+            if action_receipt is not None or pending_action is not None:
                 raise RevisionConflict
             raise RuntimeError("La reserva del trabajo ha vencido")
         if action_receipt is not None:
             key, signature, receipt, expected = action_receipt
-            identity = job["repo_id"], job["number"]
-            row = db.execute("SELECT data FROM jobs WHERE repo_id=? AND number=?", identity).fetchone()
-            if not row or job_revision(db, identity, json.loads(row[0])) != expected:
-                raise RevisionConflict
+            check_action_revision(db, job, expected)
             db.execute("INSERT INTO action_receipts VALUES(?,?,?)", (key, signature, json.dumps(receipt)))
-            db.execute("DELETE FROM leases WHERE repo_id=? AND number=? AND token=?",
-                       (*identity, job["attempt"]))
+            release_action(db, job)
+        if pending_action is not None:
+            key, receipt = pending_action
+            check_action_revision(db, job, receipt["revision"])
+            write_action_result(db, key, receipt)
+            release_action(db, job)
         detail = dict(updates)
         if "ci" in updates and state == job["state"] and not updates.get("ci_repair"):
             detail["kind"] = "ci_observation"
@@ -276,7 +328,7 @@ def save(db, job, state, *, action_receipt=None, **updates):
             (state, json.dumps(filtered(persisted)), job["repo_id"], job["number"]),
         )
     job.update(next_job)
-    if action_receipt is None:
+    if action_receipt is None and pending_action is None:
         print(f"{job['slug']}#{job['number']} {state}", flush=True)
 
 

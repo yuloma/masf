@@ -503,6 +503,14 @@ def persist(db, pr, ci=None):
             {key: value for key, value in pr["errors"].items() if key == "pr_detail"},
         )
         if ci is not None:
+            observed_at = datetime.now(timezone.utc).isoformat()
+            ci["observed_at"] = observed_at
+            ci["last_success_at"] = (previous.get("last_success_at") or {}) | {
+                source: observed_at for source in (
+                    "check_runs", "commit_statuses", "workflow_runs", "branch_protection", "branch_rules",
+                ) if source not in pr["errors"]
+            }
+            pr["observed_at"] = observed_at
             ci["errors"] = pr["errors"]
             error_events(db, pr, previous.get("errors", {}), ci["errors"])
             for key, result in ci["checks"].items():
@@ -531,8 +539,6 @@ def persist(db, pr, ci=None):
                 ON CONFLICT(repo_id,number,sha) DO UPDATE SET data=excluded.data""",
                 (*ident, sha, json.dumps(ci)),
             )
-        if ci is not None:
-            pr["observed_at"] = datetime.now(timezone.utc).isoformat()
         db.execute("""INSERT INTO pull_requests VALUES(?,?,?,?,?,?)
             ON CONFLICT(repo_id,number) DO UPDATE SET slug=excluded.slug,state=excluded.state,
             sha=excluded.sha,data=excluded.data""",

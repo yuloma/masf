@@ -12,6 +12,8 @@ El controlador se puede instalar en un contenedor o en un entorno virtual de Lin
 
 El [manifiesto central](../examples/docker/compose.yaml) describe el despliegue. La imagen local `masf-controller:pilot` instala el ejecutable `masf`. También puedes probar el [perfil de proyecto](#probar-el-perfil-sin-instalar-masf) independientemente del controlador.
 
+Para consultar el estado por HTTP desde el mismo host, usa el [despliegue del observador](observacion.md#despliegue-en-docker), que monta la configuración y el estado para lectura.
+
 En el host del piloto se necesita Linux con Docker Engine local y el plugin Docker Compose con soporte de `up --wait`. La imagen de I1 incluye MASF, sus dependencias, Git y `gh`. Desde I2 incluye también el cliente Docker y el plugin Compose. Las CLIs de IA van en las imágenes de los agentes. El host puede ejecutar el piloto contenedorizado con Docker y las utilidades habituales de Linux, aunque carezca de Python, PHP, PostgreSQL o un editor abierto.
 
 Desde la raíz de un checkout de MASF, prepara tres directorios privados del operador. Usa rutas absolutas, distintas y sin enlaces simbólicos. Mantén esta configuración en el host que ejecuta el daemon.

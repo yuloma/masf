@@ -55,6 +55,8 @@ Para actualizar, construye las imágenes del controlador y del runner de la nuev
 
 `serve` registra el CI por SHA de los PR abiertos en los repositorios habilitados. Usa `status --pr` para el head y los resultados actuales, y `logs --pr` para las transiciones, diagnósticos y SHA históricos. Para filtrar un head sustituye `HEAD_SHA` por su SHA completo. [Campos y valores de la observación](docs/especificacion.md#formato-de-observación-v1).
 
+`masf --config FILE observe-api --port 8765` sirve trabajos, intervenciones, PR y evidencia de la instalación en `127.0.0.1`. [Rutas, formatos y despliegue de solo lectura](docs/observacion.md).
+
 ```bash
 masf --config FILE status --pr OWNER/REPO#23
 masf --config FILE logs --pr OWNER/REPO#23 --sha HEAD_SHA

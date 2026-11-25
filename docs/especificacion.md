@@ -70,6 +70,8 @@ Un check con error puede aportar anotaciones, salida del check y un extracto del
 
 `phase` toma los valores `pending`, `queued`, `in_progress`, `completed` o `unknown`. Las conclusiones conservan el valor de GitHub, incluidas `failure`, `timed_out`, `cancelled`, `action_required`, `skipped` y `neutral`. Los errores de consulta aparecen en `errors` y los resultados válidos previos siguen visibles. `null` expresa un valor desconocido o aún no comunicado, por ejemplo un intento o el cálculo de checks ausentes sin una lectura válida. Un array vacío señala una lectura que no encontró elementos.
 
+`masf observe-api` expone estas entidades, los trabajos, las intervenciones y la evidencia por intento mediante la [API local de observación v1](observacion.md). Los snapshots de esta API incluyen las fechas del sondeo y la última lectura correcta por origen.
+
 ## CI de un PR abierto
 
 La etapa del trabajo y la observación de CI se registran por separado. `status` muestra ambas, el SHA observado, los límites y la intervención pendiente. `status --json` expone el estado y los intentos en un objeto por trabajo. `history OWNER/REPO#N` devuelve las transiciones y los límites de cada intento en JSON por línea, con su evidencia. Los checks locales y la revisión conservan el SHA al que corresponden aunque avance el PR.

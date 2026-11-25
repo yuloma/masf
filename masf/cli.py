@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 from . import ci
 from .config import ConfigError, load, xdg
 from .evidence import UNKNOWN_PROVENANCE, historical_role, provenance
+from .observation_api import DEFAULT_PORT, port, serve as serve_observation
 from .observe import link_pull, load_row, observe
 from .queue import (
     api,
@@ -617,6 +618,13 @@ def pull_target(value):
 
 
 def pull_output(db, target, *, history=False, sha=None):
+    def cli_snapshot(row):
+        snapshot = load_row(row)
+        if snapshot is not None:
+            snapshot.pop("observed_at", None)
+            snapshot.pop("last_success_at", None)
+        return filtered(snapshot)
+
     params = target or ()
     pull_filter = " WHERE slug=? COLLATE NOCASE AND number=?" if target else ""
     for row in db.execute("SELECT data FROM pull_requests" + pull_filter + " ORDER BY slug,number", params):
@@ -624,11 +632,11 @@ def pull_output(db, target, *, history=False, sha=None):
         ident = pr["repo_id"], pr["number"]
         label = {"repo_id": pr["repo_id"], "number": pr["number"]}
         if not history:
-            ci = load_row(db.execute(
+            ci = cli_snapshot(db.execute(
                 "SELECT data FROM pull_ci WHERE repo_id=? AND number=? AND sha=?",
                 (*ident, pr["head"]["sha"]),
             ).fetchone())
-            print(json.dumps({"type": "pull_request", **pr, "ci": filtered(ci)}))
+            print(json.dumps({"type": "pull_request", **pr, "ci": ci}))
             continue
         sha_filter = " AND sha=? COLLATE NOCASE" if sha else ""
         params_with_sha = (*ident, sha) if sha else ident
@@ -641,7 +649,7 @@ def pull_output(db, target, *, history=False, sha=None):
             "SELECT sha,data FROM pull_ci WHERE repo_id=? AND number=?" + sha_filter + " ORDER BY sha",
             params_with_sha,
         ):
-            print(json.dumps({"type": "pull_evidence", **label, "sha": item["sha"], "ci": filtered(load_row(item))}))
+            print(json.dumps({"type": "pull_evidence", **label, "sha": item["sha"], "ci": cli_snapshot(item)}))
 
     if sha:
         return
@@ -692,9 +700,7 @@ def job_evidence(db, job, root):
 
 def main():
     parser = argparse.ArgumentParser(prog="masf")
-    parser.add_argument(
-        "--config", type=Path, default=xdg("CONFIG", ".config") / "config.toml"
-    )
+    parser.add_argument("--config", type=Path)
     subs = parser.add_subparsers(dest="cmd", required=True)
     subs.add_parser("doctor").add_argument("--offline", action="store_true")
     subs.add_parser("scan").add_argument("--dry-run", action="store_true")
@@ -735,10 +741,15 @@ def main():
     logs.add_argument("--pr", type=pull_target)
     logs.add_argument("--sha")
     subs.add_parser("serve")
+    observation = subs.add_parser("observe-api", help="Sirve la API local de solo lectura")
+    observation.add_argument("--port", type=port, default=DEFAULT_PORT, help="Puerto TCP (por defecto %(default)s)")
     args = parser.parse_args()
-    config = args.config.absolute()
+    config = (args.config or xdg("CONFIG", ".config") / "config.toml").absolute()
     db = None
     try:
+        if args.cmd == "observe-api":
+            serve_observation(xdg("STATE", ".local/state"), config, args.port)
+            return 0
         cfg = load(config)
         if args.cmd == "doctor":
             doctor(cfg, args.offline)

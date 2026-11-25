@@ -3,13 +3,18 @@
 import http.client
 import json
 import os
+import signal
+import subprocess
+import sys
 import threading
 import unittest
 import uuid
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from masf import cli, observe, queue, worker
+from masf import cli, observe, queue, recovery, worker
+from masf.actions import ActionError
 from masf.evidence import digest, model, usage
 from masf.observation_api import ObservationServer
 from masf.queue import api as queue_api
@@ -188,11 +193,102 @@ class DashboardAPI(unittest.TestCase):
         self.assertEqual([(entry["kind"], entry["resume_state"]) for entry in operations],
                          [("answer", "planning"), ("allow_paths", "checking"), ("resolve", "publishing")])
         self.assertTrue(all(entry["operator"] == OPERATOR for entry in operations))
+        self.assertEqual((operations[0]["question"], operations[0]["answer"], operations[0]["question_attempt"]),
+                         (question["text"], "Para Ana", question["attempt_id"]))
+        self.assertEqual(app.agent_calls[1][1]["operator_feedback"]["question_attempt"], question["attempt_id"])
         attempts = app.data(JOB + "/attempts")
         self.assertEqual([entry["model"]["effective"] for entry in attempts if entry["role"] == "plan"],
                          ["fixture-plan-1", "fixture-plan-2"])
         self.assertTrue(any(entry["model"]["availability"] == "unknown" for entry in attempts))
         self.assertEqual({entry["provider"] for entry in attempts if entry["provider"]}, {"codex", "cursor"})
+
+    def test_cli_and_api_compete_for_same_revision(self):
+        app = self.fixture
+        app.scenario()
+        app.run_ready()
+        payload = app.payload("answer", evidence="Para Ana")
+        entered, release = threading.Event(), threading.Event()
+        path = JOB + "/actions"
+
+        def lookup(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return app.api(*args, **kwargs)
+
+        kwargs = dict(answer=True, evidence="Para Ana", revision=payload["revision"],
+                      idempotency_key="competing-cli-request")
+        target = f"{app.job['slug']}#1"
+        with ThreadPoolExecutor() as threads, patch("masf.queue.api", lookup), patch("masf.cli.api", app.api):
+            response = threads.submit(app.request, path, payload, "winning-api-request")
+            try:
+                self.assertTrue(entered.wait(5))
+                with self.assertRaises(ActionError) as busy:
+                    cli.resume(app.worker.db, app.cfg, target, **kwargs)
+                self.assertEqual(busy.exception.code, "decision_in_progress")
+            finally:
+                release.set()
+            self.assertEqual(response.result()[0], 200)
+            with self.assertRaises(ActionError) as stale:
+                cli.resume(app.worker.db, app.cfg, target, **kwargs)
+            self.assertEqual(stale.exception.code, "revision_conflict")
+        self.assertEqual(app.run_ready(), 1)
+        events = app.data(JOB + "/events")
+        self.assertEqual([op["decision"]["origin"] for event in events for op in event["operations"]], ["api"])
+        self.assertEqual(app.plan_calls, 2)
+        self.assertEqual(list(cli.pending_jobs(app.worker.db, app.cfg, {}, 1)), [])
+
+    def test_decision_survives_process_loss_at_commit_boundary(self):
+        app = self.fixture
+        app.scenario()
+        app.run_ready()
+        payload = app.payload("answer", evidence="Para Ana")
+        path = JOB + "/actions"
+        key = "restart-same-decision"
+        script = """
+import json, os, signal, sys
+from pathlib import Path
+from unittest.mock import patch
+from masf import cli, queue
+from masf.config import load
+
+root, config, target, operator, key, issue, payload, boundary = sys.argv[1:]
+payload = json.loads(payload)
+save = queue.save
+def terminate(*args, **kwargs):
+    if boundary == "after":
+        save(*args, **kwargs)
+    os.kill(os.getpid(), signal.SIGKILL)
+with (queue.connect(Path(root)) as db,
+      patch.object(cli, "operator_name", return_value=operator),
+      patch.object(cli, "api", return_value=json.loads(issue)),
+      patch.object(queue, "write_event" if boundary == "before" else "save", terminate)):
+    cli.resume(db, load(Path(config)), target, answer=True, evidence=payload["evidence"],
+               revision=payload["revision"], idempotency_key=key)
+"""
+
+        def interrupted(boundary):
+            process = subprocess.run(
+                [sys.executable, "-c", script, str(app.root / "state"), str(app.server.config),
+                 f"{app.job['slug']}#1", OPERATOR, key, json.dumps(app.issue), json.dumps(payload), boundary],
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(process.returncode, -signal.SIGKILL, process.stderr)
+
+        interrupted("before")
+        self.assertEqual(app.data()["revision"], payload["revision"])
+        self.assertEqual(app.request(path, payload, key)[1]["error"]["code"], "decision_in_progress")
+        with app.worker.db:
+            app.worker.db.execute("UPDATE leases SET expires=0")
+        interrupted("after")
+        response = app.request(path, payload, key)
+        self.assertEqual(response[0], 200)
+        self.assertEqual(response[1]["data"]["origin"], "cli")
+        self.assertEqual(app.request(path, payload, key), response)
+        self.assertEqual(app.run_ready(), 1)
+        self.assertEqual(app.plan_calls, 2)
+        self.assertEqual(len([op for event in app.data(JOB + "/events") for op in event["operations"]]), 1)
+        self.assertEqual(app.worker.db.execute("SELECT count(*) FROM action_receipts").fetchone()[0], 1)
+        self.assertEqual(list(cli.pending_jobs(app.worker.db, app.cfg, {}, 1)), [])
 
     def test_timeout_resumes_compatible_history_on_same_round(self):
         app = self.fixture
@@ -266,6 +362,94 @@ class DashboardAPI(unittest.TestCase):
         self.assertEqual(app.submit("add_rounds", options={"extra": 1})["state"], "building")
         self.assertEqual(app.run_ready(), 0)
         self.assertEqual(app.data()["limits"]["build_limit"], 3)
+
+    def test_resolved_commit_requires_work_scope_and_current_base(self):
+        app = self.fixture
+        app.open_conflicting_pr()
+        app.cfg["service"]["max_recovery_attempts"] = 0
+        self.assertEqual(app.ci_tick(), 1)
+        blocked = app.ci_job()
+        self.assertEqual(app.data()["base_conflict"]["paths"], ["README"])
+        tree = app.worker.git("rev-parse", app.old_head + "^{tree}")
+        resolved = app.worker.git("commit-tree", tree, "-p", app.old_head, "-p", app.base, "-m", "resolved")
+        path = JOB + "/actions"
+        body = app.payload("resolved_commit", options={"sha": resolved})
+        self.assertEqual(app.request(path, body)[0], 422)
+        app.keep_resolution(resolved, job=blocked | {"fingerprint": "wrong-scope"})
+        self.assertEqual(app.request(path, body)[0], 422)
+        app.keep_resolution(resolved, job=blocked)
+        offer, = [item for item in app.context()["actions"] if item["kind"] == "resolved_commit"]
+        self.assertEqual(offer["commits"], [resolved])
+
+        previous_base = app.base
+        app.advance_open_pr(message="newer base")
+        self.assertEqual(app.request(path, body)[1]["error"]["code"], "revision_conflict")
+        self.assertEqual(app.data()["observed_base"], app.base)
+        self.assertEqual(app.data()["candidate_sha"], app.old_head)
+        self.assertNotIn("resolved_commit", [item["kind"] for item in app.context()["actions"]])
+
+        # Restore the recorded observation to exercise acceptance on the current base.
+        app.base = previous_base
+        app.prs[0]["base"]["sha"] = previous_base
+        factory.command(["git", "update-ref", "refs/heads/main", previous_base], cwd=app.source)
+        queue.save(app.worker.db, blocked, "blocked", base_conflict=blocked["base_conflict"])
+        data = app.payload("resolved_commit", options={"sha": resolved})
+        key = "repeat-resolved-commit"
+        receipt = app.request(path, data, key)
+        self.assertEqual(receipt[0], 200, receipt)
+        self.assertEqual(app.request(path, data, key), receipt)
+        applied = app.ci_job()
+        self.assertEqual((applied["state"], applied["candidate"]), ("checking", resolved))
+        self.assertEqual((applied["base_checked"], applied["checks"], applied["review"]), (None, {}, {}))
+        self.assertEqual(app.ci_tick(), 0)
+        finished = app.ci_job()
+        self.assertEqual(finished["published_head"], resolved)
+        self.assertEqual((finished["base_checked"], finished["checks"]["sha"], finished["review"]["sha"]),
+                         (previous_base, resolved, resolved))
+        self.assertEqual(len(app.prs), 1)
+
+    def test_expand_exhausted_recovery_budget_and_continue_after_reopen(self):
+        app = self.fixture
+        app.cfg["service"]["max_recovery_attempts"] = 1
+        config = app.server.config
+        config.write_text(config.read_text().replace("max_recovery_attempts = 2", "max_recovery_attempts = 1"))
+
+        def interrupted(role, *args, **kwargs):
+            if role == "review":
+                raise recovery.RecoverableFailure("Revisión temporalmente interrumpida")
+            return app.agent(role, *args, **kwargs)
+
+        with patch("masf.providers.invoke", interrupted):
+            self.assertEqual(app.run_ready(), 1)
+            waiting = app.data()
+            self.assertEqual(waiting["state"], "retry_wait")
+            self.assertFalse(waiting["intervention"]["pending"])
+            self.assertEqual(waiting["recovery"]["used"], 1)
+            self.assertIsNotNone(waiting["recovery"]["next_at"])
+            self.assertEqual(app.context()["actions"], [])
+            with patch("masf.cli.time.time", return_value=waiting["recovery"]["next_at"] + 1):
+                self.assertEqual(app.run_ready(), 1)
+            blocked = app.data()
+            self.assertEqual(blocked["state"], "blocked")
+            self.assertTrue(blocked["intervention"]["pending"])
+            self.assertEqual((blocked["recovery"]["used"], blocked["recovery"]["limit"]), (1, 1))
+            self.assertEqual(blocked["recovery"]["history"][0]["action"], "retry")
+            response = app.submit("add_recoveries", options={"extra": 1})
+            self.assertEqual(response["state"], "reviewing")
+            with closing(queue.connect(app.root / "state")) as reopened:
+                job = json.loads(reopened.execute("SELECT data FROM jobs").fetchone()[0])
+                self.assertEqual(recovery.limit(job, app.cfg), 2)
+                self.assertEqual(len(job["recoveries"]), 2)
+                self.assertEqual(job["recoveries"][0]["reason"], blocked["recovery"]["history"][0]["reason"])
+                self.assertEqual(job["decisions"][-1]["expected_revision"], blocked["revision"])
+                ready, = cli.pending_jobs(reopened, app.cfg, {}, 1)
+                self.assertEqual(ready[1]["candidate"], blocked["candidate_sha"])
+            self.assertEqual(app.data()["recovery"]["used"], 2)
+
+        self.assertEqual(app.run_ready(), 0)
+        self.assertEqual(app.data()["state"], "pr_open")
+        self.assertEqual(app.data()["candidate_sha"], blocked["candidate_sha"])
+        self.assertEqual(app.roles.count("build"), 1)
 
     def test_ci_intervention_and_repair_preserve_history_at_both_shas(self):
         app = self.fixture

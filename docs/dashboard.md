@@ -38,9 +38,13 @@ En **Intervenciones**, abre el trabajo y escribe el token en **Consultar accione
 | Confirmar alcance | El operador revisa la issue y los extractos filtrados disponibles. El servidor confirma la huella del alcance observado y vuelve a planificar. |
 | Autorizar rutas | El servidor comprueba el candidato, el alcance y los archivos exactos. El formulario presenta las rutas y el resumen de líneas modificadas. El operador confirma la lista antes de volver a checks. |
 | Confirmar causa resuelta | El controlador vuelve a la etapa anunciada. Si el CI requería corregir el entorno o relanzar la ejecución, vuelve a observar el PR. |
-| Reasignar proveedor | El servidor ofrece proveedores habilitados para el rol de la etapa que se reanudará. La asignación se registra para ese trabajo. |
+| Reasignar proveedor | El servidor ofrece proveedores habilitados para los roles del trabajo. La asignación se registra para ese trabajo. |
 | Ampliar rondas | El formulario calcula el nuevo límite. El servidor admite de 1 a 25 rondas adicionales en una decisión sobre un límite agotado y las vincula al alcance vigente. |
 | Ampliar plazo y recuperar copia | El operador selecciona una copia de construcción compatible, actual o histórica, y confirma un plazo mayor al agotado y de hasta 86 400 segundos. La construcción continúa con su plan y archivos en una ronda ya contabilizada. |
+| Aceptar commit resuelto | Revisa la base, el candidato y las rutas en conflicto. Selecciona un commit conservado en el almacén Git del trabajo para ese alcance y esa base. Se verifican ambos ancestros y se repiten checks y revisión del nuevo SHA. |
+| Ampliar presupuesto de recuperación | Autoriza de 1 a 25 recuperaciones adicionales cuando se agota el presupuesto. El historial conserva el consumo, las acciones, los motivos y las construcciones. |
+
+El panel de recuperaciones muestra la etapa y la fecha de reintento cuando el estado es `retry_wait`. Los bloqueos que requieren una decisión aparecen en **Intervenciones**. [Registrar un commit en el almacén del trabajo](especificacion.md#operaciones-del-controlador).
 
 El controlador recoge el trabajo en su siguiente despacho normal. El dashboard sondea cada 10 segundos mientras la pestaña está visible. **Actualizar** solicita una lectura inmediata. La cronología conserva las operaciones, la evidencia, los intentos y los resultados de CI para los SHAs anteriores. Tras un conflicto, revisa el nuevo contexto y vuelve a marcar la confirmación. Si el transporte falla, **Reintentar el mismo envío** recupera el recibo con la misma clave.
 

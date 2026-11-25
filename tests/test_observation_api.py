@@ -323,7 +323,7 @@ class ObservationAPI(unittest.TestCase):
             "title": "Tarea", "body": "Alcance", "state": "open", "labels": [{"name": "ready"}],
         }
         with patch("masf.cli.api", return_value=issue):
-            cli.resume(self.db, {"repositories": [repo]}, SLUG + "#10",
+            cli.resume(self.db, {"repositories": [repo], "service": {"max_build_rounds": 2}}, SLUG + "#10",
                        evidence="Alcance confirmado")
         resumed = self.get(JOB)["data"]
         self.assertEqual(resumed["state"], "planning")
@@ -362,9 +362,11 @@ class ObservationAPI(unittest.TestCase):
 
         current = json.loads(self.db.execute("SELECT data FROM jobs WHERE number=10").fetchone()["data"])
         protected = ".github/workflows/check.yml"
-        queue.save(self.db, current, "blocked", reason="Ruta protegida", candidate=NEW_HEAD, retry="checking")
-        with patch("masf.cli.api", return_value=issue):
-            cli.resume(self.db, {"repositories": [repo]}, SLUG + "#10", allow_protected_paths=[protected])
+        queue.save(self.db, current, "blocked", reason="Ruta protegida", candidate=NEW_HEAD,
+                   retry="checking", blocked_paths=[protected])
+        with (patch("masf.cli.api", return_value=issue),
+              patch("masf.actions.command", return_value=f"1\t0\t{protected}\0")):
+            cli.resume(self.db, {"repositories": [repo], "service": {"max_build_rounds": 2}}, SLUG + "#10", allow_protected_paths=[protected])
         authorization = self.get(JOB + "/events")["data"][-1]
         self.assertEqual(authorization["operations"][0]["decision"]["paths"], [protected])
         self.assertEqual(authorization["path_approvals"][0]["path"], protected)

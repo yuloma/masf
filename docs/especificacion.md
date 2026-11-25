@@ -77,9 +77,15 @@ Un check con error puede aportar anotaciones, salida del check y un extracto del
 
 `masf observe-api` sirve `/dashboard/` en loopback. Las vistas consumen la API de observación v1 y distinguen cola, ejecución, bloqueo y terminación. El detalle enlaza intentos, ejecutores, modelos, decisiones y evidencia con el SHA correspondiente. Las lecturas de CI conservan el historial de heads e intentos. El panel muestra los fallos de sondeo junto con la última evidencia válida.
 
-Con `--actions-token-file FILE`, el mismo servidor habilita la API autenticada de acciones. El servidor ofrece operaciones para la revisión opaca vigente y exige confirmación explícita, evidencia e idempotencia. El controlador registra el operador, la decisión, el SHA y el estado resultante en la misma transacción que el recibo. La siguiente iteración de `masf serve` continúa el trabajo. Las decisiones de alcance revalidan la issue. Las autorizaciones de rutas verifican los archivos exactos del candidato y las reasignaciones verifican proveedores habilitados.
+Con `--actions-token-file FILE`, el servidor habilita la API autenticada de acciones. La CLI y la API usan la misma operación de decisión. El operador revisa el contexto, confirma la acción y envía el motivo o feedback, la revisión opaca esperada y una clave de idempotencia. La operación valida que el trabajo admita la acción, que la issue conserve su elegibilidad y alcance y que ninguna ejecución tenga una reserva vigente. Repetir la misma solicitud devuelve el recibo original. Una clave reutilizada con otros datos o una revisión obsoleta produce un conflicto con código propio.
 
-El plazo ampliado se aplica al rol de construcción de ese trabajo. Las copias recuperables se identifican en eventos del propio trabajo, se vinculan con su intento fallido y se validan contra su directorio, SHA de entrada, huella de alcance y límite de rondas. El controlador retoma el plan y los archivos de una ronda contabilizada y registra el plazo efectivo en el nuevo intento. [Arranque y flujos del dashboard](dashboard.md). [Contrato HTTP](observacion.md#api-autenticada-de-acciones-v1).
+SQLite confirma en una transacción la revisión, la reserva, el operador, la fecha, el origen, el motivo, el resultado, el recibo y la transición. Si la operación se interrumpe antes de confirmar, puede repetirse al vencer la reserva. Si se interrumpe después, el recibo y el nuevo estado sobreviven al reinicio. El controlador recoge el mismo trabajo en el siguiente ciclo disponible de `masf serve`. El dashboard refleja el avance por sondeo y distingue los bloqueos que necesitan una decisión de la espera automática `retry_wait`.
+
+La respuesta a una pregunta conserva el texto, el intento que la formuló cuando se conoce y la respuesta que recibe el siguiente agente. Confirmar el alcance exige la huella observada, actualiza la instantánea de la issue e invalida el plan, las autorizaciones, los checks y la revisión anteriores. Confirmar un bloqueo atendido devuelve el trabajo a la etapa registrada y conserva los checks y la revisión válidos para el mismo SHA. Las autorizaciones se aplican a archivos protegidos exactos del diff del candidato de ese trabajo y a la huella vigente. El operador puede reasignar un rol a un proveedor habilitado o ampliar un límite agotado de rondas, conservando las decisiones y los intentos contabilizados del alcance.
+
+El plazo ampliado se aplica al rol de construcción. El panel muestra etapa, plazo agotado, rondas y copias compatibles. Las referencias actuales e históricas proceden de eventos del propio trabajo y se validan contra el intento fallido, el directorio, el SHA de entrada, la huella y la ronda autorizada. El controlador retoma el plan y los archivos de la ronda con el feedback registrado.
+
+El panel de recuperación muestra las acciones, motivos, presupuesto utilizado y autorizado, construcciones de recuperación y la hora del siguiente intento. El operador puede ampliar explícitamente un presupuesto agotado. La ampliación persiste por trabajo y conserva el historial y el consumo. Tanto el reintento automático como la intervención vuelven a aplicar la elegibilidad, las rutas protegidas y las comprobaciones por SHA antes de publicar. [Arranque y flujos del dashboard](dashboard.md). [Contrato HTTP](observacion.md#api-autenticada-de-acciones-v1).
 
 ## CI de un PR abierto
 
@@ -121,16 +127,33 @@ Ejecuta estos comandos con el TOML y el estado habituales de la instalación. La
 ```bash
 masf status --json
 masf history 'OWNER/REPO#10'
-masf resume 'OWNER/REPO#10' --accept-head SHA --evidence 'Diff y procedencia del nuevo head revisados'
-masf resume 'OWNER/REPO#10' --add-rounds 1 --evidence 'Autorizada una ronda para el fallo registrado'
-masf resume 'OWNER/REPO#10' --allow-protected-path .github/workflows/factory.yml
-masf resume 'OWNER/REPO#10' --resolved-commit SHA
-masf link-pr 'OWNER/REPO#10' --pr 23 --head SHA --evidence 'Issue, PR y alcance verificados'
+job='OWNER/REPO#10'
+masf resume "$job" --decision-context
+
+# Copia la revisión y las referencias del contexto para la acción elegida.
+revision='v1:REVISION'
+masf resume "$job" --revision "$revision" --idempotency-key responder-pregunta-10-1 \
+  --answer --evidence 'El saludo es para Ana'
+masf resume "$job" --revision "$revision" --idempotency-key autorizar-factory-10-1 \
+  --allow-protected-path .github/workflows/factory.yml --evidence 'Workflow revisado'
+masf resume "$job" --revision "$revision" --idempotency-key tiempo-construccion-10-1 \
+  --timeout-seconds 1200 --workspace-reference REFERENCIA --evidence 'Conservar el plan y los archivos'
+masf resume "$job" --revision "$revision" --idempotency-key resolver-base-10-1 \
+  --resolved-commit SHA --evidence 'Integración de la base revisada'
+masf resume "$job" --revision "$revision" --idempotency-key ampliar-recuperaciones-10-1 \
+  --add-recoveries 2 --evidence 'Autorizados dos intentos adicionales'
+masf link-pr "$job" --pr 23 --head SHA --evidence 'Issue, PR y alcance verificados'
 ```
 
-`--accept-head` requiere el SHA observado en el conflicto y lo contrasta con el PR y su referencia. `--add-rounds` amplía un límite agotado para la huella vigente y puede acompañar la reconciliación del head. Un fallo de CI de acceso, cuota, configuración o evidencia insuficiente se reexamina con `resume` tras atender la causa y solicitar un rerun. Las autorizaciones de rutas siguen siendo por archivo exacto y por trabajo. `link-pr` exige una issue elegible, un PR abierto del mismo repositorio y la rama `masf/issue-N` hacia la base configurada. La vinculación permite iniciar el diagnóstico y solicitar la planificación cuando falte un plan.
+Cada línea de `resume` ejemplifica una decisión independiente. Usa la revisión vigente para cada operación y una clave nueva de 16 a 128 letras, dígitos, guiones o guiones bajos. En un reintento conserva la revisión, la clave y el resto de los argumentos. La CLI imprime el recibo en JSON y devuelve un código de conflicto en JSON si el contexto caducó. Los atajos locales sin revisión ni clave generan ambos valores para ese envío. Usa `--confirm-scope` para el alcance observado, `--assign-provider ROL PROVEEDOR` para reasignar un rol, `--add-rounds N` para ampliar rondas y `--workspace-reference REFERENCIA` para elegir una copia registrada. Una solicitud sin selector confirma que se atendió el bloqueo. `--accept-head SHA` contrasta el head observado con el PR y su referencia y puede combinarse con `--add-rounds N`. `link-pr` exige una issue elegible, un PR abierto del mismo repositorio y la rama `masf/issue-N` hacia la base configurada.
 
-`--resolved-commit` selecciona un commit local revisado por el operador que conserva la base y el head vigentes. Se admite al bloquearse una actualización de base, antes de la primera publicación o con el PR abierto. `status --json` expone `merge_observation`, la recuperación `pr_conflict`, el último `conflict_result` y la acción `conflict_action` cuando procede.
+Para una resolución manual, `--decision-context` devuelve `resolution_ref_prefix` para el conflicto registrado. Conserva el commit en el almacén Git de ese trabajo, en `$MASF_JOBS_DIR/REPO_ID-ISSUE/git`. Con el objeto ya disponible en ese almacén, copia el prefijo completo (incluida la barra final) y registra la referencia local.
+
+```bash
+git --git-dir "$JOB_GIT" update-ref "${PREFIX}${SHA}" "$SHA"
+```
+
+El dashboard y `--resolved-commit SHA` seleccionan referencias de ese almacén y prefijo, ligados al alcance y la base. El commit debe contener el candidato anterior y la base vigente como ancestros. Un avance de la base devuelve un conflicto y deja visible el SHA observado. El controlador reevalúa el conflicto al reanudar con presupuesto disponible. La resolución aceptada inicia checks de base y candidato y revisión del nuevo SHA antes de publicar. `status --json` conserva las observaciones y los resultados de integración.
 
 ## Proveedores y contrato de etapa
 

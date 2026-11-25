@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 from . import checks, ci, providers
 from .evidence import agent_explanation, explanation, model, provenance, timestamp, usage, write_artifact
 from .queue import api, interrupt_stages, latest, record_stage, require_lease, retry_delay, save, stage_attempts
-from .recovery import RecoverableFailure, reserve, wait
+from .recovery import BudgetExhausted, RecoverableFailure, limit, reserve, wait
 from .system import ProcessError, TaskStopped, clean, command, docker_env, filtered
 
 
@@ -63,6 +63,7 @@ class Worker:
     def git(self, *args, workspace=None, stdin=None, guard=None):
         prefix = [
             "git",
+            "--no-replace-objects",
             "-c",
             "credential.helper=!gh auth git-credential",
             "-c",
@@ -327,7 +328,7 @@ class Worker:
 
     def start_base_conflict(self, base, candidate, tree, paths, *, pull=None):
         j = self.job
-        conflict = {"base": base, "candidate": candidate, "paths": paths}
+        conflict = {"base": base, "candidate": candidate, "paths": paths, "fingerprint": j["fingerprint"]}
         action = "Resolver el árbol combinado y preservar los criterios de la issue y el comportamiento de la base"
         updates = {"base_conflict": conflict}
         if pull:
@@ -338,9 +339,9 @@ class Worker:
         self.git("update-ref", "refs/masf/conflict-tree", tree)
         self.update("building" if pull else "publishing", **updates)
         try:
-            history = reserve(j, self.cfg, "resolve_base", **conflict)
-        except RuntimeError as exc:
-            raise RuntimeError(
+            history = reserve(j, self.cfg, "resolve_base", reason=action, **conflict)
+        except BudgetExhausted as exc:
+            raise BudgetExhausted(
                 f"{exc}. Conflicto en {', '.join(paths)}. Usa resume --resolved-commit SHA"
             ) from None
         updates = dict(base=base, recoveries=history, repair_intent=None, build_workspace=None,
@@ -473,7 +474,7 @@ class Worker:
                 commands = report.get("commands")
                 detail = f": {commands[-1]}" if commands else ""
                 raise RuntimeError("Fallan los checks de la base" + detail)
-            self.update(j["state"] if j.get("pr_number") else "planning", base_checked=j["base"])
+            self.update(j["state"] if j.get("plan") else "planning", base_checked=j["base"])
         if not j.get("plan"):
             planning = self.role("plan", j["base"], self.checkout(j["base"]))
             result = planning["result"]
@@ -498,10 +499,11 @@ class Worker:
                 if not operator_resume and not checkpoint.get("result") and (
                     recovery.get("started") or (
                         not recovery and checkpoint
-                        and self.cfg["service"].get("max_recovery_attempts", 2)
+                        and limit(j, self.cfg)
                     )
                 ):
-                    history = reserve(j, self.cfg, "resume_build", candidate=candidate)
+                    history = reserve(j, self.cfg, "resume_build", candidate=candidate,
+                                      reason=checkpoint.get("error") or "Construcción interrumpida")
                     recovery = {**(recovery or {"type": "retry"}), "started": False}
                     if conflict:
                         reason = "Resolución interrumpida. Reintento programado"
@@ -699,7 +701,8 @@ class Worker:
                 prior = ["-p", candidate] if j.get("pr_number") else []
                 rebased = self.git("commit-tree", tree, "-p", current, *prior, "-m", j["title"])
                 history = reserve(
-                    j, self.cfg, "refresh_base", base=current, candidate=candidate
+                    j, self.cfg, "refresh_base", base=current, candidate=candidate,
+                    reason="Avanzó la rama base"
                 )
                 base_report = self.test(current)
                 if not base_report["passed"]:
@@ -715,6 +718,7 @@ class Worker:
                     candidate=rebased,
                     recoveries=history,
                     repair_intent=None,
+                    base_conflict=None,
                 )
                 continue
             if j.get("pr_number"):

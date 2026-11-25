@@ -48,6 +48,11 @@ const decisionNames = {
   resolved_commit: "Aceptar commit resuelto", link_pr: "Vincular PR",
   answer: "Responder pregunta", confirm_scope: "Confirmar alcance", resolve: "Confirmar causa resuelta",
   assign_provider: "Reasignar proveedor", add_rounds: "Ampliar rondas", extend_timeout: "Ampliar plazo y recuperar copia",
+  add_recoveries: "Ampliar presupuesto de recuperación", accept_head: "Aceptar head",
+};
+const recoveryNames = {
+  retry: "Reintentar etapa", resume_build: "Retomar construcción", resolve_base: "Resolver conflicto de base",
+  refresh_base: "Integrar el avance de la base",
 };
 const availability = { unknown: "Desconocido", pending: "Pendiente", not_applicable: "No aplica" };
 const dateFormatter = new Intl.DateTimeFormat("es", { dateStyle: "medium", timeStyle: "medium" });
@@ -578,12 +583,18 @@ function interventionPanel(job, failed) {
   const entry = job.intervention;
   if (!entry.pending) return null;
   const checkpoint = entry.build_checkpoint;
+  const conflict = job.base_conflict;
   const compatible = actionContext?.revision === job.revision ? actionContext.compatible_build_copies : null;
   return section("Intervención · " + interventionType(job), [
     fields([["Causa", entry.reason], ["Candidato", sha(job.candidate_sha)],
       ["Etapa registrada para la reanudación", label(roles, entry.retry_stage)],
       ...(entry.head_conflict ? [["Head esperado", sha(entry.head_conflict.expected)],
         ["Head observado", sha(entry.head_conflict.observed)], ["Referencia remota", sha(entry.head_conflict.remote)]] : [])]),
+    conflict ? [node("h3", "Conflicto con la rama base"),
+      fields([["Base vigente observada", sha(job.observed_base || conflict.base)],
+        ["Base del conflicto registrado", job.observed_base && sha(conflict.base)],
+        ["Candidato conservado", sha(conflict.candidate)]]),
+      textList(conflict.paths)] : null,
     failed?.error_type === "CommandTimeout" ? fields([
       ["Etapa interrumpida", label(roles, failed.role)], ["Plazo agotado", failed.timeout_seconds == null
         ? null : failed.timeout_seconds + " s"], ["Rondas consumidas", job.limits?.rounds],
@@ -632,7 +643,7 @@ function authForm() {
 
 function optionControl(name, title, choices, initial) {
   const select = node("select", choices.map(([key, text]) => node("option", text, { value: key })), { name });
-  select.value = draft.options[name] ?? String(initial);
+  select.value = choices.some(([key]) => key === draft.options[name]) ? draft.options[name] : String(initial);
   select.addEventListener("change", () => { draft.options[name] = select.value; });
   return node("label", [title, select]);
 }
@@ -682,18 +693,32 @@ function decisionForm(job, offers) {
       })));
   }
   if (offer.kind === "assign_provider") {
-    controls.push(fields([["Rol", label(roles, offer.role)], ["Proveedor actual", offer.previous_provider]]),
-      optionControl("provider", "Nuevo proveedor", offer.providers.map(name => [name, name]), offer.providers[0]));
+    const role = Object.hasOwn(offer.roles, draft.options.role) ? draft.options.role : offer.role;
+    const roleControl = optionControl("role", "Rol", Object.keys(offer.roles).map(key => [key, label(roles, key)]), role);
+    roleControl.querySelector("select").addEventListener("change", () => {
+      delete draft.options.provider;
+      paint();
+    });
+    controls.push(roleControl, fields([["Proveedor actual", offer.routing[role]]]),
+      optionControl("provider", "Nuevo proveedor", offer.roles[role].map(name => [name, name]), offer.roles[role][0]));
   }
-  if (offer.kind === "add_rounds") {
+  if (["add_rounds", "add_recoveries"].includes(offer.kind)) {
     const effect = node("p", "Nuevo límite · " + (offer.current_limit + Number(draft.options.extra ?? 1)));
     controls.push(fields([["Límite actual", offer.current_limit]]),
-      numberControl("extra", "Rondas adicionales", 1, offer.maximum_extra, effect, offer.current_limit), effect);
+      numberControl("extra", offer.kind === "add_rounds" ? "Rondas adicionales" : "Recuperaciones adicionales",
+        1, offer.maximum_extra, effect, offer.current_limit), effect);
   }
+  if (offer.kind === "resolved_commit") {
+    controls.push(optionControl("sha", "Commit de resolución conservado",
+      offer.commits.map(commit => [commit, commit]), offer.commits[0]));
+  }
+  if (offer.kind === "accept_head") controls.push(fields([["Head observado", sha(offer.head)]]));
   if (offer.kind === "extend_timeout") {
     controls.push(fields([["Plazo anterior", offer.previous_seconds + " s"]]),
-      numberControl("seconds", "Nuevo plazo de construcción (segundos)", offer.minimum_seconds, offer.maximum_seconds),
-      optionControl("reference", "Copia de construcción compatible", offer.copies.map(copy => [copy.reference,
+      numberControl("seconds", "Nuevo plazo de construcción (segundos)", offer.minimum_seconds, offer.maximum_seconds));
+  }
+  if (["extend_timeout", "reuse_workspace"].includes(offer.kind)) {
+    controls.push(optionControl("reference", "Copia de construcción compatible", offer.copies.map(copy => [copy.reference,
         (copy.current ? "Actual" : "Histórica") + " · Ronda " + copy.round + " · " + copy.input_sha +
         " · Intento " + copy.failed_attempt]), offer.copies[0].reference));
   }
@@ -713,10 +738,15 @@ function decisionForm(job, offers) {
     const data = new FormData(form);
     const options = {};
     if (offer.kind === "allow_paths") options.paths = offer.paths;
-    if (offer.kind === "assign_provider") options.provider = data.get("provider");
-    if (offer.kind === "add_rounds") options.extra = Number(data.get("extra"));
-    if (offer.kind === "extend_timeout") {
-      options.seconds = Number(data.get("seconds"));
+    if (offer.kind === "assign_provider") {
+      options.role = data.get("role");
+      options.provider = data.get("provider");
+    }
+    if (["add_rounds", "add_recoveries"].includes(offer.kind)) options.extra = Number(data.get("extra"));
+    if (offer.kind === "resolved_commit") options.sha = data.get("sha");
+    if (offer.kind === "accept_head") options.sha = offer.head;
+    if (offer.kind === "extend_timeout") options.seconds = Number(data.get("seconds"));
+    if (["extend_timeout", "reuse_workspace"].includes(offer.kind)) {
       options.reference = data.get("reference");
     }
     submission = { key: crypto.randomUUID(), payload: {
@@ -762,7 +792,10 @@ async function sendDecision() {
       submission = null;
       draft.confirmed = false;
     }
-    if (conflict) actionContext = null;
+    if (conflict) {
+      draft.options = {};
+      actionContext = null;
+    }
     if (error.status === 401) credential = "";
     actionNotice = error.status ? error.message : "No se confirmó el envío. Reintenta la misma decisión.";
   } finally {
@@ -777,6 +810,7 @@ function operationCard(operation, resultingState) {
   return node("div", [
     node("h3", label(decisionNames, decision.kind)),
     fields([["Operador", operation.executor || decision.operator], ["Fecha", when(operation.at || decision.at)],
+      ["Origen", decision.origin], ["Revisión esperada", decision.expected_revision],
       ["Modelo", "No aplica"], ["SHA", sha(operation.sha)], ["Estado resultante", label(states, resultingState)],
       ["Motivo del bloqueo", decision.reason], ["Feedback", decision.evidence || operation.explanation?.reason],
       ["Decisión", decision.result || decision.outcome || label(decisionNames, decision.kind)],
@@ -787,6 +821,12 @@ function operationCard(operation, resultingState) {
     decision.timeout_seconds ? fields([["Plazo anterior", decision.previous_timeout_seconds + " s"],
       ["Plazo autorizado", decision.timeout_seconds + " s"], ["Referencia de copia", decision.workspace]]) : null,
     decision.paths?.length ? textList(decision.paths) : null,
+    decision.question ? fields([["Pregunta", decision.question], ["Intento", decision.question_attempt],
+      ["Respuesta", decision.answer]]) : null,
+    decision.recovery_limit == null ? null : fields([["Recuperaciones añadidas", decision.recoveries],
+      ["Nuevo límite", decision.recovery_limit]]),
+    decision.previous_candidate ? fields([["Candidato anterior", sha(decision.previous_candidate)],
+      ["Base anterior", sha(decision.previous_base)], ["Base verificada", sha(decision.base)]]) : null,
   ]);
 }
 
@@ -919,6 +959,17 @@ function jobPage({ job, attempts, events, ci }) {
         ["Estado reanudado", label(states, receipt.state)], ["Estado observado", label(states, job.state)]]),
     ]), "panel") : null,
     interventionPanel(job, allAttempts.get(job.intervention.failed_attempt || job.last_attempt_id)),
+    section("Recuperaciones automáticas", [
+      fields([["Presupuesto utilizado", job.recovery?.used], ["Límite autorizado", job.recovery?.limit],
+        ["Construcciones de recuperación", job.recovery?.builds],
+        ["Próxima etapa automática", label(roles, job.recovery?.stage)],
+        ["Próximo intento", job.recovery?.next_at ? when(job.recovery.next_at) : null]]),
+      job.recovery?.history?.length ? node("ol", job.recovery.history.map(item => node("li", [
+        node("strong", label(recoveryNames, item.action)),
+        fields([["Fecha", when(item.at)], ["Motivo", item.reason], ["Candidato", sha(item.candidate)],
+          ["Base", sha(item.base)]]), item.paths.length ? textList(item.paths) : null,
+      ]))) : null,
+    ], "panel"),
     !job.intervention.pending && submission ? section("Envío de decisión", actionPanel(job), "panel") : null,
     active ? section("Etapa activa", attemptCard(active, job, previousFor(active))) : null,
     repairPanel(job),
@@ -973,7 +1024,7 @@ function paint() {
 
 function replaceView(data) {
   const snapshot = JSON.stringify([data, actionContext, actionNotice, actionError, sending,
-    Boolean(submission), Boolean(credential), draft.kind, receipt]);
+    Boolean(submission), Boolean(credential), draft.kind, draft.options.role, receipt]);
   if (snapshot === lastView) return;
   const focused = document.activeElement;
   const key = main.contains(focused) && focused.matches(focusable) ? focusKey(focused) : null;

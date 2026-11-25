@@ -1030,6 +1030,7 @@ class Delivery(TemporaryTest):
         self.action_state = "completed"
         self.action_result = "failure"
         self.annotation = "FAIL: test_check_interrupted (tests.Checks) token ghp_secret123"
+        self.ci_logs = None
         self.prs[0]["head"].update(ref="masf/issue-1")
         self.prs[0]["head"]["repo"]["id"] = 123
         self.prs[0]["base"] = {"ref": "main", "repo": {"id": 123}}
@@ -1072,7 +1073,7 @@ class Delivery(TemporaryTest):
                 return [dict(message=self.annotation)]
             if endpoint.endswith("/logs"):
                 self.assertTrue(raw)
-                return "setup complete\n" + self.annotation
+                return self.ci_logs if self.ci_logs is not None else "setup complete\n" + self.annotation
             if "/issues/1" in endpoint:
                 return self.issue
             if endpoint == f"repos/{self.job['slug']}":
@@ -1399,6 +1400,43 @@ class Delivery(TemporaryTest):
         self.assertEqual(self.ci_job()["published_head"], pushed)
         self.assertEqual(self.ci_job()["state"], "pr_open")
         self.assertEqual(self.roles.count("build"), 2)
+
+    def test_ci_build_timings_and_passing_tests_do_not_hide_assertion(self):
+        self.open_ci_pr()
+        self.annotation = "Process completed with exit code 1."
+        self.ci_logs = "\n".join([
+            "test_failed_pr_lookup_does_not_stop_other_jobs ... org/repo: 403",
+            "test_ci_access_quota_and_configuration ... ok",
+            "test_retry_after_is_respected ... ok",
+            "#10 4.429 Preparing to unpack libgssapi-krb5...",
+            "#10 5.503 Unpacking libgssapi-krb5...",
+            "FAIL: test_check_interrupted (tests.test_process_recovery.ComposeProcessRecovery)",
+            "AssertionError: 'masf-check-old' == 'masf-check-old'",
+        ])
+        self.assertEqual(self.ci_tick(observe_only=True), 0)
+        routed = self.ci_job()
+        self.assertEqual(routed["state"], "building")
+        diagnostic = routed["ci_repair"]["diagnostics"][0]
+        self.assertEqual(diagnostic["kind"], "functional")
+        self.assertIn("AssertionError", diagnostic["evidence"])
+        self.assertNotIn("Preparing to unpack", diagnostic["evidence"])
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["state"], "pr_open")
+        self.assertNotEqual(self.ci_job()["candidate"], self.old_head)
+        self.assertEqual(len(self.prs), 1)
+
+    def test_ci_http_status_diagnostics(self):
+        from masf.ci import classify
+
+        for category, examples in [
+            ("quota", ["HTTP 429", "HTTP/2 429 Too Many Requests", "status code: 429", "Quota exceeded", "API rate limit exceeded"]),
+            ("access", ["HTTP 401", "gh: Forbidden (HTTP 403)", "response status: 403", "Bad credentials"]),
+            ("infrastructure", ["HTTP/1.1 503", "status=502", "response code: 504", "Connection reset"]),
+            ("unknown", ["4.429", "5.503", "org/repo: 403", "test_ci_access_quota_and_configuration ... ok", "test_rate_limit ... ok", "test_connection_reset ... ok"]),
+        ]:
+            for evidence in examples:
+                with self.subTest(evidence=evidence):
+                    self.assertEqual(classify({"conclusion": "failure"}, evidence), category)
 
     def test_ci_access_quota_and_configuration(self):
         from masf import cli

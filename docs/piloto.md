@@ -84,6 +84,12 @@ Desde I4 arranca el controlador con `"${control[@]}" up -d controller` en Docker
 
 Conserva en la instalación del operador la revisión de MASF, versiones de las CLIs ejecutadas, id del trabajo, SHA, URL del PR y el resultado de cada criterio. En una instalación operativa, deja `serve` activo con los repositorios autorizados. Si el operador solicitó únicamente un ensayo desechable, detén su instancia y deshabilita sus entradas de prueba al terminar.
 
+## Capturas optativas de proveedores
+
+Las pruebas locales de I3 usan respuestas simuladas. El operador puede ampliar las muestras con una cuenta autorizada y un repositorio desechable, usando un encargo público y reproducible para cada rol. Para cada captura, registra la salida de `--version`, el rol, el comando con sus opciones de formato, la revisión del repositorio de prueba y la procedencia de la ejecución. Guarda la salida original en la instalación del operador.
+
+Antes de versionar una captura, elimina credenciales, identificadores personales y contenido ajeno al caso de prueba. Anota las sustituciones en el catálogo y comprueba que la muestra depurada conserva la envoltura, los eventos y la respuesta necesarios para reproducir el resultado del adaptador. La validación completa entre cuentas se acredita mediante el flujo de este piloto. [Catálogo de muestras](../tests/fixtures/README.md).
+
 ## Evidencia de recuperación autónoma del 24 de noviembre de 2026
 
 En `yuloma/masf`, el candidato resuelto de #24 pasó checks y revisión real de Cursor antes de que la fábrica publicara el borrador [PR #30](https://github.com/yuloma/masf/pull/30). La recuperación autónoma posterior se entrega en el [PR #29](https://github.com/yuloma/masf/pull/29), que depende de #27.

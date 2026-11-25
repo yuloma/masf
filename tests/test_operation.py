@@ -1,12 +1,16 @@
 import json
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
+from masf import providers
 from masf.providers import parse
-from masf.system import TaskStopped, command
+from masf.recovery import RecoverableFailure
+from masf.system import CommandTimeout, ProcessError, TaskStopped, command
 
 
 class Commands(unittest.TestCase):
@@ -58,48 +62,164 @@ class Commands(unittest.TestCase):
                     command([sys.executable, "-c", "pass"], guard=stop, on_stdout_line=on_line)
                 launch.assert_not_called()
 
-    def test_stream_requires_completion(self):
-        payload = json.dumps({"version": 1, "summary": "Plan", "criteria": ["AC1"]})
-        message = json.dumps(
-            {
+
+class ProviderContracts(unittest.TestCase):
+    # Synthetic payloads and CLI envelopes for all roles.
+    role_fields = {
+        "plan": {"criteria": ["AC1 Draft the greeting"]},
+        "build": {"changes": ["AC1 Added the greeting"]},
+        "review": {"verdict": "pass", "findings": []},
+    }
+    formats = {
+        "codex": ("jsonl",),
+        "cursor": ("stream-json", "json"),
+        "claude": ("result", "structured_output"),
+    }
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.workspace = Path(directory.name) / "code"
+        self.workspace.mkdir()
+
+    def envelope(self, output_format, payload):
+        if output_format == "jsonl":
+            message = {
                 "type": "item.completed",
                 "item": {"type": "agent_message", "text": payload},
             }
-        )
-        with self.assertRaisesRegex(ValueError, "incompleto"):
-            parse("codex", "plan", message)
-        self.assertEqual(
-            parse("codex", "plan", message + '\n{"type":"turn.completed"}')[0][
-                "criteria"
-            ],
-            ["AC1"],
-        )
+            completed = {"type": "turn.completed", "usage": {"output_tokens": 10}}
+            return "\n".join(map(json.dumps, (message, completed)))
+        result = {"type": "result", "subtype": "success", "result": payload}
+        if output_format == "stream-json":
+            return '{"type":"system","subtype":"init"}\n' + json.dumps(result)
+        if output_format == "structured_output":
+            result = {**result, "result": "Complete", "structured_output": payload}
+        return json.dumps(result)
 
-    def test_valid_results_all_roles_and_providers(self):
-        for role, extra in [
-            ("plan", {"criteria": ["AC1"]}),
-            ("build", {"changes": ["AC1"]}),
-            ("review", {"verdict": "pass", "findings": []}),
-        ]:
-            result = {"version": 1, "summary": "ok", **extra}
-            for provider in ("codex", "cursor", "claude"):
-                if provider == "codex":
-                    output = (
-                        json.dumps(
-                            {
-                                "type": "item.completed",
-                                "item": {
-                                    "type": "agent_message",
-                                    "text": json.dumps(result),
-                                },
-                            }
-                        )
-                        + '\n{"type":"turn.completed"}'
-                    )
-                else:
-                    output = json.dumps({"result": json.dumps(result)})
-                with self.subTest(role=role, provider=provider):
-                    self.assertEqual(parse(provider, role, output)[0], result)
+    def run_adapter(self, provider, role, output, *, error=None):
+        job = {"repo": {"routing": {role: provider}, "runner_image": "runner"}}
+        cfg = {
+            "providers": {provider: {"executable": provider}},
+            "service": {"step_timeout_seconds": 10},
+        }
+        activity = []
+
+        def simulate_command(args, *, on_stdout_line=None, **kwargs):
+            if args[-1] == "--version":
+                return "synthetic version"
+            if args[:3] == ["docker", "rm", "-f"]:
+                return ""
+            if isinstance(output, Exception):
+                raise output
+            if on_stdout_line:
+                for line in output.splitlines():
+                    on_stdout_line(line)
+            return output
+
+        with patch.object(providers, "command", side_effect=simulate_command) as run:
+            args = (role, job, cfg, self.workspace, {}, "test-owner")
+            if error is None:
+                result = providers.invoke(*args, on_activity=activity.append)
+            else:
+                with self.assertRaises(error) as caught:
+                    providers.invoke(*args, on_activity=activity.append)
+                result = caught.exception
+        version, execution, cleanup = run.call_args_list
+        self.assertEqual(version.args[0][-2:], [provider, "--version"])
+        self.assertEqual(activity[0]["event"], "cli_version")
+        self.assertEqual(execution.kwargs["timeout"], 10)
+        args = execution.args[0]
+        name = args[args.index("--name") + 1]
+        self.assertEqual(cleanup.args[0], ["docker", "rm", "-f", name])
+        return result
+
+    def test_success_and_alternative_role_results_in_each_format(self):
+        alternatives = {
+            "plan": {"question": "Which greeting should be used?"},
+            "review": {
+                "verdict": "changes_requested",
+                "findings": ["AC1 The greeting is missing."],
+            },
+        }
+        for provider, formats in self.formats.items():
+            for output_format in formats:
+                for role, fields in self.role_fields.items():
+                    cases = [fields]
+                    if role in alternatives:
+                        cases.append(alternatives[role])
+                    for extra in cases:
+                        with self.subTest(provider=provider, format=output_format, role=role, fields=extra):
+                            expected = {"version": 1, "summary": "Example", **extra}
+                            payload = expected if output_format == "structured_output" else json.dumps(expected)
+                            actual = self.run_adapter(provider, role, self.envelope(output_format, payload))
+                            self.assertEqual(actual["result"], expected)
+                            self.assertEqual(actual["provider"], provider)
+                            self.assertEqual(actual["version"], "synthetic version")
+                            if provider == "codex":
+                                self.assertEqual(actual["usage"], {"output_tokens": 10})
+
+    def invalid_cases(self, output_format, role, valid):
+        def wrap(value):
+            payload = value if output_format == "structured_output" else json.dumps(value)
+            return self.envelope(output_format, payload)
+
+        output = wrap(valid)
+        yield "malformed envelope", "not JSON"
+        yield "non-object envelope", "[]"
+        yield "malformed payload", self.envelope(output_format, "not JSON")
+        yield "truncated JSON", output[:-1]
+        if output_format in ("jsonl", "stream-json"):
+            yield "missing terminal event", output.rsplit("\n", 1)[0]
+        for field in valid:
+            omitted = {key: value for key, value in valid.items() if key != field}
+            yield f"missing {field}", wrap(omitted)
+            yield f"invalid {field} type", wrap({**valid, field: {"unexpected": True}})
+        for version in (True, 1.0):
+            yield f"invalid version {version!r}", wrap({**valid, "version": version})
+        if role == "plan":
+            yield "invalid question type", wrap({
+                "version": 1, "summary": "Example", "question": ["Not a string"]
+            })
+        if role == "review":
+            yield "missing requested changes", wrap({**valid, "verdict": "changes_requested"})
+
+    def test_invalid_and_truncated_output_for_every_provider_and_role(self):
+        for provider, formats in self.formats.items():
+            for output_format in formats:
+                for role, extra in self.role_fields.items():
+                    valid = {"version": 1, "summary": "Example", **extra}
+                    for failure, wire in self.invalid_cases(output_format, role, valid):
+                        with self.subTest(provider=provider, format=output_format, role=role, failure=failure):
+                            caught = self.run_adapter(provider, role, wire, error=RecoverableFailure)
+                            self.assertEqual(str(caught), f"{provider}: salida inválida o incompleta")
+
+    def test_process_failures_and_timeouts_for_every_provider_and_role(self):
+        for provider in self.formats:
+            for role in self.role_fields:
+                for error in (ProcessError("docker (2): process failed"),
+                              CommandTimeout("docker: tiempo agotado (10s)")):
+                    with self.subTest(provider=provider, role=role, error=type(error).__name__):
+                        caught = self.run_adapter(provider, role, error, error=type(error))
+                        self.assertIs(caught, error)
+
+    def test_cli_error_envelopes_report_failure(self):
+        for provider, event in (
+            ("codex", {"type": "turn.failed", "message": "CLI failed"}),
+            ("cursor", {"type": "result", "is_error": True, "result": "CLI failed"}),
+            ("claude", {"type": "result", "subtype": "error", "result": "CLI failed"}),
+        ):
+            with self.subTest(provider=provider), self.assertRaisesRegex(RuntimeError, "CLI failed"):
+                parse(provider, "plan", json.dumps(event))
+
+    def test_cursor_stream_rejects_nonterminal_and_duplicate_results(self):
+        payload = json.dumps({"version": 1, "summary": "Example", **self.role_fields["plan"]})
+        output = self.envelope("stream-json", payload)
+        progress, result = output.splitlines()
+        for invalid in (output + "\n" + progress, output + "\n" + result,
+                        output + "\n[]", result.replace('"type": "result"', '"type": "assistant"')):
+            with self.subTest(output=invalid), self.assertRaises(ValueError):
+                parse("cursor", "plan", invalid)
 
 
 class GitHubLimits(unittest.TestCase):
@@ -110,8 +230,6 @@ class GitHubLimits(unittest.TestCase):
 
     def test_retry_after_is_respected(self):
         from masf import queue
-        from masf.system import ProcessError
-
         error = ProcessError(
             "429", "HTTP/2.0 429 Too Many Requests\nRetry-After: 120\n\n{}", "HTTP 429"
         )
@@ -181,13 +299,20 @@ class Monitoring(unittest.TestCase):
 
 class CursorOutput(unittest.TestCase):
     def test_progress_and_final_object_from_real_cli(self):
-        from pathlib import Path
-
         fixture = Path(__file__).parent / "fixtures/cursor-2026.11.11-b912975.json"
-        result, meta = parse("cursor", "plan", fixture.read_text())
-        self.assertEqual(result["version"], 1)
-        self.assertEqual(len(result["criteria"]), 1)
-        self.assertIn("usage", meta)
+        output = fixture.read_text(encoding="utf-8")
+        capture = json.loads(output)
+        self.assertEqual(capture["cli_version"], "2026.11.11-b912975")
+        self.assertEqual(capture["session_id"], "fixture")
+        self.assertEqual(capture["request_id"], "fixture")
+        self.assertTrue(capture["result"].startswith("I'll inspect"))
+        result, meta = parse("cursor", "plan", output)
+        self.assertEqual(result, {
+            "version": 1,
+            "summary": "Comprobar en README.md que MASF se presenta como Multi Agent Software Factory.",
+            "criteria": ["AC1 README.md declara que MASF corresponde a Multi Agent Software Factory"],
+        })
+        self.assertEqual(meta["usage"], capture["usage"])
 
     def test_rejects_truncated_or_nonterminal_object(self):
         for payload in ('Progress {"version":1', 'Progress {"version":1} extra'):
@@ -196,25 +321,6 @@ class CursorOutput(unittest.TestCase):
 
 
 class ProviderActivity(unittest.TestCase):
-    def test_stream_result_and_incomplete_stream(self):
-        result = {
-            "version": 1,
-            "summary": "Reviewed",
-            "verdict": "pass",
-            "findings": [],
-        }
-        events = [
-            {"type": "system", "subtype": "init"},
-            {"type": "assistant", "message": {"content": []}},
-            {"type": "result", "subtype": "success", "result": json.dumps(result)},
-        ]
-        self.assertEqual(
-            parse("cursor", "review", "\n".join(json.dumps(e) for e in events))[0],
-            result,
-        )
-        with self.assertRaisesRegex(ValueError, "incompleto"):
-            parse("cursor", "review", "\n".join(json.dumps(e) for e in events[:-1]))
-
     def test_progress_survives_timeout(self):
         lines = []
         with self.assertRaisesRegex(RuntimeError, "tiempo agotado"):
@@ -247,10 +353,6 @@ class ProviderActivity(unittest.TestCase):
 
 class CursorReviewPermissions(unittest.TestCase):
     def test_review_is_noninteractive_with_readonly_code_and_readable_diff(self):
-        import tempfile
-        from pathlib import Path
-        from masf import providers
-
         diff = "diff --git a/file b/file\n+print(42)\n"
         seen = {}
 

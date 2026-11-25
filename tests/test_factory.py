@@ -12,7 +12,7 @@ from unittest.mock import patch
 from urllib.parse import quote
 
 from masf import config, providers, queue, worker
-from masf.system import command
+from masf.system import ProcessError, command
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "examples/factory.toml"
@@ -248,40 +248,6 @@ class Discovery(TemporaryTest):
             config.load(file)
 
 
-class Contracts(unittest.TestCase):
-    def test_three_formats(self):
-        result = dict(version=1, summary="ok", verdict="pass", findings=[])
-        examples = {
-            "cursor": {"result": json.dumps(result)},
-            "claude": {"structured_output": result},
-            "codex": {
-                "type": "item.completed",
-                "item": {"type": "agent_message", "text": json.dumps(result)},
-            },
-        }
-        for name, example in examples.items():
-            with self.subTest(name=name):
-                self.assertEqual(
-                    providers.parse(
-                        name,
-                        "review",
-                        json.dumps(example)
-                        + ('\n{"type":"turn.completed"}' if name == "codex" else ""),
-                    )[0],
-                    result,
-                )
-                with self.assertRaises(ValueError):
-                    providers.parse(name, "build", json.dumps(example))
-                with self.assertRaises(ValueError):
-                    providers.parse(name, "plan", "{")
-                with self.assertRaises(RuntimeError):
-                    providers.parse(
-                        name,
-                        "plan",
-                        json.dumps({"type": "turn.failed", "is_error": True}),
-                    )
-
-
 class Delivery(TemporaryTest):
     def setUp(self):
         super().setUp()
@@ -304,6 +270,7 @@ class Delivery(TemporaryTest):
         )
         self.base = command(["git", "rev-parse", "HEAD"], cwd=self.source)
         db = queue.connect(self.root / "state")
+        self.addCleanup(db.close)
         self.job = dict(
             slug=self.repo["slug"],
             repo_id=123,
@@ -411,6 +378,73 @@ class Delivery(TemporaryTest):
         self.worker.process()
         self.assertEqual(self.roles.count("build"), 2)
         self.assertEqual(self.job["review"]["sha"], self.prs[0]["head"]["sha"])
+
+    def test_distinct_providers_exchange_persisted_plan_and_checked_diff(self):
+        remote = self.root / "remote.git"
+        command(["git", "clone", "--bare", str(self.source), str(remote)])
+        self.worker.url = str(remote)
+        self.repo["routing"].update(plan="claude", build="codex", review="cursor")
+        plan = {"version": 1, "summary": "Add a greeting", "criteria": ["AC1 Say hello"]}
+        check_argv = [
+            sys.executable, "-c",
+            "from pathlib import Path; print(Path('greeting').read_text().strip())",
+        ]
+        checked = {}
+        reviewed = []
+
+        def plan_with_claude(workspace, inputs):
+            self.assertEqual(inputs["sha"], self.base)
+            return plan
+
+        def build_with_codex(workspace, inputs):
+            self.assertEqual(inputs["plan"], plan)
+            (workspace / "greeting").write_text("Hello\n")
+            return {"version": 1, "summary": "Added greeting", "changes": ["AC1 Say hello"]}
+
+        def review_with_cursor(workspace, inputs):
+            stored = json.loads(self.worker.db.execute("SELECT data FROM jobs").fetchone()[0])
+            sha = inputs["sha"]
+            self.assertNotEqual(sha, self.base)
+            self.assertEqual(sha, stored["candidate"])
+            self.assertEqual(inputs["plan"], stored["plan"])
+            self.assertEqual(inputs["plan"], plan)
+            self.assertEqual(inputs["checks"], checked[sha])
+            self.assertEqual(inputs["checks"], stored["checks"])
+            self.assertEqual(inputs["checks"]["sha"], sha)
+            self.assertEqual((workspace / "greeting").read_text(), "Hello\n")
+            reviewed.append(inputs)
+            return {"version": 1, "summary": "Reviewed", "verdict": "pass", "findings": []}
+
+        adapters = {"claude": plan_with_claude, "codex": build_with_codex, "cursor": review_with_cursor}
+
+        def invoke(role, job, cfg, workspace, inputs, owner, **kwargs):
+            provider = job["repo"]["routing"][role]
+            return {"provider": provider, "result": adapters[provider](workspace, inputs)}
+
+        def check(sha):
+            if sha == self.base:
+                return self.check(sha)
+            self.assertNotIn(sha, checked)
+            workspace = self.worker.checkout(sha)
+            log = command(check_argv, cwd=workspace)
+            self.assertEqual(log, "Hello")
+            report = {"sha": sha, "passed": True, "commands": [
+                {"argv": check_argv, "code": 0, "log": log},
+            ]}
+            checked[sha] = report
+            return report
+
+        with patch.object(worker.providers, "invoke", invoke), patch.object(self.worker, "test", check):
+            self.worker.process()
+        (review,) = reviewed
+        sha = self.prs[0]["head"]["sha"]
+        self.assertEqual(self.job["state"], "pr_open")
+        self.assertEqual(review["sha"], sha)
+        self.assertEqual(self.job["review"]["provider"], "cursor")
+        self.assertEqual(review["diff"], command(
+            ["git", "--git-dir", str(remote), "diff", self.base, sha]
+        ))
+        self.assertIn("+Hello", review["diff"])
 
     def test_protected(self):
         self.changed = ".github/workflows/new.yml"
@@ -799,10 +833,11 @@ class Delivery(TemporaryTest):
     def run_controller(self):
         from masf import cli
 
+        previous = self.worker
+
         def create(db, cfg, config, state, jobs, job):
             self.job = job
-            previous = self.worker
-            self.worker = worker.Worker(previous.db, cfg, config, state, jobs, job)
+            self.worker = worker.Worker(db, cfg, config, state, jobs, job)
             self.worker.url = str(self.source)
             self.worker.test = previous.test
             self.worker.recover = previous.recover
@@ -810,10 +845,12 @@ class Delivery(TemporaryTest):
 
         due = max(time.time(), self.job.get("recovery_wait", {}).get("until", 0)) + 1
         with (
+            patch.dict("os.environ", {"MASF_JOBS_DIR": str(self.root / "jobs")}),
             patch.object(cli, "Worker", side_effect=create),
             patch("masf.cli.time.time", return_value=due),
         ):
             result = cli.process_task(self.cfg, CONFIG, self.root / "state", self.job)
+        self.worker.db = previous.db
         self.job = json.loads(
             self.worker.db.execute("SELECT data FROM jobs").fetchone()[0]
         )
@@ -871,6 +908,93 @@ class Delivery(TemporaryTest):
         self.assertEqual(self.job["candidate"], sha)
         self.assertEqual(self.job["checks"], checks)
         self.assertEqual(self.roles.count("build"), 1)
+
+    def test_build_access_failure_keeps_job_and_workspace_for_operator_resume(self):
+        from masf.cli import resume
+
+        self.repo["routing"]["build"] = "claude"
+        self.worker.update("queued")
+        workspaces = []
+
+        def agent(role, job, cfg, workspace, inputs, owner, **kwargs):
+            if role == "build":
+                workspaces.append(workspace)
+                partial = workspace / "partial"
+                if len(workspaces) == 1:
+                    partial.write_text("keep")
+                    raise ProcessError("HTTP 401 Unauthorized, token=synthetic-value")
+                self.assertEqual(partial.read_text(), "keep")
+                self.assertTrue(inputs["recovery"]["workspace_reused"])
+                self.assertEqual(inputs["recovery"]["previous_error"], cause)
+            return self.agent(role, job, cfg, workspace, inputs, owner, **kwargs)
+
+        cause = "HTTP 401 Unauthorized, token=[redacted]"
+        identity = (self.job["repo_id"], self.job["number"], self.job["fingerprint"])
+        with patch.object(worker.providers, "invoke", agent):
+            self.assertEqual(self.run_controller(), 1)
+            with closing(queue.connect(self.root / "state")) as db:
+                blocked = json.loads(db.execute("SELECT data FROM jobs").fetchone()[0])
+                self.assertEqual((blocked["repo_id"], blocked["number"], blocked["fingerprint"]), identity)
+                self.assertEqual(blocked["state"], "blocked")
+                self.assertEqual(blocked["retry"], "building")
+                self.assertEqual(blocked["reason"], cause)
+                self.assertEqual(blocked["build_workspace"]["error"], cause)
+                self.assertEqual(blocked["build_workspace"]["path"], str(workspaces[0]))
+                (evidence,) = self.worker.evidence.glob("build-*.json")
+                details = json.loads(evidence.read_text())
+                self.assertEqual(details["provider"], blocked["repo"]["routing"]["build"])
+                self.assertEqual(details["provider"], "claude")
+                self.assertEqual(details["error"], cause)
+                self.assertEqual(details["role"], "build")
+                with patch("masf.cli.api", self.api):
+                    resume(db, self.cfg, f"{blocked['slug']}#{blocked['number']}")
+            self.assertEqual(self.run_controller(), 0)
+        self.assertEqual(workspaces, [workspaces[0], workspaces[0]])
+        self.assertEqual((self.job["repo_id"], self.job["number"], self.job["fingerprint"]), identity)
+        self.assertEqual(self.job["state"], "pr_open")
+        self.assertEqual(self.roles, ["plan", "build", "review"])
+
+    def test_review_quota_failure_keeps_job_candidate_and_checks_for_retry(self):
+        self.repo["routing"]["review"] = "cursor"
+        reviews = []
+
+        def agent(role, job, cfg, workspace, inputs, owner, **kwargs):
+            if role == "review":
+                reviews.append(inputs)
+                if len(reviews) == 1:
+                    raise ProcessError("HTTP 429 quota exhausted, api_key=synthetic-value")
+            return self.agent(role, job, cfg, workspace, inputs, owner, **kwargs)
+
+        cause = "HTTP 429 quota exhausted, api_key=[redacted]"
+        identity = (self.job["repo_id"], self.job["number"], self.job["fingerprint"])
+        with (
+            patch.object(worker.providers, "invoke", agent),
+            patch.object(self.worker, "test", wraps=self.check) as check,
+        ):
+            self.assertEqual(self.run_controller(), 1)
+            with closing(queue.connect(self.root / "state")) as db:
+                waiting = json.loads(db.execute("SELECT data FROM jobs").fetchone()[0])
+            self.assertEqual((waiting["repo_id"], waiting["number"], waiting["fingerprint"]), identity)
+            self.assertEqual(waiting["state"], "retry_wait")
+            self.assertEqual(waiting["recovery_wait"]["stage"], "reviewing")
+            self.assertEqual(waiting["reason"], cause)
+            self.assertEqual(waiting["recoveries"][-1]["reason"], cause)
+            (evidence,) = self.worker.evidence.glob("review-*.json")
+            details = json.loads(evidence.read_text())
+            self.assertEqual(details["provider"], waiting["repo"]["routing"]["review"])
+            self.assertEqual(details["provider"], "cursor")
+            self.assertEqual(details["error"], cause)
+            self.assertEqual(details["role"], "review")
+            self.assertEqual(details["sha"], waiting["candidate"])
+            self.assertEqual(waiting["checks"], reviews[0]["checks"])
+            self.assertEqual(self.run_controller(), 0)
+            self.assertEqual([call.args[0] for call in check.call_args_list], [self.base, waiting["candidate"]])
+        self.assertEqual((self.job["repo_id"], self.job["number"], self.job["fingerprint"]), identity)
+        self.assertEqual(self.job["state"], "pr_open")
+        self.assertEqual(self.job["candidate"], waiting["candidate"])
+        self.assertEqual(self.job["checks"], waiting["checks"])
+        self.assertEqual(reviews, [reviews[0], reviews[0]])
+        self.assertEqual(self.roles, ["plan", "build", "review"])
 
     def test_repeated_timeout_stops_at_durable_budget(self):
         from masf.system import CommandTimeout
@@ -1511,27 +1635,3 @@ class Leases(TemporaryTest):
         self.assertEqual(queue.renew(db, job, "second", 90), 1)
         with self.assertRaisesRegex(RuntimeError, "reserva"):
             queue.save(db, job | {"attempt": "first"}, "publishing")
-
-
-class ProviderFailure(TemporaryTest):
-    def test_process_failure_and_timeout(self):
-        for provider in ("codex", "cursor", "claude"):
-            self.repo["routing"]["plan"] = provider
-            for failure in ("tiempo agotado", "fallo del proceso"):
-                with self.subTest(provider=provider, failure=failure):
-                    with patch(
-                        "masf.providers.command",
-                        side_effect=["cli 1.0", RuntimeError(failure), ""],
-                    ) as run:
-                        with self.assertRaisesRegex(RuntimeError, failure):
-                            providers.invoke(
-                                "plan",
-                                {"repo": self.repo},
-                                self.cfg,
-                                self.root,
-                                {},
-                                "test-owner",
-                            )
-                        self.assertEqual(
-                            run.call_args.args[0][:3], ["docker", "rm", "-f"]
-                        )

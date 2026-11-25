@@ -150,6 +150,36 @@ La regresión de Cursor usa una muestra de la CLI `2026.11.11-b912975`, sin cred
 
 La entrada de procesos usa un archivo temporal privado para conservar prompts grandes mientras se consulta el plazo o la elegibilidad. Una regresión con un lector lento verifica el contenido completo en Python 3.11 y versiones posteriores.
 
+### Recuperación tras terminar el controlador
+
+Desde la raíz del repositorio, con las dependencias de MASF instaladas, ejecuta:
+
+```bash
+python3 -m unittest tests.test_process_recovery.ProcessRecovery -v
+```
+
+Los cinco casos arrancan la CLI con `run --once`, un remoto Git temporal, un servidor HTTP de GitHub en loopback y un proveedor de prueba. Ejecutan un check de prueba en la copia local de cada SHA y funcionan sin Docker, credenciales ni cuentas de IA. El proceso recibe `SIGKILL` tras confirmar la reserva, el push o la creación del PR en el simulador. El harness verifica que la reserva vigente impide otro intento y adelanta su vencimiento en SQLite para que la CLI la reclame sin esperar 90 segundos.
+
+Los casos de publicación repiten el escenario con la base estable y con un avance de `main`. Si solo se subió la rama y la base avanzó, el reemplazo verifica la nueva base y el nuevo candidato y vuelve a revisar el candidato antes de crear el PR. Si ya se creó el PR, recupera su número y su SHA originales. Los registros de roles y checks comprueban la reutilización de la evidencia vigente. Las regresiones con excepciones simuladas siguen formando parte de la suite.
+
+Para interrumpir un check real dentro de Compose, usa un Docker Engine local con el plugin Compose y la imagen `masf-runner:pilot` ya disponible. La CI ejecuta el caso en el paso de pruebas con Docker tras construir esa imagen:
+
+```bash
+MASF_TEST_ENGINE=1 python3 -m unittest tests.test_process_recovery.ComposeProcessRecovery -v
+```
+
+Si el Engine ha agotado sus pools automáticos, el harness acepta las mismas variables de subred que el smoke. El proyecto de control usa `MASF_SMOKE_BASE_SUBNET` y los checks usan `MASF_SMOKE_CANDIDATE_SUBNET`; la recuperación debe retirar el check anterior antes de reutilizar su subred. Ambas subredes deben estar libres.
+
+```bash
+MASF_SMOKE_BASE_SUBNET=10.253.248.0/28 MASF_SMOKE_CANDIDATE_SUBNET=10.253.248.16/28 MASF_TEST_ENGINE=1 python3 -m unittest tests.test_process_recovery.ComposeProcessRecovery -v
+```
+
+El caso Compose espera una señal escrita por el check dentro del contenedor antes de matar el controlador. Después cambia el volumen declarado en el perfil del operador. El reemplazo retira el proyecto anterior con el manifiesto congelado, completa el check en un proyecto nuevo y retira sus recursos y su journal. La espera del reemplazo exige la señal de un checkout asociado a un journal distinto. La señal anterior permanece en su checkout tras la caída. Un proyecto Compose de control conserva su contenedor, su red y el dato guardado en su volumen durante y después de la recuperación.
+
+**Resultado local del 25 de noviembre de 2026 con Python 3.14.4.** Tras integrar la base vigente, `python3 -m unittest discover -v` descubrió 115 pruebas. Pasaron 105, incluidos los cinco casos de recuperación con `SIGKILL` sin Engine, y se omitieron 10 por requerir Docker Engine. El proveedor simulado acepta el callback de actividad del motor actual, el servidor simula también la observación de PR y CI, y la sustitución de la reserva se contrasta con los tokens conservados en los eventos.
+
+**Resultado con Engine del 25 de noviembre de 2026.** `ComposeProcessRecovery.test_check_interrupted` pasó con Docker Engine local en 45,35 segundos y las dos subredes explícitas del ejemplo. Se verificaron el SIGKILL del controlador durante el check, la retirada mediante el manifiesto congelado, una sola ejecución de reemplazo, la conservación del plan y la construcción, un único PR con checks y revisión del mismo SHA, la limpieza final y la identidad y el dato del proyecto de control. La espera del reemplazo excluye el journal y la señal que dejó el proceso terminado. Estos ensayos utilizan proveedores y GitHub simulados.
+
 La aceptación de I2 incluye autorizar con `resume --allow-protected-path RUTA` un archivo exacto de un trabajo bloqueado. La regresión debe conservar el candidato y las rondas, rechazar comodines y rutas no canónicas, mantener la comprobación de otros archivos e invalidar el permiso si cambia la huella de la issue.
 
 La aceptación de recuperación de I2 incluye una construcción interrumpida tras escribir archivos. La reanudación debe reutilizar la copia registrada del mismo SHA y alcance, conservar el plan, contar el siguiente intento y pasar después por checks y revisión. `resume --reuse-workspace RUTA` permite recuperar una copia histórica del propio trabajo y rechaza rutas de otro trabajo o del almacén Git.

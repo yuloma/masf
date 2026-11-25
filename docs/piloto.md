@@ -104,3 +104,9 @@ El ensayo real está pendiente de una ejecución autorizada en la instalación d
 4. Registra el resultado de checks y revisión del mismo SHA, el head esperado del push y el nuevo head del PR #23. Comprueba que el número del PR se conserva y registra el ID, intento, SHA y conclusión de su nuevo CI. Conserva el PR abierto para la decisión de integración.
 
 La suite local simula GitHub y el proveedor y usa un remoto Git temporal. El historial de esa prueba y el de campo se guardan en las instalaciones donde se ejecuten.
+
+## Intervención operativa del 25 de noviembre de 2026
+
+El trabajo #10 aceptó el head `d8cda48a51ee46eb285ac866e8b58d4ad89415db` del PR #23 y una ronda adicional. Codex `0.167.1` produjo el candidato `e1507b2efd73307e6cba93c96508314931d6bc5b`, que distingue el journal nuevo del conservado tras SIGKILL. Cursor `2026.11.22-e9042b2` pidió cambios porque la evidencia local omitía Engine y la documentación dejaba esa ejecución pendiente. El trabajo agotó sus tres rondas y quedó en `needs_input`.
+
+La intervención posterior integró la base vigente y actualizó el harness al contrato actual de actividad, observación y reservas. La suite de 115 pruebas pasó con diez omisiones optativas de Engine. La recuperación con Compose se ejecutó por separado con Engine local y subredes explícitas y pasó, comprobando la conservación del proyecto de control y la limpieza de los recursos del trabajo. La [aceptación](implementacion.md) registra el comando y el resultado observado. Esta evidencia adicional procede de remotos temporales, GitHub simulado y un proveedor de prueba; el historial de la instalación conserva por separado las invocaciones reales de Codex y Cursor.

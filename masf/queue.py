@@ -2,6 +2,7 @@ import hashlib
 import json
 import sqlite3
 import sys
+import threading
 import time
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote
@@ -10,6 +11,7 @@ from .system import ProcessError, TaskStopped, command
 
 
 _retry_at = 0
+_rate_lock = threading.Lock()
 
 
 def retry_delay():
@@ -29,8 +31,33 @@ def response_body(output):
     return headers, output
 
 
-def api(endpoint, *opts, raw=False):
+def http_status(exc):
+    if isinstance(exc, ProcessError):
+        first = exc.stdout.partition("\n")[0].split()
+        if len(first) > 1 and first[0].startswith("HTTP/") and first[1].isdigit():
+            return int(first[1])
+    return None
+
+
+def set_retry(headers, *, limited=False):
     global _retry_at
+    if not (limited or "retry-after" in headers or headers.get("x-ratelimit-remaining") == "0"):
+        return
+    try:
+        if "retry-after" in headers:
+            try:
+                wait = float(headers["retry-after"])
+            except ValueError:
+                wait = parsedate_to_datetime(headers["retry-after"]).timestamp() - time.time()
+        else:
+            wait = float(headers.get("x-ratelimit-reset", time.time() + 60)) - time.time()
+    except (ValueError, TypeError, OverflowError):
+        wait = 60
+    with _rate_lock:
+        _retry_at = max(_retry_at, time.monotonic() + max(1, wait))
+
+
+def api(endpoint, *opts, raw=False, with_headers=False):
     if retry_delay():
         raise RuntimeError(
             f"GitHub: límite de peticiones, esperar {retry_delay():.0f}s"
@@ -39,26 +66,38 @@ def api(endpoint, *opts, raw=False):
         output = command(["gh", "api", "--include", endpoint, *opts])
     except ProcessError as exc:
         headers, _ = response_body(exc.stdout)
-        if (
-            headers.get("x-ratelimit-remaining") == "0"
-            or "retry-after" in headers
+        limited = (
+            http_status(exc) == 429
             or "HTTP 429" in exc.stderr
-        ):
-            wait = 60
-            if "retry-after" in headers:
-                try:
-                    wait = float(headers["retry-after"])
-                except ValueError:
-                    wait = (
-                        parsedate_to_datetime(headers["retry-after"]).timestamp()
-                        - time.time()
-                    )
-            elif "x-ratelimit-reset" in headers:
-                wait = float(headers["x-ratelimit-reset"]) - time.time()
-            _retry_at = time.monotonic() + max(1, wait)
+            or "secondary rate limit" in (exc.stdout + exc.stderr).lower()
+            or "rate limit exceeded" in (exc.stdout + exc.stderr).lower()
+        )
+        set_retry(headers, limited=limited)
         raise
-    _, body = response_body(output)
-    return body if raw else json.loads(body)
+    headers, body = response_body(output)
+    set_retry(headers)
+    result = body if raw else json.loads(body)
+    return (headers, result) if with_headers else result
+
+
+def pages(request, endpoint, key=None):
+    separator = "&" if "?" in endpoint else "?"
+    page = 1
+    while True:
+        headers, result = request(
+            f"{endpoint}{separator}per_page=100&page={page}", with_headers=True,
+        )
+        items = result[key] if key else result
+        if not isinstance(items, list):
+            raise ValueError("Página de GitHub inválida")
+        yield from items
+        links = headers.get("link")
+        has_next = 'rel="next"' in links if links is not None else len(items) == 100
+        if not has_next:
+            if key and result.get("total_count", 0) > (page - 1) * 100 + len(items):
+                raise RuntimeError("GitHub devolvió un listado incompleto")
+            return
+        page += 1
 
 
 def eligible(issue, repo):
@@ -92,6 +131,25 @@ def connect(root):
     db.execute("""CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY, at TEXT DEFAULT CURRENT_TIMESTAMP, repo_id INTEGER,
         number INTEGER, attempt TEXT, state TEXT, detail TEXT)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS pull_requests (
+        repo_id INTEGER, number INTEGER, slug TEXT, state TEXT, sha TEXT, data TEXT,
+        PRIMARY KEY(repo_id, number))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS pull_ci (
+        repo_id INTEGER, number INTEGER, sha TEXT, data TEXT,
+        PRIMARY KEY(repo_id, number, sha))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS pull_events (
+        id INTEGER PRIMARY KEY, at TEXT DEFAULT CURRENT_TIMESTAMP, repo_id INTEGER,
+        number INTEGER, sha TEXT, kind TEXT, detail TEXT)""")
+    db.execute("""CREATE INDEX IF NOT EXISTS pull_events_lookup
+        ON pull_events(repo_id, number, sha, id)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS pull_sources (
+        slug TEXT PRIMARY KEY, error TEXT, changed_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS pull_source_events (
+        id INTEGER PRIMARY KEY, at TEXT DEFAULT CURRENT_TIMESTAMP, slug TEXT,
+        source TEXT, error TEXT)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS pull_links (
+        repo_id INTEGER, number INTEGER, job_number INTEGER,
+        PRIMARY KEY(repo_id, number), UNIQUE(repo_id, job_number))""")
     return db
 
 
@@ -141,7 +199,7 @@ def save_link(db, job, approval):
     print(f"{job['slug']}#{job['number']} pr_open", flush=True)
 
 
-def scan(cfg, db=None):
+def scan(cfg, db=None, *, repository_ids=None):
     errors = 0
     for repo in cfg["repositories"]:
         if not repo["enabled"]:
@@ -149,6 +207,8 @@ def scan(cfg, db=None):
         slug = repo["slug"]
         try:
             meta = api(f"repos/{slug}")
+            if repository_ids is not None:
+                repository_ids[slug] = meta["id"]
             branch = repo.get("base_branch") or meta["default_branch"]
             page = 1
             base = None
@@ -189,19 +249,22 @@ def scan(cfg, db=None):
                 if len(issues) < 100:
                     break
                 page += 1
-        except (RuntimeError, OSError) as exc:
+        except (RuntimeError, OSError, ValueError, TypeError, KeyError) as exc:
             print(f"{slug}: {exc}", file=sys.stderr, flush=True)
             errors += 1
+            if retry_delay():
+                break
     return errors
 
 
-def claim(db, job, token, ttl):
+def claim(db, job, token, ttl, limit=None):
     with db:
         result = db.execute(
-            """INSERT INTO leases VALUES(?,?,?,unixepoch()+?)
+            """INSERT INTO leases SELECT ?,?,?,unixepoch()+?
+            WHERE ? IS NULL OR (SELECT count(*) FROM leases WHERE expires>unixepoch()) < ?
             ON CONFLICT(repo_id, number) DO UPDATE SET token=excluded.token, expires=excluded.expires
             WHERE leases.expires<=unixepoch()""",
-            (job["repo_id"], job["number"], token, ttl),
+            (job["repo_id"], job["number"], token, ttl, limit, limit),
         )
         return bool(result.rowcount)
 

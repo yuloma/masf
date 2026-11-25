@@ -138,7 +138,7 @@ class Monitoring(unittest.TestCase):
                 patch("masf.cli.api", side_effect=RuntimeError("403")),
                 patch("masf.cli.process_task", return_value=0) as process,
             ):
-                self.assertEqual(cli.tick(db, cfg, root / "config.toml", root, True), 1)
+                self.assertEqual(cli.tick(db, cfg, root / "config.toml", root, True), 2)
                 process.assert_called_once()
             db.close()
 

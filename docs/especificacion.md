@@ -40,6 +40,33 @@ Cada intento de construcción cuenta como una ronda. Los fallos de infraestructu
 
 Antes de publicar se releen el estado, la etiqueta y la huella del encargo. Si el autor cambió el contenido, el trabajo pasa a `needs_input` para confirmar el alcance actualizado. Las reglas o instrucciones de proyecto aplicables, incluido un `AGENTS.md` existente, se ponen a disposición de los tres adaptadores. Las convenciones del proyecto orientan la implementación dentro de los permisos fijados por el operador.
 
+## Observación de PR y CI
+
+`serve` admite issues y recorre las páginas de PR abiertos de cada repositorio habilitado mientras los workers ejecutan agentes y checks locales. El intervalo sigue `service.poll_seconds` y se amplía si GitHub comunica una espera de cuota. Un fallo aislado permite seguir consultando otros PR o repositorios mientras haya cuota. Si un PR registrado desaparece de un listado completo, el controlador consulta su detalle. El trabajo publicado pasa a `closed` o `merged` cuando el detalle confirma el resultado.
+
+El vínculo con un trabajo se resuelve por la referencia ya registrada o por la marca de publicación contrastada con el repositorio, las ramas y el SHA. Los PR sin vínculo aparecen con `job: null`. El operador puede asociarlos a una issue ya registrada del mismo repositorio con `masf link-pr OWNER/REPO#PR OWNER/REPO#ISSUE`. Esta asociación es local y se puede repetir para la misma pareja. La referencia publicada del trabajo tiene prioridad.
+
+El controlador consulta check runs con todas sus ejecuciones y commit statuses por el SHA de `head`. Consulta también los workflows de Actions del mismo SHA y los jobs de cada intento disponible. Correlaciona jobs y checks por su ID y conserva la vinculación al workflow cuando coincide el ID de la suite. La protección de la rama base y las reglas aplicables aportan los nombres obligatorios y su aplicación de GitHub, cuando el acceso permite leerlos. Una ejecución pendiente, en cola o activa solo modifica la observación del CI. El SHA del candidato y las rondas del trabajo conservan la evidencia de construcción local.
+
+Un check con error puede aportar anotaciones, salida del check y un extracto del log del job. Antes de guardar los fragmentos se eliminan los escapes de terminal y se filtran los patrones de credenciales y los valores marcados con `::add-mask::` que aparezcan en el log. La referencia al log completo apunta al endpoint estable de GitHub, que exige el acceso correspondiente. Las denegaciones de acceso se registran por recurso y los diagnósticos pendientes vuelven a intentarse en sondeos posteriores de ese head mientras el PR siga abierto. Para integraciones externas se conserva el enlace comunicado por el check o commit status.
+
+### Formato de observación v1
+
+`status --pr OWNER/REPO#N` devuelve objetos JSON, uno por línea. `status` conserva las filas de trabajos y añade las observaciones en ese mismo formato. `logs --pr OWNER/REPO#N` consulta el historial y `--sha SHA` lo limita a una revisión. La versión de este formato es `version: 1` en la observación del PR. Las ampliaciones de trazabilidad, API e interfaz de #12, #15 y #16 pueden consumir las siguientes entidades locales.
+
+| Entidad | Clave y contenido |
+| --- | --- |
+| `pull_request` | `(repo_id, number)` identifica el PR de forma estable. `id` y `url` proceden de GitHub. `state` es `open`, `closed` o `merged`. `base` y `head` incluyen `repo_id`, `repo`, `ref` y `sha`. Incluye `draft`, `observed_at`, `job`, `provenance`, `errors` y el `ci` del head. |
+| `job` | Incluye `number` de issue, `candidate`, `rounds` y `method` con valor `registered`, `publication` u `operator`. `provenance` distingue `candidate`, `unknown`, `different_head` y `merge_from_base`. En el último caso se verifica la ascendencia con los padres del commit y se registran la rama base, el commit integrado y la fuente. |
+| `pull_evidence` | `(repo_id, number, sha)` identifica un snapshot `ci` con `checks`, `runs`, `required`, `base_ref` y `errors`. Los snapshots de SHA anteriores permanecen disponibles. |
+| `checks` | Mapa por origen e ID con prefijo `check:`, `status:` o `job:`. Cada valor tiene `status` de GitHub, `phase` normalizada, la conclusión, `current`, enlaces e identificadores de correlación. Si GitHub reutiliza un ID de check para otro intento conocido, se archiva el anterior con su job e intento en la clave. Los commit statuses anteriores del mismo contexto conservan `current: false`. |
+| `runs` | Mapa por `run_id:attempt`, con `unknown` en la clave si falta el intento. Guarda el ID y enlace del workflow, la ejecución, su intento y su lista de jobs. `historical: true` identifica intentos anteriores de la misma ejecución. Si falla la lectura del detalle de un intento anterior, se conserva su último estado válido y se reintenta la consulta. Una nueva ejecución del mismo workflow recibe su propia clave. |
+| `required` | `known` indica lectura completa de los requisitos de protección y reglas. `checks` contiene los pares `name` y `app_id` observados, incluso si una consulta posterior falla. `missing` enumera los requisitos sin resultado y `unverified` los que tienen un nombre coincidente con aplicación sin confirmar. Si falla la lectura de checks o statuses, se conserva el cálculo anterior del mismo SHA si existe. |
+| `pull_event` | Evento con ID local, fecha, PR, SHA, tipo y detalle. Registra descubrimiento, cambios de PR, transiciones de fase, conclusiones, intervención, diagnóstico y cambios en errores de consulta. Si un check se correlaciona con un job ya observado, `detail.previous_key` permite seguir sus eventos previos. El snapshot y sus eventos se escriben en la misma transacción. |
+| `pull_source` y `pull_source_event` | Error actual e historial de un listado o consulta de identidad o detalle de PR. Sus claves incluyen `slug` y el recurso consultado. Los errores llevan código HTTP si está disponible y un mensaje filtrado. La recuperación deja un evento con `error: null`. |
+
+`phase` toma los valores `pending`, `queued`, `in_progress`, `completed` o `unknown`. Las conclusiones conservan el valor de GitHub, incluidas `failure`, `timed_out`, `cancelled`, `action_required`, `skipped` y `neutral`. Los errores de consulta aparecen en `errors` y los resultados válidos previos siguen visibles. `null` expresa un valor desconocido o aún no comunicado, por ejemplo un intento o el cálculo de checks ausentes sin una lectura válida. Un array vacío señala una lectura que no encontró elementos.
+
 ## CI de un PR abierto
 
 La etapa del trabajo y la observación de CI se registran por separado. `status` muestra ambas, el SHA observado, los límites y la intervención pendiente. `status --json` expone el estado actual en un objeto por trabajo. `history OWNER/REPO#N` devuelve las transiciones de ese trabajo en JSON por línea, con su intento y evidencia. Los checks locales y la revisión conservan el SHA al que corresponden aunque avance el PR.
@@ -60,6 +87,8 @@ Se consultan las ejecuciones de GitHub Actions del head y la rama del PR, los ch
 ### Operaciones del controlador
 
 Ejecuta estos comandos con el TOML y el estado habituales de la instalación. La evidencia indica qué verificó el operador y qué autoriza. Las decisiones quedan asociadas a su identidad local, el trabajo, la huella de la issue y los SHAs correspondientes.
+
+`link-pr PR ISSUE` conserva la asociación local de una observación sin activar una reparación. Para incorporar un PR al ciclo de reparación se usa `link-pr ISSUE --pr N --head SHA --evidence TEXTO`, que valida el alcance y el head antes de registrar el trabajo. `status --json` emite solo trabajos con sus límites; `status --pr` y `logs --pr` conservan el formato de observación v1.
 
 ```bash
 masf status --json

@@ -768,7 +768,8 @@ class Delivery(TemporaryTest):
 
         for target, name, value in [
             (cli, "api", lookup), (worker, "api", lookup),
-            (cli, "scan", lambda *_: 0), (cli, "Worker", create_worker),
+            (cli, "scan", lambda *_, **__: 0), (cli, "observe", lambda *_: 0),
+            (cli, "Worker", create_worker),
             (worker, "command", git_or_gh), (providers, "invoke", agent),
         ]:
             patcher = patch.object(target, name, value)

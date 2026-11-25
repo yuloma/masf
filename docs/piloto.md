@@ -93,3 +93,14 @@ La revisión `9ea085d0b3cb97cc7ea5942469cb70e1e7d2cc71` pasó 78 pruebas en el h
 Los timeouts, pérdida de respuesta, reinicios y conflictos de Git se provocaron con remotos temporales, proveedores simulados y respuestas de GitHub simuladas. Cubren reanudación con un Worker nuevo, presupuesto persistente, espera sin ocupar capacidad, conservación de archivos, repetición de revisión sobre el mismo SHA, cancelación y publicación de un PR único.
 
 Cursor Agent `2026.11.22-e9042b2` revisó realmente la implementación `51f338905ecbc645789b3805c7885ff14db981fd` con el código montado para lectura y devolvió `pass` sin hallazgos en 143,84 segundos. El registro de instalación del operador conserva por separado los logs de aceptación y las revisiones posteriores con su SHA y versión de CLI.
+
+## Aceptación de CI del PR 23
+
+El ensayo real está pendiente de una ejecución autorizada en la instalación del operador. Las referencias de preparación son el PR #23 abierto, el head `d8cda48a51ee46eb285ac866e8b58d4ad89415db` y la ejecución de CI `45406357312`, con el fallo `test_check_interrupted`. El trabajo #10 conservaba el candidato `bb747e16b42c2aaf05ac9275c9625cde90a49aec` y dos rondas consumidas. Estos datos son el punto de partida del ensayo.
+
+1. Antes de ejecutar la fábrica, registra el estado efectivo del PR #23, su head, el ID e intento de la ejecución, el nombre del check y el fallo observado. Recoge el candidato, los contadores y límites del trabajo #10 mediante `status --json` e `history 'yuloma/masf#10'`.
+2. Ejecuta un sondeo y registra la discrepancia de head si persiste. Si el operador confirma que el head efectivo corresponde al trabajo, ejecuta `resume 'yuloma/masf#10' --accept-head SHA --evidence 'Evidencia revisada del PR y del diff'`. Si el límite vigente sigue agotado, añade `--add-rounds 1` a esa decisión o autoriza la ronda tras registrar el agotamiento. Conserva el operador, la huella y los SHAs de la decisión.
+3. Deja que `serve` o `run --once` diagnostique el fallo observado. Comprueba la construcción con el plan vigente y el diagnóstico de `test_check_interrupted`, y conserva proveedor, modelo cuando se conozca, ronda y SHA del candidato reparado.
+4. Registra el resultado de checks y revisión del mismo SHA, el head esperado del push y el nuevo head del PR #23. Comprueba que el número del PR se conserva y registra el ID, intento, SHA y conclusión de su nuevo CI. Conserva el PR abierto para la decisión de integración.
+
+La suite local simula GitHub y el proveedor y usa un remoto Git temporal. El historial de esa prueba y el de campo se guardan en las instalaciones donde se ejecuten.

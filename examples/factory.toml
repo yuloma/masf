@@ -5,6 +5,9 @@ version = 1 # Entero de versión.
 poll_seconds = 60
 max_parallel_jobs = 1
 max_build_rounds = 2
+# Reintentos técnicos acumulados por trabajo. Cero requiere intervención inmediata.
+max_ci_technical_retries = 2
+ci_retry_seconds = 60
 # Plazo total de cada etapa, incluida la suma de setup y checks.
 step_timeout_seconds = 900
 # Presupuesto compartido de reintentos y resolución de conflictos por trabajo.

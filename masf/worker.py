@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from contextlib import contextmanager
 import fnmatch
 import json
 import os
@@ -10,9 +10,10 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from . import checks, ci, providers
-from .queue import api, latest, require_lease, save
+from .evidence import agent_explanation, explanation, model, provenance, timestamp, usage, write_artifact
+from .queue import api, interrupt_stages, latest, record_stage, require_lease, save, stage_attempts
 from .recovery import RecoverableFailure, reserve
-from .system import ProcessError, TaskStopped, clean, command, docker_env
+from .system import ProcessError, TaskStopped, clean, command, docker_env, filtered
 
 
 def saved_workspace(root, path):
@@ -78,93 +79,172 @@ class Worker:
         self.git("checkout-index", "--all", workspace=folder)
         return folder
 
+    @contextmanager
+    def stage(self, role, sha, *, provider=None, commands=(), evidence_files=()):
+        job = self.job
+        prior = stage_attempts(self.db, job, role=role) if self.db is not None else []
+        previous = prior[-1] if prior else {}
+        ident = uuid.uuid4().hex
+        file = self.evidence / f"{role}-{ident}.json"
+        refs = [file.name, *evidence_files]
+        if role in {"build", "review"}:
+            refs.append(job.get("plan_attempt"))
+        if role in {"review", "build"}:
+            refs.append((job.get("checks") or {}).get("stage_attempt"))
+        if role == "build":
+            refs.append((job.get("review") or {}).get("stage_attempt"))
+        repair = job.get("ci_repair") or {}
+        record = {
+            "version": 1, "id": ident, "repo_id": job["repo_id"], "number": job["number"],
+            "role": role, "provider": provider, "executor": provider or "masf",
+            "execution_id": None, "cli_version": None, "lease": job.get("attempt"),
+            "input_sha": sha, "sha": sha, "candidate_sha": None, "started_at": timestamp(),
+            "finished_at": None, "duration_seconds": None, "status": "active",
+            "model": model(self.cfg.get("providers", {}).get(provider, {}).get("model"),
+                           applicable=provider is not None),
+            "usage": usage(), "provenance": provenance(self.cfg, job),
+            "result": None, "error": None, "explanation": explanation(evidence=refs),
+            "commands": list(commands), "evidence_file": file.name,
+            "purpose": ("candidate" if sha == job.get("candidate") else "base")
+                       if role == "checks" else None,
+            "previous_attempt": previous.get("id"),
+            "retry_of": previous.get("id") if previous.get("status") in
+                        {"failed", "interrupted", "cancelled", "changes_requested", "pending"}
+                        else None,
+            "trigger": job.get("reason") or job.get("feedback"),
+            "pr": job.get("pr_number"),
+            "ci_origin": {"pr": job.get("pr_number"), "sha": repair["sha"], "key": repair["key"], "id": repair.get("id")}
+                         if repair.get("key") and repair.get("sha") else None,
+        }
+        start = time.monotonic()
+        record_stage(self.db, job, record, boundary="started")
+        prior_stage = job.get("_stage")
+        job["_stage"] = ident
+        try:
+            yield record
+            if record["status"] == "active":
+                record["status"] = "completed"
+        except Exception as exc:
+            reason = clean(str(exc))
+            record.update(status="cancelled" if isinstance(exc, TaskStopped) else "failed",
+                          error=reason, error_type=type(exc).__name__,
+                          explanation=explanation(
+                              reason, decisions=["Cerrar el intento"], reason=reason,
+                              criteria=record["explanation"]["criteria"],
+                              evidence=record["explanation"]["evidence"],
+                          ))
+            raise
+        finally:
+            if prior_stage is None:
+                job.pop("_stage", None)
+            else:
+                job["_stage"] = prior_stage
+            # A process exit or expired lease leaves the durable start for the next worker.
+            if record["status"] != "active":
+                record.update(finished_at=timestamp(),
+                              duration_seconds=round(time.monotonic() - start, 3))
+                try:
+                    record_stage(self.db, job, record, boundary="finished")
+                except TaskStopped:
+                    pass
+                else:
+                    write_artifact(file, record)
+
     def test(self, sha):
-        folder = self.checkout(sha)
-        # Compose services can have a different numeric UID.
-        folder.chmod(0o755)
-        return checks.verify(
-            self.job["repo"],
-            self.config,
-            folder,
-            sha,
-            self.evidence / uuid.uuid4().hex,
-            self.owner,
-            self.cfg["service"]["step_timeout_seconds"],
-            guard=self.guard,
-        )
+        repo = self.job["repo"]
+        current = next((item for item in self.cfg.get("repositories", [])
+                        if item["slug"] == self.job["slug"]), {})
+        # Reuse private argv values from the registry only when the saved command still matches.
+        repo = repo | {key: current[key] for key in ("setup", "checks")
+                       if key in current and filtered(current[key]) == repo[key]}
+        folder = self.evidence / uuid.uuid4().hex
+        artifact = str(folder.relative_to(self.evidence) / "checks.json")
+        with self.stage("checks", sha, commands=repo["setup"] + repo["checks"],
+                        evidence_files=[artifact]) as stage:
+            workspace = self.checkout(sha)
+            # Compose services can have a different numeric UID.
+            workspace.chmod(0o755)
+            report = checks.verify(
+                repo, self.config, workspace, sha, folder, self.owner,
+                self.cfg["service"]["step_timeout_seconds"], guard=self.guard,
+            )
+            stage["result"] = report
+            if not report["passed"]:
+                stage.update(status="failed", error=report.get("failure_kind") or "checks_failed")
+            summary = "Checks correctos" if report["passed"] else "Fallaron los checks"
+            stage["explanation"] = explanation(
+                summary, decisions=[summary], criteria=["Códigos de salida de los comandos configurados"],
+                evidence=stage["explanation"]["evidence"], reason=stage["error"],
+            )
+            report["stage_attempt"] = stage["id"]
+        return filtered(report)
 
     def role(self, role, sha, folder, **inputs):
         job = self.job
         require_lease(self.db, job)
-        started = time.monotonic()
-        file = self.evidence / f"{role}-{uuid.uuid4().hex}.json"
-        activity_file = file.with_suffix(".activity.jsonl")
-        activity_meta = {}
-        last_activity_log = 0
+        provider = job["repo"]["routing"][role]
+        with self.stage(role, sha, provider=provider) as stage:
+            stage["explanation"]["criteria"] = (inputs.get("plan") or {}).get("criteria", [])
+            activity_file = self.evidence / f"{role}-{stage['id']}.activity.jsonl"
+            last_activity_log = 0
+            started = time.monotonic()
 
-        def activity(event):
-            nonlocal last_activity_log
-            activity_meta.update(event)
-            record = {
-                "at": datetime.now(timezone.utc).isoformat(),
-                "role": role,
-                "sha": sha,
-                "attempt": job.get("attempt"),
-                **event,
-            }
-            with activity_file.open("a") as stream:
-                stream.write(clean(json.dumps(record)) + "\n")
-            now = time.monotonic()
-            if (
-                event.get("event") == "cli_version"
-                or now - last_activity_log >= 15
-                or event.get("type") == "result"
-            ):
-                provider = job["repo"]["routing"][role]
-                label = event.get("type") or event.get("event")
-                tools = ",".join(event.get("tools", []))
-                print(
-                    f"{job['slug']}#{job['number']} {role} {provider} {label} {tools} ({now - started:.0f}s)",
-                    flush=True,
-                )
-                last_activity_log = now
+            def activity(event):
+                nonlocal last_activity_log
+                if event.get("event") == "cli_version":
+                    stage["cli_version"] = event["version"]
+                for key in ("model", "execution_id", "execution_id_source"):
+                    if key in event:
+                        stage[key] = event[key]
+                if "usage_evidence" in event:
+                    stage["usage"] = event["usage_evidence"]
+                record = {"at": timestamp(), "role": role, "sha": sha,
+                          "attempt": stage["id"], **event}
+                with activity_file.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(filtered(record)) + "\n")
+                new_file = activity_file.name not in stage["explanation"]["evidence"]
+                if new_file:
+                    stage["explanation"]["evidence"].append(activity_file.name)
+                if new_file or event.get("event") in {"cli_version", "provider_metadata"}:
+                    record_stage(self.db, job, stage)
+                now = time.monotonic()
+                if (event.get("event") == "cli_version" or now - last_activity_log >= 15
+                        or event.get("type") == "result"):
+                    label = event.get("type") or event.get("event")
+                    print(clean(f"{job['slug']}#{job['number']} {role} {provider} {label} ({now - started:.0f}s)"),
+                          flush=True)
+                    last_activity_log = now
 
-        try:
-            result = providers.invoke(
-                role,
-                job,
-                self.cfg,
-                folder,
-                dict(title=job["title"], body=job["body"], sha=sha, **inputs),
-                self.owner,
-                guard=self.guard,
-                on_activity=activity,
-            )
-        except Exception as exc:
-            if role == "build" and job["state"] == "building":
-                checkpoint = dict(job.get("build_workspace") or {})
-                checkpoint["error"] = clean(str(exc))
-                self.update("building", build_workspace=checkpoint)
-            file.write_text(
-                json.dumps(
-                    {
-                        "sha": sha,
-                        "role": role,
-                        "attempt": job.get("attempt"),
-                        "provider": job["repo"]["routing"][role],
-                        "version": activity_meta.get("version"),
-                        "last_activity": activity_meta,
-                        "activity_file": str(activity_file),
-                        "error": clean(str(exc)),
-                        "seconds": round(time.monotonic() - started, 2),
-                    },
-                    indent=2,
+            try:
+                result = providers.invoke(
+                    role, job, self.cfg, folder,
+                    dict(title=job["title"], body=job["body"], sha=sha, **inputs),
+                    self.owner, guard=self.guard, on_activity=activity,
                 )
+            except Exception as exc:
+                if role == "build" and job["state"] == "building" and not isinstance(exc, TaskStopped):
+                    checkpoint = dict(job.get("build_workspace") or {})
+                    checkpoint.update(error=clean(str(exc)), failed_attempt=stage["id"])
+                    self.update("building", build_workspace=checkpoint)
+                raise
+            for key in ("execution_id", "execution_id_source"):
+                if key in result:
+                    stage[key] = result[key]
+            if isinstance(result.get("model"), dict):
+                stage["model"] = result["model"]
+            stage["cli_version"] = result.get("version", stage["cli_version"])
+            stage["usage"] = result.get("usage_evidence", stage["usage"])
+            stage["result"] = result["result"]
+            if result["result"].get("question"):
+                stage["status"] = "needs_input"
+            elif result["result"].get("verdict") == "changes_requested":
+                stage["status"] = "changes_requested"
+            stage["explanation"] = agent_explanation(
+                role, result["result"], stage["explanation"]["evidence"], inputs.get("plan"),
             )
-            raise
-        result.update(sha=sha, attempt=job.get("attempt"), evidence_file=file.name)
-        file.write_text(clean(json.dumps(result, indent=2)))
-        return result
+            result.update(sha=sha, attempt=job.get("attempt"), stage_attempt=stage["id"],
+                          evidence_file=stage["evidence_file"])
+        return filtered(result)
 
     def admission(self):
         return ci.scope(self.db, self.job, api)
@@ -179,11 +259,13 @@ class Worker:
         for file in self.evidence.glob("*/cleanup.json"):
             stop, workspace = json.loads(file.read_text())
             command(stop, env=docker_env() | {"MASF_WORKSPACE": workspace})
+            checks.remove_profiles(stop, Path(workspace))
             file.unlink()
 
     def process(self):
         j = self.job
         repo = j["repo"]
+        interrupt_stages(self.db, j)
         self.update(j["state"])
         self.recover()
         if j.get("pr_number"):
@@ -193,7 +275,7 @@ class Worker:
                 return
             if not self.admission():
                 return
-            if j.get("repair_intent") and self.publish_repair(recover=True):
+            if j.get("repair_intent") and self.publication(self.publish_repair, recover=True):
                 return
             if not self.pr_head():
                 return
@@ -206,7 +288,7 @@ class Worker:
                     return
                 if j.get("ci_retry_at", 0) > time.time():
                     return
-        elif j.get("intent") and self.reconcile_publication():
+        elif j.get("intent") and self.publication(self.reconcile_publication):
             return
         if not self.admission():
             return
@@ -227,11 +309,12 @@ class Worker:
                 )
             self.update(j["state"] if j.get("pr_number") else "planning", base_checked=j["base"])
         if not j.get("plan"):
-            result = self.role("plan", j["base"], self.checkout(j["base"]))["result"]
+            planning = self.role("plan", j["base"], self.checkout(j["base"]))
+            result = planning["result"]
             if "question" in result:
-                self.update("needs_input", reason=result["question"])
+                self.update("needs_input", reason=result["question"], plan_attempt=planning.get("stage_attempt"))
                 return
-            self.update("building", plan=result, reason="")
+            self.update("building", plan=result, reason="", plan_attempt=planning.get("stage_attempt"))
         while self.admission():
             candidate = j.get("candidate")
             if not candidate or j["state"] == "building":
@@ -511,13 +594,15 @@ class Worker:
                 )
                 continue
             if j.get("pr_number"):
-                self.publish_repair()
+                self.publication(self.publish_repair)
             else:
-                self.publish()
+                self.publication(self.publish)
             return
 
     def remote_head(self):
-        output = self.git("ls-remote", self.url, "refs/heads/" + ci.branch(self.job))
+        args = ("ls-remote", self.url, "refs/heads/" + ci.branch(self.job))
+        self.publication_command("git", *args)
+        output = self.git(*args)
         return output.split()[0] if output else None
 
     def pr_head(self):
@@ -531,6 +616,43 @@ class Worker:
             ci.head_conflict(self.db, j, pr["head"]["sha"], remote)
             return False
         return True
+
+    def publication(self, action, **options):
+        job = self.job
+        sha = job.get("candidate")
+        with self.stage("publish", sha) as stage:
+            self.publication_record = stage
+            try:
+                outcome = action(**options)
+            finally:
+                self.publication_record = None
+            confirmed = job.get("published_head") == sha and bool(job.get("pr_number"))
+            summary = "PR y SHA confirmados" if confirmed else "Publicación pendiente de confirmación"
+            if job.get("reason") and not confirmed:
+                summary = job["reason"]
+            stage.update(
+                status="completed" if confirmed else "pending",
+                candidate_sha=sha, pr=job.get("pr_number"),
+                result={"confirmed": confirmed, "pr": job.get("pr_number"),
+                        "sha": job.get("published_head"), "url": job.get("pr"),
+                        "intent": stage.get("publication_intent") or job.get("repair_intent") or job.get("intent"),
+                        "intent_attempt": job.get("publication_intent_attempt")},
+                explanation=explanation(
+                    summary, decisions=[summary], criteria=["Checks y revisión aprobados para el SHA"],
+                    evidence=[*stage["explanation"]["evidence"],
+                              job.get("checks", {}).get("stage_attempt"),
+                              job.get("review", {}).get("evidence_file"),
+                              job.get("publication_intent_attempt")],
+                    reason=None if confirmed else summary,
+                ),
+            )
+            return outcome
+
+    def publication_command(self, *argv):
+        record = getattr(self, "publication_record", None)
+        if record is not None:
+            record["commands"].append(list(argv))
+            record_stage(self.db, self.job, record)
 
     def publish_repair(self, *, recover=False):
         j = self.job
@@ -577,10 +699,14 @@ class Worker:
             raise RuntimeError("La reparación no produjo un SHA nuevo")
         if not self.admission() or not self.pr_head():
             return True
-        self.update("publishing", repair_intent={"pr": j["pr_number"], "expected": expected, "target": sha})
+        intent = {"pr": j["pr_number"], "expected": expected, "target": sha}
+        if getattr(self, "publication_record", None) is not None:
+            self.publication_record["publication_intent"] = intent
+        self.update("publishing", repair_intent=intent, publication_intent_attempt=j.get("_stage"))
         ref = "refs/heads/" + ci.branch(j)
-        self.git("push", "--force-with-lease=" + ref + ":" + expected,
-                 self.url, sha + ":" + ref, guard=lambda: require_lease(self.db, j))
+        push = ("push", "--force-with-lease=" + ref + ":" + expected, self.url, sha + ":" + ref)
+        self.publication_command("git", *push)
+        self.git(*push, guard=lambda: require_lease(self.db, j))
         return self.publish_repair(recover=True)
 
     def existing_pr(self):
@@ -592,7 +718,9 @@ class Worker:
                 state="all",
             )
         )
-        return api(f"repos/{j['slug']}/pulls?{params}")
+        endpoint = f"repos/{j['slug']}/pulls?{params}"
+        self.publication_command("gh", "api", endpoint)
+        return api(endpoint)
 
     def record_pr(self, pr):
         j = self.job
@@ -641,19 +769,18 @@ class Worker:
             and j["review"]["result"]["verdict"] == "pass"
         ):
             raise ValueError("Falta la aprobación del SHA")
+        self.publication_command("git", "ls-remote", self.url, ref)
         remote = self.git("ls-remote", self.url, ref)
         previous = remote.split()[0] if remote else ""
         if previous and previous not in (j.get("intent"), j.get("previous_intent")):
             raise RuntimeError("Rama remota con SHA inesperado o sin procedencia")
-        self.update("publishing", intent=sha, previous_intent=previous)
+        self.update("publishing", intent=sha, previous_intent=previous,
+                    publication_intent_attempt=j.get("_stage"))
         if previous != sha:
             require_lease(self.db, j)
-            self.git(
-                "push",
-                "--force-with-lease=" + ref + ":" + previous,
-                self.url,
-                sha + ":" + ref,
-            )
+            push = ("push", "--force-with-lease=" + ref + ":" + previous, self.url, sha + ":" + ref)
+            self.publication_command("git", *push)
+            self.git(*push)
         marker = f"<!-- masf:{self.owner} -->"
         matches = self.existing_pr()
         if matches:
@@ -671,7 +798,7 @@ class Worker:
                 head=branch,
                 draft=True,
             )
-            pr = api(
-                f"repos/{j['slug']}/pulls", "--input", "-", stdin=json.dumps(payload)
-            )
+            endpoint = f"repos/{j['slug']}/pulls"
+            self.publication_command("gh", "api", endpoint, "--input", "-")
+            pr = api(endpoint, "--input", "-", stdin=json.dumps(filtered(payload)))
         self.record_pr(pr)

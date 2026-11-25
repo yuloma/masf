@@ -2,10 +2,12 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import time
 import uuid
+from pathlib import Path
 
-from .system import TaskStopped, clean, command, docker_env
+from .system import TaskStopped, clean, command, docker_env, filtered
 from .recovery import retryable
 
 
@@ -70,6 +72,16 @@ def compose_files(config, profile, folder, workspace):
     return target
 
 
+def remove_profiles(stop, workspace):
+    for index, arg in enumerate(stop[:-1]):
+        if arg == "-f":
+            folder = Path(stop[index + 1]).parent
+            if (folder.parent == workspace.parent
+                    and re.fullmatch(r"masf-check-[0-9a-f]{32}-profiles", folder.name)
+                    and folder.is_dir()):
+                shutil.rmtree(folder)
+
+
 def verify(repo, config, workspace, sha, folder, owner, timeout, *, guard=None):
     deadline = time.monotonic() + timeout
 
@@ -84,53 +96,59 @@ def verify(repo, config, workspace, sha, folder, owner, timeout, *, guard=None):
     file = folder / "cleanup.json"
     compose = repo.get("compose")
     if compose:
-        profiles = compose_files(config, compose, folder, workspace)
-        stack = [
-            "docker",
-            "compose",
-            "--env-file",
-            "/dev/null",
-            "--project-directory",
-            str(folder),
-            "-p",
-            name,
-            *profiles,
-        ]
-        model = json.loads(
-            command(
-                stack + ["config", "--format", "json"],
-                env=env,
-                timeout=remaining(),
-                guard=guard,
+        profiles_folder = workspace.parent / (name + "-profiles")
+        profiles_folder.mkdir(mode=0o700)
+        try:
+            profiles = compose_files(config, compose, profiles_folder, workspace)
+            stack = [
+                "docker",
+                "compose",
+                "--env-file",
+                "/dev/null",
+                "--project-directory",
+                str(folder),
+                "-p",
+                name,
+                *profiles,
+            ]
+            model = json.loads(
+                command(
+                    stack + ["config", "--format", "json"],
+                    env=env,
+                    timeout=remaining(),
+                    guard=guard,
+                )
             )
-        )
-        record["profile_sha256"] = hashlib.sha256(
-            json.dumps(model, sort_keys=True).encode()
-        ).hexdigest()
-        record["service"] = compose["service"]
-        for svc in model["services"].values():
-            if "build" in svc and (
-                "image" in svc or svc["build"]["context"] != str(workspace)
-            ):
-                raise ValueError("La imagen construida debe ser exclusiva del proyecto")
-            for mount in svc.get("volumes", []):
-                if mount["type"] == "bind" and mount["source"] != str(workspace):
-                    raise ValueError("Montaje fuera del checkout")
-        if compose["service"] not in model["services"]:
-            raise ValueError("No existe el servicio " + compose["service"])
-        start = stack + [
-            "up",
-            "-d",
-            "--build",
-            "--wait",
-            "--wait-timeout",
-            str(timeout),
-        ]
-        execute = stack + ["exec", "-T", compose["service"]]
-        stop = stack + ["down", "--volumes", "--remove-orphans"]
-        if any("build" in svc for svc in model["services"].values()):
-            # Builds have no explicit image name, so only their project tags are local.
-            stop.extend(["--rmi", "local"])
+            record["profile_sha256"] = hashlib.sha256(
+                json.dumps(model, sort_keys=True).encode()
+            ).hexdigest()
+            record["service"] = compose["service"]
+            for svc in model["services"].values():
+                if "build" in svc and (
+                    "image" in svc or svc["build"]["context"] != str(workspace)
+                ):
+                    raise ValueError("La imagen construida debe ser exclusiva del proyecto")
+                for mount in svc.get("volumes", []):
+                    if mount["type"] == "bind" and mount["source"] != str(workspace):
+                        raise ValueError("Montaje fuera del checkout")
+            if compose["service"] not in model["services"]:
+                raise ValueError("No existe el servicio " + compose["service"])
+            start = stack + [
+                "up",
+                "-d",
+                "--build",
+                "--wait",
+                "--wait-timeout",
+                str(timeout),
+            ]
+            execute = stack + ["exec", "-T", compose["service"]]
+            stop = stack + ["down", "--volumes", "--remove-orphans"]
+            if any("build" in svc for svc in model["services"].values()):
+                # Builds have no explicit image name, so only their project tags are local.
+                stop.extend(["--rmi", "local"])
+        except BaseException:
+            shutil.rmtree(profiles_folder)
+            raise
     else:
         start = [
             "docker",
@@ -160,8 +178,8 @@ def verify(repo, config, workspace, sha, folder, owner, timeout, *, guard=None):
         ]
         execute = ["docker", "exec", name]
         stop = ["docker", "rm", "-f", name]
-    report.write_text(json.dumps(record, indent=2))
-    file.write_text(json.dumps([stop, str(workspace)]))
+    report.write_text(json.dumps(filtered(record), indent=2))
+    file.write_text(json.dumps(filtered([stop, str(workspace)])))
     try:
         command(start, env=env, timeout=remaining(), guard=guard)
         for args in repo["setup"] + repo["checks"]:
@@ -197,7 +215,9 @@ def verify(repo, config, workspace, sha, folder, owner, timeout, *, guard=None):
         else:
             record["passed"] = True
     finally:
-        report.write_text(json.dumps(record, indent=2))
+        report.write_text(json.dumps(filtered(record), indent=2))
         command(stop, env=env, timeout=timeout)
         file.unlink()
+        if compose:
+            remove_profiles(stop, workspace)
     return record

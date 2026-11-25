@@ -5,9 +5,9 @@ import time
 import uuid
 import tempfile
 
-from .system import command, docker_env
+from .evidence import model, reported_usage, usage
 from .recovery import RecoverableFailure, retryable
-from .system import ProcessError
+from .system import ProcessError, clean, command, docker_env
 
 SHAPES = {
     "plan": '{"version":1,"summary":"...","criteria":["AC1 ..."]} or {"version":1,"summary":"...","question":"..."}',
@@ -124,11 +124,38 @@ def parse(provider, role, output):
     return payload, meta
 
 
+def reported_metadata(provider, event, requested):
+    source = provider + ":cli"
+    metadata = {}
+    for key in ("session_id", "thread_id", "execution_id", "agent_id", "run_id", "request_id"):
+        if isinstance(event.get(key), str) and event[key]:
+            metadata["execution_id"] = event[key]
+            metadata["execution_id_source"] = f"{source}:{key}"
+            break
+    for key in ("effective_model", "model"):
+        value = event.get(key)
+        if isinstance(value, str) and value and (
+            key == "effective_model" or (
+                value.lower() not in {"auto", "default"}
+                and (value != requested or event.get("type") in {"result", "turn.completed"})
+            )
+        ):
+            metadata["model"] = model(requested) | {
+                "effective": value, "availability": "reported", "source": f"{source}:{key}",
+            }
+            break
+    measurements = reported_usage(event, source)
+    if measurements:
+        metadata["usage_evidence"] = usage(measurements)
+    return metadata
+
+
 def invoke(role, job, cfg, workspace, inputs, owner, *, guard=None, on_activity=None):
     provider = job["repo"]["routing"][role]
     settings = cfg["providers"][provider]
     exe = settings["executable"]
     image = job["repo"]["runner_image"]
+    requested = settings.get("model")
     version = command(
         ["docker", "run", "--rm", "--network", "none", image, exe, "--version"],
         env=docker_env(),
@@ -137,16 +164,42 @@ def invoke(role, job, cfg, workspace, inputs, owner, *, guard=None, on_activity=
         on_activity({"event": "cli_version", "provider": provider, "version": version})
 
     last_signal = 0
+    metadata = {}
+    measurements = {}
+    pending_object = []
+    reported_error = None
 
-    def progress(line):
-        nonlocal last_signal
+    def progress(line, *, assembled=False):
+        nonlocal last_signal, reported_error
+        if not assembled and line.strip() == "{" and not pending_object:
+            pending_object.append(line)
+            return
+        if pending_object:
+            pending_object.append(line)
+            if line != "}":
+                return
+            line = "\n".join(pending_object)
+            pending_object.clear()
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             return
         if not isinstance(event, dict):
             return
-        if on_activity:
+        if event.get("type") in {"error", "turn.failed"} or event.get("is_error"):
+            detail = event.get("message") or event.get("error") or event.get("result")
+            if detail:
+                reported_error = clean(str(detail))[:500]
+        learned = reported_metadata(provider, event, requested)
+        if "usage_evidence" in learned:
+            for item in learned["usage_evidence"]["measurements"]:
+                measurements[item["source"]] = item
+            learned["usage_evidence"] = usage(list(measurements.values()))
+        if any(metadata.get(key) != value for key, value in learned.items()):
+            metadata.update(learned)
+            if on_activity:
+                on_activity({"event": "provider_metadata", **learned})
+        if on_activity and provider == "cursor" and not assembled:
             now = time.monotonic()
             if event.get("subtype") == "delta":
                 if now - last_signal < 15:
@@ -160,8 +213,6 @@ def invoke(role, job, cfg, workspace, inputs, owner, *, guard=None, on_activity=
             tool = event.get("tool_call") or {}
             if isinstance(tool, dict):
                 info["tools"] = [key for key in tool if key.endswith("ToolCall")]
-            if isinstance(event.get("model"), str):
-                info["model"] = event["model"]
             on_activity(info)
 
     task_data = dict(inputs)
@@ -263,10 +314,14 @@ def invoke(role, job, cfg, workspace, inputs, owner, *, guard=None, on_activity=
                 stdin=None if provider == "cursor" else prompt,
                 timeout=cfg["service"]["step_timeout_seconds"],
                 guard=guard,
-                on_stdout_line=progress
-                if provider == "cursor" and on_activity
-                else None,
+                on_stdout_line=progress if on_activity else None,
             )
+            if output.lstrip().startswith("{") and not pending_object:
+                # Some CLI versions emit a single pretty-printed JSON envelope.
+                progress(output, assembled=True)
+            if not on_activity:
+                for line in output.splitlines():
+                    progress(line)
             try:
                 result, meta = parse(provider, role, output)
             except (ValueError, KeyError, TypeError) as exc:
@@ -277,13 +332,25 @@ def invoke(role, job, cfg, workspace, inputs, owner, *, guard=None, on_activity=
                 if retryable(ProcessError(str(exc))):
                     raise RecoverableFailure(str(exc)) from exc
                 raise
-        finally:
+        except BaseException as exc:
+            try:
+                command(["docker", "rm", "-f", name], env=docker_env())
+            except (OSError, RuntimeError):
+                # Keep the execution failure; the controller can retry cleanup by owner.
+                pass
+            if isinstance(exc, ProcessError) and reported_error:
+                raise ProcessError(f"{exc}: {reported_error}", exc.stdout, exc.stderr) from exc
+            raise
+        else:
             command(["docker", "rm", "-f", name], env=docker_env())
     return {
         "provider": provider,
         "version": version,
-        "model": settings.get("model"),
+        "requested_model": requested,
         "seconds": round(time.monotonic() - start, 2),
         "result": result,
-        **meta,
+        **{key: value for key, value in meta.items() if key != "model"},
+        "model": model(requested),
+        "usage_evidence": usage(),
+        **metadata,
     }

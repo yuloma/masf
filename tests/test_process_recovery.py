@@ -551,8 +551,12 @@ class ComposeProcessRecovery(RecoveryHarness):
                 if (workspace / "check-ready").exists():
                     report = json.loads(journal.with_name("checks.json").read_text())
                     self.assertEqual(argv[argv.index("-p") + 1], report["name"])
-                    profile = journal.with_name("profile-0.yaml")
-                    self.assertEqual(argv[argv.index("-f") + 1], str(profile))
+                    profile = Path(argv[argv.index("-f") + 1])
+                    self.assertEqual(
+                        profile,
+                        workspace.parent / (report["name"] + "-profiles") / "profile-0.yaml",
+                    )
+                    self.assertEqual(profile.parent.stat().st_mode & 0o777, 0o700)
                     self.assertEqual(argv[-3:], ["down", "--volumes", "--remove-orphans"])
                     return report, journal, profile, workspace
 
@@ -590,6 +594,7 @@ class ComposeProcessRecovery(RecoveryHarness):
         self.kill(child)
         self.assertEqual(self.resources(old), old_resources)
         self.assertTrue(old_journal.exists())
+        self.assertEqual(frozen.read_text(), original_manifest)
 
         replacement_manifest = self.manifest("replacement", checkout=True)
         self.profile.write_text(replacement_manifest)
@@ -600,7 +605,7 @@ class ComposeProcessRecovery(RecoveryHarness):
         active = report["name"]
         self.assertEqual(report["sha"], candidate)
         self.assertNotEqual(active, old)
-        self.assertEqual(frozen.read_text(), original_manifest)
+        self.assertFalse(frozen.parent.exists())
         self.assertEqual(profile.read_text(), replacement_manifest)
         self.assertFalse(old_journal.exists())
         self.assertEqual(self.trace("cleanup.jsonl"), [frozen_cleanup])
@@ -617,5 +622,6 @@ class ComposeProcessRecovery(RecoveryHarness):
         self.assertEqual(job["checks"]["name"], active)
         self.assertEqual(self.calls(), partial_calls + [("check", candidate), ("review", candidate)])
         self.assertEqual(list(self.evidence.glob("*/cleanup.json")), [])
+        self.assertFalse(profile.parent.exists())
         self.assert_job_projects()
         self.assert_control()

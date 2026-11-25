@@ -5,7 +5,9 @@ import re
 from datetime import datetime, timezone
 
 from . import github_ci as gh
-from .queue import pages, retry_delay
+from .evidence import timestamp
+from .queue import decision_details, pages, retry_delay, write_event
+from .system import filtered
 
 
 def load_row(row):
@@ -85,7 +87,7 @@ def job_ref(job, method):
     return gh.fields(job, "number", "candidate", "rounds") | {"method": method}
 
 
-def link_pull(db, target, issue):
+def link_pull(db, target, issue, *, operator=None):
     slug, number = target
     if slug.lower() != issue[0].lower():
         raise ValueError("El PR y la issue deben pertenecer al mismo repositorio")
@@ -115,9 +117,15 @@ def link_pull(db, target, issue):
             raise ValueError("El trabajo ya tiene un vínculo")
         db.execute("INSERT INTO pull_links VALUES(?,?,?)", (pr["repo_id"], number, issue[1]))
         pr["job"] = job_ref(job, "operator")
-        append_event(db, pr, "pr_job", {"before": None, "after": issue[1], "method": "operator"})
+        entry = {"kind": "link_observation", "operator": operator, "at": timestamp(),
+                 "head": pr["head"]["sha"], "pr": number,
+                 "evidence": "Asociación solicitada por el operador"}
+        operations = decision_details([entry], job)
+        append_event(db, pr, "pr_job", {"before": None, "after": issue[1], "method": "operator",
+                                        "operations": operations})
+        write_event(db, job, job["state"], {"operations": operations})
         db.execute("UPDATE pull_requests SET data=? WHERE repo_id=? AND number=?", (
-            json.dumps(pr), pr["repo_id"], number,
+            json.dumps(filtered(pr)), pr["repo_id"], number,
         ))
 
 
@@ -390,7 +398,7 @@ def correlate_from_check(repo, check, old, runs):
 def append_event(db, pr, kind, detail):
     db.execute(
         "INSERT INTO pull_events(repo_id,number,sha,kind,detail) VALUES(?,?,?,?,?)",
-        (pr["repo_id"], pr["number"], pr["head"]["sha"], kind, json.dumps(detail)),
+        (pr["repo_id"], pr["number"], pr["head"]["sha"], kind, json.dumps(filtered(detail))),
     )
 
 
@@ -453,7 +461,7 @@ def close_job(db, pr):
     job.pop("attempt", None)
     job["state"] = pr["state"]
     db.execute("UPDATE jobs SET state=?,data=? WHERE repo_id=? AND number=?", (
-        pr["state"], json.dumps(job), *ident,
+        pr["state"], json.dumps(filtered(job)), *ident,
     ))
     db.execute("INSERT INTO events(repo_id,number,state,detail) VALUES(?,?,?,?)", (
         *ident, pr["state"], json.dumps({"pr_number": pr["number"], "sha": pr["head"]["sha"]}),
@@ -461,6 +469,8 @@ def close_job(db, pr):
 
 
 def persist(db, pr, ci=None):
+    pr = filtered(pr)
+    ci = filtered(ci)
     ident = pr["repo_id"], pr["number"]
     sha = pr["head"]["sha"]
     with db:
@@ -526,7 +536,7 @@ def persist(db, pr, ci=None):
         db.execute("""INSERT INTO pull_requests VALUES(?,?,?,?,?,?)
             ON CONFLICT(repo_id,number) DO UPDATE SET slug=excluded.slug,state=excluded.state,
             sha=excluded.sha,data=excluded.data""",
-            (*ident, pr["slug"], pr["state"], sha, json.dumps(pr)),
+            (*ident, pr["slug"], pr["state"], sha, json.dumps(filtered(pr))),
         )
         if ci is not None:
             close_job(db, pr)
@@ -617,12 +627,12 @@ def observe_repository(db, request, slug, meta=None):
         if old_errors != errors:
             db.execute("""INSERT INTO pull_sources(slug,error) VALUES(?,?)
                 ON CONFLICT(slug) DO UPDATE SET error=excluded.error,changed_at=CURRENT_TIMESTAMP""",
-                (slug, json.dumps(errors)),
+                (slug, json.dumps(filtered(errors))),
             )
             for source in sorted(old_errors.keys() | errors.keys()):
                 if old_errors.get(source) != errors.get(source):
                     db.execute("INSERT INTO pull_source_events(slug,source,error) VALUES(?,?,?)", (
-                        slug, source, json.dumps(errors[source]) if source in errors else None,
+                        slug, source, json.dumps(filtered(errors[source])) if source in errors else None,
                     ))
     return len(errors) + pull_errors
 

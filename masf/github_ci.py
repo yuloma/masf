@@ -208,7 +208,7 @@ def annotation_excerpt(request, endpoint):
     return annotations
 
 
-def log_excerpt(raw):
+def filter_log(raw):
     raw = ANSI_ESCAPE.sub("", raw)
     masks = set()
     for line in raw.splitlines():
@@ -219,7 +219,11 @@ def log_excerpt(raw):
     if masks:
         pattern = "|".join(re.escape(value) for value in sorted(masks, key=lambda v: (-len(v), v)))
         raw = re.sub(pattern, "[redacted]", raw)
-    lines = clean(raw).splitlines()
+    return clean(raw)
+
+
+def log_excerpt(raw):
+    lines = filter_log(raw).splitlines()
     relevant = [
         index for index, line in enumerate(lines)
         if re.search(r"(?i)error|fail(?:ed|ure)?|exception|timed?\s*out|fatal", line)

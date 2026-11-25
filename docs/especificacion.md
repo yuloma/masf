@@ -55,7 +55,7 @@ Un check con error puede aportar anotaciones, salida del check y un extracto del
 
 ### Formato de observación v1
 
-`status --pr OWNER/REPO#N` devuelve objetos JSON, uno por línea. `status` conserva las filas de trabajos y añade las observaciones en ese mismo formato. `logs --pr OWNER/REPO#N` consulta el historial y `--sha SHA` lo limita a una revisión. La versión de este formato es `version: 1` en la observación del PR. Las ampliaciones de trazabilidad, API e interfaz de #12, #15 y #16 pueden consumir las siguientes entidades locales.
+`status --pr OWNER/REPO#N` devuelve objetos JSON, uno por línea. `status` conserva las filas de trabajos y añade las observaciones en ese mismo formato. `logs --pr OWNER/REPO#N` consulta el historial y `--sha SHA` lo limita a una revisión. La versión de este formato es `version: 1` en la observación del PR. La trazabilidad de los trabajos y las interfaces de #15 y #16 pueden consultar las siguientes entidades locales.
 
 | Entidad | Clave y contenido |
 | --- | --- |
@@ -72,7 +72,7 @@ Un check con error puede aportar anotaciones, salida del check y un extracto del
 
 ## CI de un PR abierto
 
-La etapa del trabajo y la observación de CI se registran por separado. `status` muestra ambas, el SHA observado, los límites y la intervención pendiente. `status --json` expone el estado actual en un objeto por trabajo. `history OWNER/REPO#N` devuelve las transiciones de ese trabajo en JSON por línea, con su intento y evidencia. Los checks locales y la revisión conservan el SHA al que corresponden aunque avance el PR.
+La etapa del trabajo y la observación de CI se registran por separado. `status` muestra ambas, el SHA observado, los límites y la intervención pendiente. `status --json` expone el estado y los intentos en un objeto por trabajo. `history OWNER/REPO#N` devuelve las transiciones y los límites de cada intento en JSON por línea, con su evidencia. Los checks locales y la revisión conservan el SHA al que corresponden aunque avance el PR.
 
 | Observación del head vinculado | Decisión |
 | --- | --- |
@@ -93,7 +93,7 @@ Los códigos numéricos de cuota, acceso e infraestructura requieren contexto HT
 
 Ejecuta estos comandos con el TOML y el estado habituales de la instalación. La evidencia indica qué verificó el operador y qué autoriza. Las decisiones quedan asociadas a su identidad local, el trabajo, la huella de la issue y los SHAs correspondientes.
 
-`link-pr PR ISSUE` conserva la asociación local de una observación sin activar una reparación. Para incorporar un PR al ciclo de reparación se usa `link-pr ISSUE --pr N --head SHA --evidence TEXTO`, que valida el alcance y el head antes de registrar el trabajo. `status --json` emite solo trabajos con sus límites; `status --pr` y `logs --pr` conservan el formato de observación v1.
+`link-pr PR ISSUE` conserva la asociación local de una observación sin activar una reparación. Para incorporar un PR al ciclo de reparación se usa `link-pr ISSUE --pr N --head SHA --evidence TEXTO`, que valida el alcance y el head antes de registrar el trabajo. `status --json` emite trabajos con sus límites, procedencia e intentos. `status --pr` y `logs --pr` conservan el formato de observación v1.
 
 ```bash
 masf status --json
@@ -119,6 +119,49 @@ Cada trabajo puede usar uno, dos o tres proveedores sin mantener un IDE abierto.
 El servicio entrega a cada adaptador el identificador de trabajo e intento, rol, revisión de código, directorio asignado, plazo, permisos y artefactos de entrada. Espera un resultado estructurado y versionado con estado, resumen y los datos propios del rol. Planificación devuelve criterios identificables o una pregunta. Implementación devuelve un resumen y relaciona cada criterio con los cambios. Revisión devuelve un veredicto y sus hallazgos. Los adaptadores convierten el formato del proveedor y validan los campos exigidos antes de avanzar.
 
 Cada etapa recibe sus entradas por contenido o archivos. Un id de sesión del proveedor puede facilitar el diagnóstico, pero otra CLI debe poder continuar solo con el plan, el diff y las evidencias. Una respuesta truncada, un proceso interrumpido o un error de cuota se conservan como fallo. Cambiar de proveedor o ampliar el número de rondas requiere una decisión explícita del operador.
+
+### Formato de evidencia de etapa v1
+
+`status --json` incluye `provenance` al registrar el trabajo y `stage_attempts` con la procedencia vigente al inicio de cada intento. `engine` es la huella SHA-256 de los módulos instalados. `policy` identifica los módulos que determinan admisión, enrutamiento, checks, recuperación y publicación. `configuration` contiene el repositorio efectivo, su base y asignación de roles, los proveedores asignados y los parámetros del servicio. Las huellas funcionan también en una instalación empaquetada. Las instantáneas anteriores se conservan al reconfigurar un proveedor.
+
+| Campo | Contenido |
+| --- | --- |
+| `id`, `repo_id`, `number`, `lease` | Identificador propio del intento, clave del trabajo y reserva del controlador. |
+| `role`, `executor`, `provider`, `execution_id`, `cli_version` | Rol y ejecutor. Los adaptadores capturan el identificador de sesión, hilo o ejecución y su procedencia cuando la CLI los comunica. |
+| `input_sha`, `candidate_sha`, `previous_attempt`, `retry_of` | SHA utilizado, candidato producido y vínculos a intentos anteriores. El candidato de una construcción se añade al guardar el commit y se refleja en la transición correspondiente de `history`. |
+| `started_at`, `finished_at`, `duration_seconds`, `status`, `result`, `error` | Inicio y cierre UTC, duración monotónica, resultado o fallo. Un intento interrumpido conserva el inicio, lo observado hasta la interrupción y `detected_at`, fecha en que otro controlador detectó la interrupción. |
+| `model` | `requested` conserva la selección configurada, incluido un alias. `effective` conserva la identidad comunicada por la CLI con `source`. `availability` toma `reported`, `unknown` o `not_applicable`. |
+| `usage` | `availability` toma `reported` o `unknown`. Cada medición incluye nombre, valor, unidad y fuente. Cero cuenta como dato comunicado. Una medición de coste distingue `estimated` de `confirmed`. |
+| `explanation` | Resumen breve, decisiones, criterios, referencias a evidencia y motivo de bloqueo o cambio de rumbo cuando el resultado lo indica. `source` indica si deriva del resultado de etapa, del controlador o del operador. `availability` toma `available` o `unknown`. |
+| `commands`, `purpose`, `pr`, `ci_origin`, `ci_result` | Comandos de checks o publicación, propósito de los checks, PR asociado y vínculos desde y hacia el CI de una reparación. |
+
+El controlador persiste el inicio en SQLite antes de ejecutar la etapa y actualiza los metadatos de proveedor al recibirlos. `history` emite `stage_event` con `started`, `finished` o `interrupted` y el registro de ese momento. Los checkpoints y transiciones enlazan por ID las decisiones posteriores de reintento, confirmación o bloqueo. Los archivos `evidence/<repo_id>-<number>/<role>-<id>.json` contienen el resultado de la etapa y los `*.activity.jsonl` la actividad disponible. Para checks, el intento referencia el informe `checks.json` del SHA. Para publicación, los eventos conservan la intención, el intento que la registró y el PR y SHA confirmados. Las autorizaciones humanas incluyen ejecutor local, decisión, fecha y SHA, con modelo `not_applicable`.
+
+La explicación se construye a partir del resumen y los campos del resultado validado. Usa los criterios del plan en construcción y revisión, los hallazgos de revisión y la evidencia del intento. Un fallo de ejecución comunica la causa que observó el controlador. En los registros históricos se adaptan los resultados y errores conservados. `null` identifica los datos desconocidos y `legacy_model` conserva el campo antiguo cuando se desconoce si era una selección o un dato comunicado. SQLite amplía el esquema al abrirlo y permite reutilizar el plan, candidato y checks históricos vigentes.
+
+Estos fragmentos muestran una revisión activa, su posible resultado y dos lecturas de fallos.
+
+```json
+{"id":"intento-22","role":"review","provider":"cursor","input_sha":"abc123","status":"active","cli_version":"2026.11.11","model":{"requested":"auto","effective":null,"source":null,"availability":"unknown"},"explanation":{"availability":"unknown"}}
+{"id":"intento-22","role":"review","provider":"cursor","input_sha":"abc123","status":"completed","model":{"requested":"auto","effective":"modelo-2026-11","source":"cursor:cli:effective_model","availability":"reported"},"usage":{"availability":"reported","measurements":[{"name":"outputTokens","value":0,"unit":"tokens","source":"cursor:cli:usage.outputTokens"}]},"explanation":{"availability":"available","summary":"Revisión aprobada","decisions":["pass"],"criteria":["AC1 Conservar los checks del SHA"],"evidence":["review-intento-22.json","intento-checks-21"],"reason":null,"source":"stage_result"}}
+{"id":"intento-23","role":"review","status":"failed","cli_version":null,"error":"Falló la consulta de versión","model":{"availability":"unknown"},"explanation":{"availability":"available","reason":"Falló la consulta de versión"}}
+{"id":"intento-24","role":"review","status":"failed","cli_version":"2026.11.11","execution_id":"sesion-12","error":"Salida incompleta","model":{"requested":"auto","effective":"modelo-2026-11","source":"cursor:cli:effective_model","availability":"reported"}}
+{"historical":true,"role":"review","input_sha":"abc123","legacy_model":"auto","model":{"effective":null,"availability":"unknown"},"provenance":{"engine":null,"policy":null,"configuration":null},"explanation":{"availability":"available","summary":"Revisión aprobada"}}
+```
+
+Un fallo de CI se identifica por PR, SHA y la clave de sus resultados fallidos. La decisión guarda clasificación, errores, evidencia y motivo. `ci_origin.id` identifica esa decisión y `ci_result` permite consultar el CI del candidato en el formato de observación por PR y SHA. `kind: "ci_observation"` distingue las actualizaciones de evidencia dentro del mismo estado del trabajo.
+
+```json
+{"id":"intento-25","role":"build","provider":"codex","input_sha":"abc123","candidate_sha":"def456","ci_origin":{"pr":23,"sha":"abc123","key":[[71,2,205,"failure"]],"id":"huella-del-fallo"},"ci_result":{"pr":23,"sha":"def456"}}
+```
+
+```bash
+masf --config FILE status --json
+masf --config FILE history OWNER/REPO#1
+masf --config FILE logs --pr OWNER/REPO#23 --sha def456
+```
+
+SQLite, los archivos de evidencia y los resúmenes publicados filtran los campos y textos antes de serializar. El controlador usa la configuración privada para ejecutar los checks. Los perfiles Compose necesarios para limpiar una ejecución interrumpida se conservan en el directorio privado de trabajos y se retiran tras la limpieza.
 
 ## Persistencia, aislamiento y recuperación
 

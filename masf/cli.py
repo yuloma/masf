@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 
 from . import ci
 from .config import ConfigError, load, xdg
+from .evidence import UNKNOWN_PROVENANCE, historical_role, provenance
 from .observe import link_pull, load_row, observe
 from .queue import (
     api,
@@ -31,8 +32,10 @@ from .queue import (
     save,
     save_link,
     scan,
+    stage_attempts,
+    interrupt_stages,
 )
-from .system import TaskStopped, clean, command, docker_env
+from .system import TaskStopped, clean, command, docker_env, filtered
 from .recovery import schedule
 from .worker import Worker, saved_workspace
 
@@ -139,13 +142,16 @@ def process_task(cfg, config, root, job):
     except Exception as exc:
         reason = clean(str(exc))
         try:
+            failures = [stage for stage in stage_attempts(db, job)
+                        if stage["lease"] == token and stage["status"] == "failed"]
+            failed_attempt = failures[-1]["id"] if failures else None
             updates = schedule(job, cfg, exc, minimum_delay=retry_delay())
             if updates is not None:
-                save(db, job, "retry_wait", **updates)
+                save(db, job, "retry_wait", **updates, failed_attempt=failed_attempt)
             else:
                 if len(job.get("recoveries", [])) >= cfg["service"].get("max_recovery_attempts", 2):
                     reason += " (sin presupuesto de recuperación automática)"
-                save(db, job, "blocked", retry=job["state"], reason=reason)
+                save(db, job, "blocked", retry=job["state"], reason=reason, failed_attempt=failed_attempt)
         except RuntimeError:
             if not lease_active(db, job):
                 return 0
@@ -198,6 +204,7 @@ def poll_ci_jobs(db, cfg):
                     ci.observe_and_route(db, job, cfg, lookup)
                 elif job.get("ci_intervention") and not job.get("head_conflict"):
                     observation, _ = ci.observe(job, ci.expected_head(job), lookup)
+                    observation = filtered(observation)
                     if observation != job.get("ci"):
                         save(db, job, job["state"], ci=observation)
         except TaskStopped:
@@ -301,6 +308,7 @@ def resume(db, cfg, target, allow_protected_paths=(), reuse_workspace=None, reso
         job = leased_job(db, job, token)
         if job["state"] not in {"needs_input", "blocked"}:
             raise ValueError("Trabajo no reanudable")
+        interrupt_stages(db, job)
         return resume_job(db, cfg, job, allow_protected_paths, reuse_workspace,
                           accept_head, add_rounds, evidence, resolved_commit)
     finally:
@@ -498,6 +506,7 @@ def resume_job(db, cfg, j, allow_protected_paths, reuse_workspace,
         published = ci.expected_head(j)
         for key in (
             "plan",
+            "plan_attempt",
             "candidate",
             "checks",
             "review",
@@ -513,11 +522,16 @@ def resume_job(db, cfg, j, allow_protected_paths, reuse_workspace,
             if not scope_changed and repair:
                 linked["feedback"] = {"source": "CI", "sha": repair["sha"],
                                       "diagnostics": repair["diagnostics"]}
+        entry = decision(j | {"fingerprint": fingerprint(issue)}, "resume_planning",
+                         evidence or j.get("reason") or "Alcance de la issue actualizado",
+                         previous_fingerprint=j["fingerprint"], pr=j.get("pr_number"),
+                         head=published)
         save(
             db,
             j,
             "planning",
             **linked,
+            decisions=[*j.get("decisions", []), entry],
             title=issue["title"],
             body=issue["body"],
             rounds=0 if scope_changed or not j.get("pr_number") else j["rounds"],
@@ -541,6 +555,13 @@ def resume_job(db, cfg, j, allow_protected_paths, reuse_workspace,
                 base_resolutions=[*(j.get("base_resolutions") or []), resolution],
             )
             state = "checking"
+        kind = ("resolved_commit" if resolution else "allow_paths" if allow_protected_paths
+                else "reuse_workspace" if reuse_workspace is not None else "resume")
+        entry = decision(j, kind, evidence or j.get("reason") or f"resume: {state}",
+                         candidate=updates.get("candidate", j.get("candidate")),
+                         base=updates.get("base", j.get("base")), pr=j.get("pr_number"),
+                         paths=list(allow_protected_paths))
+        updates["decisions"] = [*j.get("decisions", []), entry]
         save(db, j, state, **updates)
 
 
@@ -578,6 +599,7 @@ def link_pr(db, cfg, target, pr_number, sha, evidence):
         current_issue = api(f"repos/{slug}/issues/{number}")
         if not eligible(current_issue, repo) or fingerprint(current_issue) != job["fingerprint"]:
             raise ValueError("La elegibilidad o el alcance han cambiado durante la vinculación")
+        job["provenance"] = provenance(cfg, job)
         job.update(attempt=token, state="pr_open", base=base, pr=pr["html_url"],
                    published_head=sha, candidate=sha, decisions=[entry],
                    ci={"sha": sha, "state": "waiting", "checks": [], "pending_runs": []})
@@ -598,7 +620,7 @@ def pull_output(db, target, *, history=False, sha=None):
     params = target or ()
     pull_filter = " WHERE slug=? COLLATE NOCASE AND number=?" if target else ""
     for row in db.execute("SELECT data FROM pull_requests" + pull_filter + " ORDER BY slug,number", params):
-        pr = load_row(row)
+        pr = filtered(load_row(row))
         ident = pr["repo_id"], pr["number"]
         label = {"repo_id": pr["repo_id"], "number": pr["number"]}
         if not history:
@@ -606,7 +628,7 @@ def pull_output(db, target, *, history=False, sha=None):
                 "SELECT data FROM pull_ci WHERE repo_id=? AND number=? AND sha=?",
                 (*ident, pr["head"]["sha"]),
             ).fetchone())
-            print(json.dumps({"type": "pull_request", **pr, "ci": ci}))
+            print(json.dumps({"type": "pull_request", **pr, "ci": filtered(ci)}))
             continue
         sha_filter = " AND sha=? COLLATE NOCASE" if sha else ""
         params_with_sha = (*ident, sha) if sha else ident
@@ -614,12 +636,12 @@ def pull_output(db, target, *, history=False, sha=None):
             "SELECT id,at,sha,kind,detail FROM pull_events WHERE repo_id=? AND number=?"
             + sha_filter + " ORDER BY id", params_with_sha,
         ):
-            print(json.dumps({"type": "pull_event", **label, **dict(item), "detail": json.loads(item["detail"])}))
+            print(json.dumps({"type": "pull_event", **label, **dict(item), "detail": filtered(json.loads(item["detail"]))}))
         for item in db.execute(
             "SELECT sha,data FROM pull_ci WHERE repo_id=? AND number=?" + sha_filter + " ORDER BY sha",
             params_with_sha,
         ):
-            print(json.dumps({"type": "pull_evidence", **label, "sha": item["sha"], "ci": load_row(item)}))
+            print(json.dumps({"type": "pull_evidence", **label, "sha": item["sha"], "ci": filtered(load_row(item))}))
 
     if sha:
         return
@@ -644,6 +666,28 @@ def pull_output(db, target, *, history=False, sha=None):
                     "type": "pull_source", "slug": row["slug"],
                     "changed_at": row["changed_at"], "errors": errors,
                 }))
+
+
+def job_evidence(db, job, root):
+    records = stage_attempts(db, job)
+    for role in ("plan", "build", "review"):
+        record = job.get(role) or {}
+        if record and not (record.get("stage_attempt") or job.get(role + "_attempt")):
+            records.append(historical_role(role, record))
+    folder = root / "evidence" / f"{job['repo_id']}-{job['number']}"
+    known_files = {record.get("evidence_file") for record in records}
+    for role in ("plan", "build", "review"):
+        for file in sorted(folder.glob(f"{role}-*.json")):
+            if file.name in known_files:
+                continue
+            try:
+                record = json.loads(file.read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(record, dict) and "id" not in record and (record.get("error") or record.get("result")):
+                records.append(historical_role(role, record | {"evidence_file": file.name}))
+    return {"provenance": job.get("provenance") or UNKNOWN_PROVENANCE,
+            "stage_attempts": records}
 
 
 def main():
@@ -711,7 +755,8 @@ def main():
                     j = json.loads(row[0])
                     observed = j.get("ci") or {}
                     if args.json:
-                        print(json.dumps(j | {"limits": ci.limits(j, cfg)}, ensure_ascii=False))
+                        print(json.dumps(filtered(j | job_evidence(db, j, root) |
+                                                  {"limits": ci.limits(j, cfg)}), ensure_ascii=False))
                         continue
                     counts = ci.limits(j, cfg)
                     print(
@@ -739,7 +784,14 @@ def main():
                 """SELECT e.* FROM events e JOIN jobs j USING(repo_id, number)
                 WHERE j.slug=? AND j.number=? ORDER BY e.id""", (slug, int(number))
             ):
-                print(json.dumps(dict(row) | {"detail": json.loads(row["detail"])}, ensure_ascii=False))
+                detail = json.loads(row["detail"])
+                for role in ("plan", "build", "review"):
+                    record = detail.get(role)
+                    if isinstance(record, dict) and record and not (
+                        record.get("stage_attempt") or detail.get(role + "_attempt")
+                    ):
+                        detail.setdefault("historical_stages", []).append(historical_role(role, record))
+                print(json.dumps(filtered(dict(row) | {"detail": detail}), ensure_ascii=False))
             return 0
         if args.cmd == "serve":
             print(
@@ -774,7 +826,7 @@ def main():
                             if args.linked_issue is not None:
                                 if args.pr is not None or args.head or args.evidence:
                                     raise ValueError("La vinculación de observación usa solo PR e issue")
-                                link_pull(db, args.target, args.linked_issue)
+                                link_pull(db, args.target, args.linked_issue, operator=operator_name())
                             else:
                                 if args.pr is None or not args.head or not args.evidence:
                                     raise ValueError("La vinculación para reparar requiere --pr, --head y --evidence")

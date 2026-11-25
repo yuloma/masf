@@ -1153,6 +1153,7 @@ class Delivery(TemporaryTest):
         self.action_attempt = 1
         self.action_state = "completed"
         self.action_result = "failure"
+        self.action_metadata = {}
         self.annotation = "FAIL: test_check_interrupted (tests.Checks) token ghp_secret123"
         self.ci_logs = None
         self.prs[0]["head"].update(ref="masf/issue-1")
@@ -1178,6 +1179,7 @@ class Delivery(TemporaryTest):
                            run_attempt=1 if different else self.action_attempt,
                            status="completed" if different else self.action_state,
                            conclusion="success" if different else self.action_result)
+                run.update(self.action_metadata)
                 return {"workflow_runs": [run, run | {"head_sha": self.base}]}
             if "/attempts/" in endpoint:
                 different = "/runs/9/" in endpoint
@@ -1283,6 +1285,105 @@ class Delivery(TemporaryTest):
         self.assertTrue(any(event.get("ci", {}).get("sha") == self.old_head
                             and event["ci"]["state"] == "failed" for event in history))
         self.assertTrue(any(event.get("review", {}).get("sha") == self.old_head for event in history))
+
+        build, = [item for item in queue.stage_attempts(self.worker.db, repaired, role="build")
+                  if item["ci_origin"]]
+        self.assertEqual(build["ci_origin"]["sha"], self.old_head)
+        self.assertEqual(build["input_sha"], self.old_head)
+        self.assertEqual(build["ci_result"], {"pr": 3, "sha": sha})
+        self.assertEqual(build["candidate_sha"], sha)
+        self.assertEqual(build["model"]["availability"], "unknown")
+        decision, = [event["ci_repair"] for event in history if event.get("ci_repair")]
+        self.assertEqual(build["ci_origin"]["id"], decision["id"])
+        self.assertEqual(decision["diagnostics"][0]["kind"], "functional")
+        self.assertIn("plan vigente", decision["decision"])
+        self.assertEqual(self.ci_job()["ci"]["evidence"], build["ci_result"])
+        published = queue.stage_attempts(self.worker.db, repaired, role="publish")[-1]
+        self.assertEqual(published["result"]["intent"]["target"], sha)
+        self.assertEqual(published["result"]["pr"], 3)
+
+    def test_published_summary_filters_role_results_and_commands(self):
+        original = self.agent
+
+        def agent(role, *args, **kwargs):
+            response = original(role, *args, **kwargs)
+            if role == "review":
+                response["result"]["summary"] = "Aprobado, api_key=review-fixture"
+            elif role == "plan":
+                response["result"]["criteria"] = ["AC1 token=plan-fixture"]
+            return response
+
+        def checks(sha):
+            report = self.check(sha)
+            report["commands"][0]["argv"] += ["--password", "command-fixture"]
+            return report
+
+        with (
+            patch.object(providers, "invoke", agent),
+            patch.object(self.worker, "test", checks),
+        ):
+            self.worker.process()
+        raw = self.prs[0]["body"]
+        self.assertIn("token=[redacted]", raw)
+        self.assertIn("api_key=[redacted]", raw)
+        self.assertIn("--password [redacted]", raw)
+        for secret in ("review-fixture", "plan-fixture", "command-fixture"):
+            self.assertNotIn(secret, raw)
+        self.assertIn(self.job["candidate"], raw)
+
+    def test_historical_publication_resumes_with_original_plan_candidate_and_checks(self):
+        from masf import cli
+
+        self.deny = True
+        self.assertEqual(self.run_controller(), 1)
+        historical = self.job
+        historical.pop("plan_attempt", None)
+        historical["review"].pop("stage_attempt", None)
+        historical["build"].pop("stage_attempt", None)
+        candidate, report, plan = (historical[key] for key in ("candidate", "checks", "plan"))
+        with self.worker.db:
+            self.worker.db.execute("DELETE FROM stage_attempts")
+            self.worker.db.execute("UPDATE jobs SET data=?", (json.dumps(historical),))
+        evidence = cli.job_evidence(self.worker.db, historical, self.root / "state")
+        self.assertIsNone(evidence["provenance"]["engine"])
+        review, = [item for item in evidence["stage_attempts"] if item["role"] == "review"]
+        self.assertTrue(review["historical"])
+        self.assertEqual(review["input_sha"], candidate)
+        self.deny = False
+        with patch.object(cli, "api", self.api):
+            cli.resume(self.worker.db, self.cfg, f"{historical['slug']}#1")
+        self.assertEqual(self.run_controller(), 0)
+        self.assertEqual(self.roles, ["plan", "build", "review"])
+        self.assertEqual(self.job["candidate"], candidate)
+        self.assertEqual(self.job["checks"], report)
+        self.assertEqual(self.job["plan"], plan)
+        publication = queue.stage_attempts(self.worker.db, self.job, role="publish")[-1]
+        self.assertEqual(publication["result"]["sha"], candidate)
+        self.assertEqual(publication["model"]["availability"], "not_applicable")
+
+    def test_ci_late_metadata_and_masked_logs_preserve_the_original_route(self):
+        from masf import ci, cli
+
+        self.open_ci_pr()
+        self.annotation = "Test failed"
+        self.ci_logs = ("::add-mask::fixture-value\n"
+                        "AssertionError: observed fixture-value during test")
+        self.assertEqual(self.ci_tick(observe_only=True), 0)
+        routed = self.ci_job()
+        self.assertEqual(routed["state"], "building")
+        repair = routed["ci_repair"]
+        self.assertNotIn("fixture-value", json.dumps(repair))
+        self.assertIn("[redacted]", repair["diagnostics"][0]["evidence"])
+
+        self.action_metadata = {"run_started_at": "2026-11-24T12:00:00Z",
+                                "html_url": "https://github.com/org/repo/actions/runs/7"}
+        with closing(queue.connect(self.root / "state")) as reopened:
+            self.assertTrue(ci.observe_and_route(reopened, routed, self.cfg, cli.api, revalidate=True))
+            self.assertEqual(routed["ci"]["workflows"][0]["run_started_at"], self.action_metadata["run_started_at"])
+            self.assertEqual(routed["ci_repair"], repair)
+            count = reopened.execute("SELECT count(*) FROM events").fetchone()[0]
+            self.assertTrue(ci.observe_and_route(reopened, routed, self.cfg, cli.api, revalidate=True))
+            self.assertEqual(reopened.execute("SELECT count(*) FROM events").fetchone()[0], count)
 
     def test_ci_pending_duplicate_and_rerun(self):
         self.open_ci_pr()
@@ -1614,7 +1715,10 @@ class Delivery(TemporaryTest):
         self.ci_tick()
         self.assertIsNone(self.worker.db.execute("SELECT data FROM jobs").fetchone())
         cli.link_pr(self.worker.db, self.cfg, self.target, 3, self.old_head, "Scope approved")
-        self.assertEqual(self.ci_job()["decisions"][0]["kind"], "link")
+        linked = self.ci_job()
+        self.assertEqual(linked["decisions"][0]["kind"], "link")
+        self.assertTrue(linked["provenance"]["engine"].startswith("sha256:"))
+        self.assertEqual(linked["provenance"]["configuration"]["repository"]["base_branch"], "main")
         self.ci_tick()
         self.assertEqual(self.ci_job()["retry"], "planning")
         cli.resume(self.worker.db, self.cfg, self.target)

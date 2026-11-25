@@ -1,10 +1,14 @@
 """Observe checks on a PR head and persist decisions for that observation."""
 
+import json
 import re
 import time
 
+from .evidence import digest
+from .github_ci import filter_log
+
 from .queue import api, eligible, fingerprint, retry_delay, save
-from .system import ProcessError, clean
+from .system import ProcessError, clean, filtered
 
 
 PASSING = {"success", "neutral", "skipped"}
@@ -111,12 +115,17 @@ def observe(job, sha, lookup=api):
     commit = f"{repo}/commits/{sha}"
     checks = {}
     pending_runs = []
+    workflows = []
     # Workflow attempts are needed even before a rerun has created check runs.
     runs = pages(lookup, f"{repo}/actions/runs?head_sha={sha}", "workflow_runs")
     for run in runs:
         if run["head_sha"] != sha or run.get("head_branch") != branch(job):
             continue
         run_id, attempt = run["id"], run["run_attempt"]
+        workflows.append({field: run.get(field) for field in (
+            "id", "name", "run_attempt", "status", "conclusion", "created_at",
+            "run_started_at", "updated_at", "html_url", "url",
+        )})
         if run["status"] != "completed":
             pending_runs.append([run_id, attempt])
             continue
@@ -132,6 +141,7 @@ def observe(job, sha, lookup=api):
                 "id": item["id"], "check_id": int(check_id) if check_id.isdecimal() else None,
                 "run": run_id, "attempt": attempt, "name": excerpt(item["name"], 200),
                 "status": item["status"], "conclusion": item.get("conclusion"),
+                **observation_fields(item),
                 "steps": [excerpt(step["name"], 160) for step in item.get("steps", [])
                           if step.get("conclusion") == "failure"][:12],
             }
@@ -141,7 +151,7 @@ def observe(job, sha, lookup=api):
             checks[f"workflow:{run_id}"] = {
                 "id": run_id, "run": run_id, "attempt": attempt, "check_id": None,
                 "name": excerpt(run.get("name"), 200), "status": "completed",
-                "conclusion": run.get("conclusion"), "steps": [],
+                "conclusion": run.get("conclusion"), "steps": [], **observation_fields(run),
             }
     for item in pages(lookup, f"{commit}/check-runs?filter=latest", "check_runs"):
         if item.get("head_sha") != sha or (item.get("app") or {}).get("slug") == "github-actions":
@@ -149,7 +159,7 @@ def observe(job, sha, lookup=api):
         checks[f"check:{item['id']}"] = {
             "id": item["id"], "check_id": item["id"], "run": None, "attempt": None,
             "name": excerpt(item["name"], 200), "status": item["status"],
-            "conclusion": item.get("conclusion"), "steps": [],
+            "conclusion": item.get("conclusion"), "steps": [], **observation_fields(item),
         }
     contexts = set()
     for item in pages(lookup, f"{commit}/statuses"):
@@ -161,7 +171,7 @@ def observe(job, sha, lookup=api):
             "id": item["id"], "check_id": None, "run": None, "attempt": None,
             "name": excerpt(context, 200),
             "status": "pending" if item["state"] == "pending" else "completed",
-            "conclusion": item["state"], "steps": [],
+            "conclusion": item["state"], "steps": [], **observation_fields(item),
         }
     items = sorted(checks.values(), key=lambda item: (item["name"], item["id"]))
     failures = [item for item in items if item["conclusion"] not in PASSING]
@@ -173,7 +183,16 @@ def observe(job, sha, lookup=api):
         state = "success"
     else:
         state = "waiting"
-    return dict(sha=sha, state=state, checks=items, pending_runs=sorted(pending_runs)), failures
+    return dict(sha=sha, state=state, checks=items, pending_runs=sorted(pending_runs),
+                workflows=sorted(workflows, key=lambda run: run["id"]),
+                evidence={"pr": job.get("pr_number"), "sha": sha}), failures
+
+
+def observation_fields(item):
+    return {key: item[key] for key in (
+        "created_at", "updated_at", "started_at", "completed_at", "run_started_at",
+        "url", "html_url", "details_url", "target_url",
+    ) if item.get(key) is not None}
 
 
 HTTP_STATUS = (
@@ -199,14 +218,38 @@ def classify(item, evidence):
     return kinds[0] if kinds else "unknown"
 
 
-def diagnose(job, item, lookup=api):
+def prior_diagnostic(snapshot, item):
+    for key, check in snapshot.get("checks", {}).items():
+        if not check.get("current") or check["conclusion"] != item["conclusion"]:
+            continue
+        if item["run"] is not None:
+            matches = (check.get("run_id"), check.get("attempt"), check.get("job_id")) == (
+                item["run"], item["attempt"], item["id"],
+            )
+        else:
+            source = "check" if item["check_id"] else "status"
+            matches = check.get("source") == source and check["id"] == item["id"]
+        if matches and check.get("diagnostic"):
+            return check["diagnostic"], key
+    return {}, None
+
+
+def diagnose(job, item, lookup=api, *, snapshot=None):
     endpoint = f"repos/{job['slug']}/check-runs/{item['check_id']}/annotations"
     sources = []
     evidence = []
+    errors = []
+    cached, key = prior_diagnostic(snapshot or {}, item)
+    evidence.extend(excerpt(value, 400) for value in (cached.get("output") or {}).values() if value)
+    if cached.get("details_url"):
+        sources.append(cached["details_url"])
     if item["check_id"]:
         sources.append(endpoint)
         try:
-            for index, annotation in enumerate(pages(lookup, endpoint)):
+            annotations = cached.get("annotations")
+            if annotations is None:
+                annotations = pages(lookup, endpoint)
+            for index, annotation in enumerate(annotations):
                 if index >= 16:
                     break
                 evidence.append(excerpt(" ".join(str(annotation.get(key) or "")
@@ -214,14 +257,16 @@ def diagnose(job, item, lookup=api):
         except ProcessError as exc:
             if retry_delay():
                 raise
-            evidence.append(excerpt(str(exc), 250))
+            errors.append({"source": endpoint, "error": excerpt(str(exc), 250)})
     if item["run"] and item["check_id"]:
         endpoint = f"repos/{job['slug']}/actions/jobs/{item['id']}/logs"
         sources.append(endpoint)
         try:
-            logs = lookup(endpoint, raw=True)
+            logs = cached.get("log_excerpt")
+            if logs is None:
+                logs = lookup(endpoint, raw=True)
             patterns = "|".join(SIGNALS.values())
-            for line in logs.splitlines():
+            for line in filter_log(logs).splitlines():
                 if re.search(patterns, line, re.I):
                     evidence.append(excerpt(line, 400))
                 if len(evidence) >= 20:
@@ -229,9 +274,9 @@ def diagnose(job, item, lookup=api):
         except ProcessError as exc:
             if retry_delay():
                 raise
-            evidence.append(excerpt(str(exc), 250))
+            errors.append({"source": endpoint, "error": excerpt(str(exc), 250)})
     details = excerpt("\n".join([*item["steps"], *evidence]))
-    return dict(check=item, evidence=details, sources=sources, kind=classify(item, details))
+    return dict(check=item, evidence=details, sources=sources, errors=errors, observation_key=key, kind=classify(item, details or " ".join(error["error"] for error in errors)))
 
 
 def limits(job, cfg):
@@ -247,9 +292,11 @@ def limits(job, cfg):
 def observe_and_route(db, job, cfg, lookup=api, *, revalidate=False):
     sha = expected_head(job)
     observation, failures = observe(job, sha, lookup)
+    observation = filtered(observation)
     previous = job.get("ci")
     if observation["state"] != "failed":
-        if previous != observation or revalidate or job.get("ci_poll_error"):
+        if (previous != observation or job.get("ci_poll_error")
+                or (revalidate and job["state"] != "pr_open")):
             save(db, job, "pr_open", ci=observation, ci_repair=None, ci_retry_at=0,
                  ci_poll_error=None, reason="")
         return False
@@ -258,32 +305,40 @@ def observe_and_route(db, job, cfg, lookup=api, *, revalidate=False):
            for item in sorted(failures, key=lambda item: (item["run"] or 0, item["id"]))]
     active = job.get("ci_repair") or {}
     if active.get("sha") == sha and active.get("key") == key:
-        if job.get("ci_poll_error"):
-            save(db, job, job["state"], ci_poll_error=None, ci_retry_at=0, reason="")
+        if previous != observation or job.get("ci_poll_error"):
+            updates = {"ci": observation}
+            if job.get("ci_poll_error"):
+                updates["ci_poll_error"] = None
+            save(db, job, job["state"], **updates)
         return True
     if any(entry["sha"] == sha and entry["key"] == key
            for entry in job.get("ci_handled", [])):
-        if previous != observation or revalidate:
+        if previous != observation or (revalidate and job["state"] != "pr_open"):
             save(db, job, "pr_open", ci=observation, ci_repair=None,
                  reason="Fallo ya tramitado. Consulta el historial o solicita una nueva ejecución de CI")
         return False
     if not scope(db, job, lookup):
         return False
-    diagnostics = [diagnose(job, item, lookup) for item in failures[:10]]
+    row = db.execute("SELECT data FROM pull_ci WHERE repo_id=? AND number=? AND sha=?",
+                     (job["repo_id"], job.get("pr_number"), sha)).fetchone()
+    snapshot = json.loads(row["data"]) if row else {}
+    diagnostics = [diagnose(job, item, lookup, snapshot=snapshot) for item in failures[:10]]
     if len(failures) > len(diagnostics):
         diagnostics.append({"kind": "unknown", "evidence": "Hay más checks fallidos de los que caben en el diagnóstico"})
     counts = limits(job, cfg)
     repair = dict(sha=sha, key=key, diagnostics=diagnostics, counters=counts,
-                  provider=job["repo"]["routing"]["build"], agent="build",
-                  model=cfg.get("providers", {}).get(job["repo"]["routing"]["build"], {}).get("model"))
+                  pr=job.get("pr_number"), id=digest([job["repo_id"], job["number"],
+                                                     job.get("pr_number"), sha, key]))
     kinds = {item["kind"] for item in diagnostics}
     fields = dict(ci=observation, ci_repair=repair, ci_poll_error=None,
                   ci_handled=[*job.get("ci_handled", []), {"sha": sha, "key": key}])
     if kinds == {"functional"} and job.get("plan") and counts["rounds"] < counts["build_limit"]:
+        repair["decision"] = "Reparación funcional con el plan vigente"
         save(db, job, "building", **fields, candidate=sha, build_workspace=None, reason="", ci_retry_at=0,
              feedback={"source": "CI", "sha": sha, "diagnostics": diagnostics})
         return True
     if kinds == {"infrastructure"} and counts["technical"] < counts["technical_limit"]:
+        repair["decision"] = "Fallo de infraestructura de CI. Verificación local programada"
         delay = cfg["service"].get("ci_retry_seconds", 60)
         save(db, job, "checking", **fields, candidate=sha, checks={}, review={},
              ci_technical=counts["technical"] + 1, ci_retry_at=time.time() + delay,
@@ -302,6 +357,7 @@ def observe_and_route(db, job, cfg, lookup=api, *, revalidate=False):
         reason = "Configuración de CI inválida. Corrige el workflow o sus parámetros y relanza CI"
     else:
         reason = "Diagnóstico de CI insuficiente. Revisa los logs del check indicado y relanza CI con evidencia"
+    repair["decision"] = reason
     needs_plan = kinds == {"functional"} and not job.get("plan")
     save(db, job, "blocked" if kinds & {"access", "quota", "configuration"} else "needs_input",
          **fields, reason=reason, retry="planning" if needs_plan else "pr_open",

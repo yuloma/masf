@@ -7,7 +7,8 @@ import time
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 
-from .system import ProcessError, TaskStopped, command
+from .evidence import explanation, model, provenance, timestamp
+from .system import ProcessError, TaskStopped, command, filtered
 
 
 _retry_at = 0
@@ -151,27 +152,101 @@ def connect(root):
     db.execute("""CREATE TABLE IF NOT EXISTS pull_links (
         repo_id INTEGER, number INTEGER, job_number INTEGER,
         PRIMARY KEY(repo_id, number), UNIQUE(repo_id, job_number))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS stage_attempts (
+        id TEXT PRIMARY KEY, repo_id INTEGER, number INTEGER, role TEXT, status TEXT, data TEXT)""")
+    db.execute("""CREATE INDEX IF NOT EXISTS stage_attempts_job
+        ON stage_attempts(repo_id, number, role)""")
     return db
 
 
 def write_event(db, job, state, updates):
     db.execute(
         "INSERT INTO events(repo_id,number,attempt,state,detail) VALUES(?,?,?,?,?)",
-        (job["repo_id"], job["number"], job.get("attempt"), state, json.dumps(updates)),
+        (job["repo_id"], job["number"], job.get("attempt"), state, json.dumps(filtered(updates))),
     )
+
+
+def store_stage(db, record):
+    safe = filtered(record)
+    db.execute(
+        """INSERT INTO stage_attempts VALUES (?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET status=excluded.status,data=excluded.data""",
+        (safe["id"], safe["repo_id"], safe["number"], safe["role"], safe["status"],
+         json.dumps(safe)),
+    )
+
+
+def stage_attempts(db, job, *, role=None):
+    return [json.loads(row["data"]) for row in db.execute(
+        """SELECT data FROM stage_attempts WHERE repo_id=? AND number=?
+        AND (? IS NULL OR role=?) ORDER BY rowid""",
+        (job["repo_id"], job["number"], role, role),
+    )]
+
+
+def record_stage(db, job, record, *, boundary=None):
+    if db is None:
+        return
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        require_lease(db, job)
+        store_stage(db, record)
+        if boundary:
+            write_event(db, job, job["state"], {"stage_event": boundary, "stage": record})
+
+
+def interrupt_stages(db, job):
+    for record in stage_attempts(db, job):
+        if record["status"] != "active" or record["lease"] == job.get("attempt"):
+            continue
+        reason = "La ejecución anterior se interrumpió antes de registrar el cierre"
+        record.update(status="interrupted", detected_at=timestamp(), error=reason,
+                      explanation=explanation(reason, reason=reason,
+                                              evidence=record["explanation"]["evidence"]))
+        record_stage(db, job, record, boundary="interrupted")
+
+
+def decision_details(entries, job):
+    return [
+        {"role": "operation", "executor": entry.get("operator"), "model": model(applicable=False),
+         "sha": entry.get("head") or entry.get("candidate") or job.get("candidate") or job.get("base"),
+         "at": entry.get("at"), "decision": entry,
+         "explanation": explanation(entry["kind"], decisions=[entry["kind"]],
+                                    reason=entry.get("evidence"), source="operator")}
+        for entry in entries
+    ]
 
 
 def save(db, job, state, **updates):
     next_job = job | updates | {"state": state}
-    persisted = {key: value for key, value in next_job.items() if key != "attempt"}
+    persisted = {key: value for key, value in next_job.items() if key not in {"attempt", "_stage"}}
     with db:
         db.execute("BEGIN IMMEDIATE")
         if not lease_active(db, job):
             raise RuntimeError("La reserva del trabajo ha vencido")
-        write_event(db, job, state, updates)
+        detail = dict(updates)
+        if "ci" in updates and state == job["state"] and not updates.get("ci_repair"):
+            detail["kind"] = "ci_observation"
+        if job.get("_stage"):
+            detail["stage_attempt"] = job["_stage"]
+        additions = updates.get("decisions", [])[len(job.get("decisions", [])):]
+        if additions:
+            detail["operations"] = decision_details(additions, next_job)
+        build = updates.get("build") or {}
+        if updates.get("candidate") and build.get("stage_attempt"):
+            row = db.execute("SELECT data FROM stage_attempts WHERE id=? AND repo_id=? AND number=?",
+                             (build["stage_attempt"], job["repo_id"], job["number"])).fetchone()
+            if row:
+                stage = json.loads(row["data"])
+                stage["candidate_sha"] = updates["candidate"]
+                if stage.get("ci_origin"):
+                    stage["ci_result"] = {"pr": next_job.get("pr_number"), "sha": updates["candidate"]}
+                store_stage(db, stage)
+                detail["stage_attempt"] = stage["id"]
+        write_event(db, job, state, detail)
         db.execute(
             "UPDATE jobs SET state=?,data=? WHERE repo_id=? AND number=?",
-            (state, json.dumps(persisted), job["repo_id"], job["number"]),
+            (state, json.dumps(filtered(persisted)), job["repo_id"], job["number"]),
         )
     job.update(next_job)
     print(f"{job['slug']}#{job['number']} {state}", flush=True)
@@ -179,7 +254,7 @@ def save(db, job, state, **updates):
 
 def save_link(db, job, approval):
     key = (job["repo_id"], job["number"])
-    persisted = {key: value for key, value in job.items() if key != "attempt"}
+    persisted = {key: value for key, value in job.items() if key not in {"attempt", "_stage"}}
     with db:
         db.execute("BEGIN IMMEDIATE")
         if not lease_active(db, job):
@@ -188,15 +263,20 @@ def save_link(db, job, approval):
             "SELECT 1 FROM jobs WHERE repo_id=? AND json_extract(data, '$.pr_number')=?",
             (job["repo_id"], job["pr_number"]),
         ).fetchone()
-        row = db.execute("SELECT state FROM jobs WHERE repo_id=? AND number=?", key).fetchone()
+        row = db.execute("SELECT state,data FROM jobs WHERE repo_id=? AND number=?", key).fetchone()
         if conflict or (row and row["state"] != "queued"):
             raise ValueError("El PR está vinculado o la issue ya tiene un trabajo activo")
+        if row:
+            old = json.loads(row["data"])
+            persisted["provenance"] = old.get("provenance")
         db.execute(
             """INSERT INTO jobs VALUES (?,?,?,?,?)
             ON CONFLICT(repo_id, number) DO UPDATE SET state=excluded.state,data=excluded.data""",
-            (*key, job["slug"], "pr_open", json.dumps(persisted)),
+            (*key, job["slug"], "pr_open", json.dumps(filtered(persisted))),
         )
-        write_event(db, job, "pr_open", {"decisions": [approval], "ci": job["ci"]})
+        write_event(db, job, "pr_open", {"decisions": [approval], "ci": job["ci"],
+                                           "operations": decision_details([approval], job),
+                                           "provenance": job["provenance"]})
     print(f"{job['slug']}#{job['number']} pr_open", flush=True)
 
 
@@ -238,10 +318,11 @@ def scan(cfg, db=None, *, repository_ids=None):
                         fingerprint=fingerprint(issue),
                         rounds=0,
                     )
+                    job["provenance"] = provenance(cfg, job)
                     with db:
                         result = db.execute(
                             "INSERT OR IGNORE INTO jobs VALUES (?,?,?,?,?)",
-                            (meta["id"], number, slug, "queued", json.dumps(job)),
+                            (meta["id"], number, slug, "queued", json.dumps(filtered(job))),
                         )
                     if result.rowcount:
                         print(f"{slug}#{number} queued", flush=True)

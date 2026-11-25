@@ -15,8 +15,10 @@ def clean(value):
     value = re.sub(
         r'''(?ix)
         ( (?:bearer|basic)\s+
+        | --(?:[\w-]*-)?(?:password|passwd|token|secret|api[-_]?key)\s+
         | \b (?: access[_-]?token | refresh[_-]?token | (?:api|private)[_-]?key
-          | password | passwd | (?:github|gh|npm)?[_-]?token | secret ) ["']?\s*[:=]\s*
+          | password | passwd | signature | credential | [\w-]*[_-](?:token|secret|password|signature|credential|api[_-]?key)
+          | (?:github|gh|npm)?[_-]?token | secret ) ["']?\s*[:=]\s*
         )
         (?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s&,;"'<>]+)
         ''',
@@ -28,6 +30,28 @@ def clean(value):
         "[redacted]", value,
     )
     return re.sub(r"(?i)(https?://)[^/@\s:]+:[^/@\s]+@", r"\1[redacted]@", value)
+
+
+_SECRET_KEY = re.compile(
+    r"(?:^|[_-])(?:token|secret|password|passwd|credential|signature|(?:api|private)[_-]?key)$",
+    re.I,
+)
+
+
+def secret_key(key):
+    return bool(_SECRET_KEY.search(re.sub(r"([a-z])([A-Z])", r"\1_\2", key)))
+
+
+def filtered(value):
+    """Filter strings before serialization so multiline values cannot corrupt JSON."""
+    if isinstance(value, dict):
+        return {clean(key): "[redacted]" if secret_key(key) and item is not None else filtered(item)
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return ["[redacted]" if index and isinstance(value[index - 1], str)
+                and value[index - 1].startswith("-") and secret_key(value[index - 1].lstrip("-"))
+                else filtered(item) for index, item in enumerate(value)]
+    return clean(value) if isinstance(value, str) else value
 
 
 class ProcessError(RuntimeError):

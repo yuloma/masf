@@ -28,12 +28,14 @@ def parse(provider, role, output):
         completed = False
         for line in output.splitlines():
             event = json.loads(line)
+            if not isinstance(event, dict):
+                raise ValueError("Codex: evento inválido")
             if event["type"] in ("error", "turn.failed"):
                 raise RuntimeError(
                     "Codex: " + str(event.get("message", event.get("error", "")))[:500]
                 )
             item = event.get("item", {})
-            if item.get("type") == "agent_message":
+            if isinstance(item, dict) and item.get("type") == "agent_message":
                 messages.append(item["text"])
             if event["type"] == "turn.completed":
                 completed = True
@@ -51,10 +53,16 @@ def parse(provider, role, output):
             if provider != "cursor":
                 raise
             events = [json.loads(line) for line in output.splitlines() if line.strip()]
+            if not all(isinstance(item, dict) for item in events):
+                raise ValueError("Cursor: evento inválido")
             results = [item for item in events if item.get("type") == "result"]
             if len(results) != 1 or events[-1] != results[0]:
                 raise ValueError("Cursor: flujo incompleto, falta resultado final")
             event = results[0]
+        if not isinstance(event, dict):
+            raise ValueError(f"{provider}: envoltura inválida")
+        if provider == "cursor" and event.get("type", "result") != "result":
+            raise ValueError("Cursor: flujo incompleto, falta resultado final")
         if event.get("is_error") or event.get("subtype", "success") != "success":
             raise RuntimeError(
                 f"{provider}: {str(event.get('result', 'error de CLI'))[:400]}"
@@ -88,7 +96,8 @@ def parse(provider, role, output):
                 ) from None
     if (
         not isinstance(payload, dict)
-        or payload.get("version") != 1
+        or type(payload.get("version")) is not int
+        or payload["version"] != 1
         or not isinstance(payload.get("summary"), str)
         or not payload["summary"].strip()
     ):
@@ -134,6 +143,8 @@ def invoke(role, job, cfg, workspace, inputs, owner, *, guard=None, on_activity=
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            return
+        if not isinstance(event, dict):
             return
         if on_activity:
             now = time.monotonic()

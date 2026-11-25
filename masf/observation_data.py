@@ -4,8 +4,9 @@ import math
 import re
 from urllib.parse import urlsplit, urlunsplit
 
-from .evidence import digest, historical_role
+from .evidence import historical_role
 from .github_ci import filter_log
+from .queue import revision
 from .system import clean
 
 
@@ -32,6 +33,27 @@ def fields(value, names):
 
 def strings(value):
     return [scalar(item) for item in items(value) if isinstance(item, str)]
+
+
+def protected_paths(reason):
+    # Historical blocks record only the first conflicting path.
+    prefix = "Ruta protegida: "
+    if isinstance(reason, str) and reason.startswith(prefix) and reason[len(prefix):]:
+        return [scalar(reason[len(prefix):])]
+    return []
+
+
+def build_checkpoint(job):
+    checkpoint = mapping(job.get("build_workspace"))
+    if not checkpoint:
+        return None
+    sha = job.get("candidate") or job.get("base")
+    fingerprint = job.get("fingerprint")
+    return fields(checkpoint, "input_sha round failed_attempt") | {
+        "matches_input": checkpoint["input_sha"] == sha if checkpoint.get("input_sha") and sha else None,
+        "matches_scope": checkpoint["fingerprint"] == fingerprint
+        if checkpoint.get("fingerprint") and fingerprint else None,
+    }
 
 
 def url(value):
@@ -108,7 +130,7 @@ def stage(value):
     applicable = value.get("role") in {"plan", "build", "review"} or bool(value.get("provider"))
     public = fields(value, "id role executor provider execution_id execution_id_source cli_version "
                     "input_sha candidate_sha started_at finished_at detected_at duration_seconds "
-                    "status error error_type purpose previous_attempt retry_of pr legacy_model")
+                    "status error error_type purpose previous_attempt retry_of pr legacy_model configured_timeout_seconds")
     public["historical"] = value.get("historical") is True
     public["identity_availability"] = (
         "available" if public["executor"] else "pending" if active else "unknown"
@@ -119,6 +141,18 @@ def stage(value):
             else "pending" if active else "unknown"
         )
     public["model"] = model(value.get("model"), active=active, applicable=applicable)
+    if value.get("role") in {"checks", "publish"}:
+        commands = [argv[0] for argv in items(value.get("commands")) if items(argv)]
+        public["executables"] = [scalar(name) for name in commands
+                                 if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.+-]+", name)]
+    if value.get("role") == "publish":
+        public["operations"] = [
+            " ".join(argv[:2]) for argv in items(value.get("commands")) if len(items(argv)) >= 2
+            and argv[:2] in (["git", "push"], ["git", "ls-remote"], ["gh", "api"])
+        ]
+    if value.get("error_type") == "CommandTimeout":
+        match = re.search(r"tiempo agotado \((\d{1,9})s\)$", public["error"] or "")
+        public["timeout_seconds"] = int(match[1]) if match else None
     public["usage"] = usage(value.get("usage"), active=active, applicable=applicable)
     public["explanation"] = explanation(value.get("explanation"), active=active)
     public["provenance"] = fields(value.get("provenance"), "engine policy")
@@ -147,7 +181,8 @@ def operation(value):
         "at": scalar(value.get("at")), "sha": scalar(value.get("sha")),
         "model": model(None, applicable=False), "usage": usage(None, applicable=False),
         "decision": fields(entry, "id kind operator at evidence pr head candidate base rounds "
-                           "result outcome status reason") | {"paths": strings(entry.get("paths"))},
+                           "result outcome status reason resume_state role provider previous_provider round_limit "
+                           "timeout_seconds previous_timeout_seconds workspace") | {"paths": strings(entry.get("paths"))},
         "explanation": explanation(value.get("explanation")),
     }
 
@@ -211,11 +246,6 @@ def feedback(value):
         "checks": check_report(value) if "commands" in value else None,
         "diagnostics": [diagnostic(item) for item in items(value.get("diagnostics"))],
     }
-
-
-def revision(job, event_id):
-    """Shared precondition for action readers and writers, evaluated in their transaction."""
-    return "v1:" + digest([job, event_id])
 
 
 def local_ci(value):

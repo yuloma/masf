@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Panel de MASF</title>
+  <link rel="stylesheet" href="/dashboard/style.css">
+  <script type="module" src="/dashboard/app.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Saltar al contenido</a>
+  <header class="masthead">
+    <div class="wrap header-row">
+      <a class="brand" href="/dashboard/">MASF <span>Panel de la fábrica</span></a>
+      <div class="freshness">
+        <span id="freshness">Sin lecturas</span>
+        <button id="refresh" type="button">Actualizar</button>
+      </div>
+    </div>
+  </header>
+  <div class="wrap">
+    <nav id="navigation" aria-label="Vistas"></nav>
+    <p id="notice" role="status" aria-live="polite">Cargando datos…</p>
+    <main id="main" tabindex="-1" aria-busy="true"></main>
+    <noscript>Activa JavaScript para consultar el panel.</noscript>
+  </div>
+</body>
+</html>

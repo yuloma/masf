@@ -1,4 +1,4 @@
-"""Read-only HTTP access to the installed queue and registered evidence."""
+"""Loopback HTTP access to evidence and optionally to authenticated decisions."""
 
 import argparse
 import json
@@ -9,14 +9,16 @@ import stat
 import tomllib
 from contextlib import ExitStack, closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.resources import files
 from itertools import islice
 from urllib.parse import parse_qsl
 
 from . import ci
 from . import observation_data as public
+from .actions import ActionError, Actions
 from .config import ConfigError
 from .evidence import digest
-from .queue import decision_details
+from .queue import connect, decision_details
 
 DEFAULT_PORT = 8765
 PAGE_SIZE = 50
@@ -28,6 +30,11 @@ SLUG = re.compile(r"[\w.-]+/[\w.-]+")
 STAGE_FILE = re.compile(r"(?:plan|build|review|checks|publish)-[A-Za-z0-9_-]+\.json")
 CHECK_FILE = re.compile(r"[0-9a-f]{32}/checks\.json")
 STATE = re.compile(r"[a-z_]{1,40}")
+DASHBOARD_ASSETS = {
+    "/dashboard/": ("index.html", "text/html"),
+    "/dashboard/style.css": ("style.css", "text/css"),
+    "/dashboard/app.js": ("app.js", "text/javascript"),
+}
 
 
 class RequestError(Exception):
@@ -486,6 +493,12 @@ class View:
                 "pending": row["state"] in {"blocked", "needs_input"},
                 "reason": reason if row["state"] in {"blocked", "needs_input"} else None,
                 "questions": questions,
+                "scope_changed": bool(job.get("scope_conflict")),
+                "protected_paths": (public.strings(job.get("blocked_paths"))
+                                    or public.protected_paths(job.get("reason")))
+                if row["state"] == "blocked" and public.protected_paths(job.get("reason")) else [],
+                "failed_attempt": public.scalar(job.get("failed_attempt")),
+                "build_checkpoint": public.build_checkpoint(job) if row["state"] in {"blocked", "needs_input"} else None,
                 "ci": bool(job.get("ci_intervention")) and row["state"] in {"blocked", "needs_input"},
                 "retry_stage": JOB_STAGE.get(job.get("retry")),
                 "head_conflict": public.fields(job["head_conflict"], "expected observed remote")
@@ -607,12 +620,15 @@ class ObservationHandler(BaseHTTPRequestHandler):
 
     def respond(self, status, payload, *, head=False):
         data = json.dumps({"version": 1, **payload}, ensure_ascii=True, allow_nan=False).encode()
+        self.send_content(status, data, "application/json", "default-src 'none'; frame-ancestors 'none'", head)
+
+    def send_content(self, status, data, media_type, policy, head):
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", f"{media_type}; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+        self.send_header("Content-Security-Policy", policy)
         self.send_header("Connection", "close")
         if status == 405:
             self.send_header("Allow", "GET, HEAD")
@@ -627,22 +643,37 @@ class ObservationHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         head = self.command == "HEAD"
         try:
-            hosts = self.headers.get_all("Host") or []
-            host = self.server.server_port
-            if hosts not in (["127.0.0.1"], ["localhost"], [f"127.0.0.1:{host}"], [f"localhost:{host}"]):
-                raise RequestError(400, "invalid_host", "El servidor requiere un host local")
+            host = self.local_host()
             path, _, query = self.path.partition("?")
+            if path in DASHBOARD_ASSETS:
+                name, media_type = DASHBOARD_ASSETS[path]
+                data = files("masf").joinpath("dashboard", name).read_bytes()
+                policy = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+                          "base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+                self.send_content(200, data, media_type, policy, head)
+                return
             segments = path.split("/")
             if len(segments) < 3 or segments[:2] != ["", "v1"] or not all(
                 IDENT.fullmatch(segment) for segment in segments[2:]
             ):
                 raise invalid()
+            identity = self.action_route(path)
+            if identity and self.server.actions:
+                if query:
+                    raise invalid()
+                self.server.actions.authorize(self.headers, host)
+                with closing(connect_readonly(self.server.root)) as db:
+                    payload = {"data": self.server.actions.context(db, identity)}
+                self.respond(200, payload, head=head)
+                return
             with closing(connect_readonly(self.server.root)) as db:
                 payload = View(db, self.server.root, self.server.config).dispatch(segments[2:], Query(query))
+            if len(segments) == 5 and segments[2] == "jobs":
+                payload["data"]["actions_enabled"] = self.server.actions is not None
             self.respond(200, payload, head=head)
-        except RequestError as exc:
+        except (RequestError, ActionError) as exc:
             self.respond(exc.status, {"error": {"code": exc.code, "message": exc.message}}, head=head)
-        except (sqlite3.Error, ConfigError, OSError):
+        except (sqlite3.Error, ConfigError, OSError, RuntimeError):
             self.respond(503, {"error": {"code": "unavailable", "message": "Datos de observación no disponibles"}},
                          head=head)
         except (ValueError, KeyError, TypeError, RecursionError):
@@ -650,6 +681,48 @@ class ObservationHandler(BaseHTTPRequestHandler):
                          head=head)
 
     do_HEAD = do_GET
+
+    def local_host(self):
+        hosts = self.headers.get_all("Host") or []
+        port = self.server.server_port
+        if hosts not in (["127.0.0.1"], ["localhost"], [f"127.0.0.1:{port}"], [f"localhost:{port}"]):
+            raise RequestError(400, "invalid_host", "El servidor requiere un host local")
+        return hosts[0]
+
+    def action_route(self, path):
+        match = re.fullmatch(r"/v1/jobs/([0-9]{1,18})/([0-9]{1,18})/actions", path)
+        if match:
+            return tuple(positive(value) for value in match.groups())
+        return None
+
+    def do_POST(self):
+        if self.server.actions is None:
+            return self.reject_method()
+        try:
+            host = self.local_host()
+            identity = self.action_route(self.path)
+            if not identity:
+                raise missing()
+            self.server.actions.authorize(self.headers, host)
+            lengths = self.headers.get_all("Content-Length") or []
+            if (self.headers.get("Transfer-Encoding") or len(lengths) != 1
+                    or not re.fullmatch(r"[0-9]{1,5}", lengths[0])
+                    or not 0 < int(lengths[0]) <= 16384
+                    or self.headers.get_content_type() != "application/json"):
+                raise invalid()
+            keys = self.headers.get_all("Idempotency-Key") or []
+            if len(keys) != 1:
+                raise invalid()
+            try:
+                payload = json.loads(self.rfile.read(int(lengths[0])))
+            except (ValueError, RecursionError):
+                raise invalid() from None
+            receipt = self.server.actions.submit(identity, keys[0], payload)
+            self.respond(200, {"data": receipt})
+        except (RequestError, ActionError) as exc:
+            self.respond(exc.status, {"error": {"code": exc.code, "message": exc.message}})
+        except (sqlite3.Error, ConfigError, OSError, RuntimeError, ValueError, KeyError, TypeError):
+            self.respond(503, {"error": {"code": "unavailable", "message": "No se pudo confirmar la decisión. Reintenta el mismo envío."}})
 
     def __getattr__(self, name):
         if name.startswith("do_"):
@@ -661,19 +734,23 @@ class ObservationHandler(BaseHTTPRequestHandler):
 
 
 class ObservationServer(ThreadingHTTPServer):
-    def __init__(self, root, config, listen_port):
+    def __init__(self, root, config, listen_port, actions_token_file=None):
         self.root, self.config = root, config
+        self.actions = Actions(root, config, actions_token_file) if actions_token_file is not None else None
+        if self.actions is not None:
+            with closing(connect(root)):
+                pass
         super().__init__(("127.0.0.1", listen_port), ObservationHandler)
 
 
-def serve(root, config, listen_port):
+def serve(root, config, listen_port, actions_token_file=None):
     registry(config)
     try:
         with closing(connect_readonly(root)) as db:
             db.execute("SELECT repo_id FROM jobs LIMIT 1")
     except sqlite3.Error as exc:
         raise ConfigError("La cola de observación debe existir y permitir lectura") from exc
-    with ObservationServer(root, config, listen_port) as server:
+    with ObservationServer(root, config, listen_port, actions_token_file) as server:
         print(f"MASF observe-api activo en http://127.0.0.1:{server.server_port}/v1", flush=True)
         try:
             server.serve_forever()

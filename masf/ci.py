@@ -87,8 +87,14 @@ def scope(db, job, lookup=api):
         save(
             db, job, "needs_input", retry="planning", scope_conflict=observed,
             reason="El contenido de la issue ha cambiado. Confirma el alcance actualizado con resume",
+            scope_review=scope_review(job, issue),
         )
     return False
+
+
+def scope_review(job, issue):
+    return {name: {key: excerpt(item.get(key) or "") for key in ("title", "body")}
+            for name, item in (("previous", job), ("observed", issue))}
 
 
 def pages(lookup, endpoint, field=None):

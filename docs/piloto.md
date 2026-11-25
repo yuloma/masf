@@ -60,7 +60,7 @@ masf_pilot status
 
 Abre el PR en borrador. Comprueba los tres ejemplos en el SHA publicado, revisa el diff, verifica qué proveedor hizo cada etapa y contrasta el resultado de los checks con el del PR. La rama base debe conservar su SHA en este repo de prueba hasta que una persona decida fusionar. El diff debe contener únicamente los cambios propios de la tarea.
 
-Desde I4 arranca el controlador con `"${control[@]}" up -d controller` en Docker, o `masf_pilot serve` en la instalación nativa. Etiqueta una **segunda issue** independiente, por ejemplo añadir al README del proyecto un ejemplo de uso de `saludo("Eva")` con su salida. El servicio ha de recogerla sin una orden manual. En Docker, ejecuta `"${control[@]}" up -d --force-recreate controller` y verifica con `masf_pilot status` que se conservan los identificadores y el PR. Los casos de caída en el punto exacto de publicación se reproducen mediante la prueba controlada de I2.
+Para acreditar la combinación de proveedores de I3–I4 en una sola issue, sigue el [piloto mediante serve](#piloto-i3i4-de-una-sola-issue-mediante-serve). Para el ejercicio independiente de I4, arranca el controlador con `"${control[@]}" up -d controller` en Docker, o `masf_pilot serve` en la instalación nativa. Etiqueta una **segunda issue** independiente, por ejemplo añadir al README del proyecto un ejemplo de uso de `saludo("Eva")` con su salida. El servicio ha de recogerla sin una orden manual. En Docker, ejecuta `"${control[@]}" up -d --force-recreate controller` y verifica con `masf_pilot status` que se conservan los identificadores y el PR. Los casos de caída en el punto exacto de publicación se reproducen mediante la prueba controlada de I2.
 
 ### Segundo destino con aplicación y base de datos en Docker
 
@@ -68,6 +68,155 @@ Desde I4 arranca el controlador con `"${control[@]}" up -d controller` en Docker
 2. Con I2 implementado, registra un segundo repo de prueba mediante la entrada `example-org/masf-pilot-sql`. Usa un proyecto con `schema.sql` que cree `probe(id integer PRIMARY KEY)` y `tests/smoke.sql` que falle si la tabla contiene filas, como en el script. Estos archivos son el código y las pruebas del proyecto. El TOML y los manifiestos siempre están en la instalación central.
 3. Etiqueta una issue que pida añadir a `probe` una columna `label` obligatoria, con valor inicial `'nuevo'`, y comprobarlo en su prueba SQL. Ejecuta `masf_pilot run --once` con esa issue como único trabajo elegible pendiente. En `status` y en la evidencia del mismo SHA deben constar el servicio `app`, el resultado de `psql` y proyectos Compose distintos para base y candidato.
 4. Mantén otro stack de desarrollo abierto con un dato de control. Comprueba que conserva el dato y sus servicios después de una ejecución y de cancelar otra. Tras recrear el controlador en mitad de una verificación, debe recuperar la referencia, retirar solo los recursos de esa verificación y permitir terminar el trabajo. Anota cualquier red o volumen huérfano.
+
+## Piloto I3–I4 de una sola issue mediante serve
+
+Ejecuta este ensayo en la instalación activa del operador con acceso autorizado a GitHub, Codex y Cursor. Usa el destino desechable de la sección 2 y la issue de [saludo](#3-ejecutar-una-tarea-observable). Los comandos de Compose usan el array `control` con la extensión del motor. En nativo usa la CLI y el TOML efectivos del servicio y consulta los logs a través de su supervisor. Guarda las capturas en un directorio privado de la instalación. [Guía de Docker](docker.md#desplegar-el-controlador).
+
+### Revisión instalada, proveedores y checks de base
+
+En el checkout de MASF, registra `git rev-parse HEAD` y comprueba que `git status --porcelain` esté vacío. Para este encargo la revisión prevista es `bc6a6e47280d72ceb9cea0d078f1b8a4dfa218df`. Registra el ID de la imagen usada por el controlador y su etiqueta `org.opencontainers.image.revision` si se construyó con `--build-arg MASF_REVISION=SHA`. Contrasta el código del checkout probado con el paquete del servicio comparando las huellas. En nativo ejecuta la segunda consulta con el Python del entorno virtual del servicio desde fuera del checkout.
+
+```bash
+python3 -c 'from masf.evidence import revisions; print(revisions())'
+"${control[@]}" exec -T controller /opt/venv/bin/python -I -c \
+  'from masf.evidence import revisions; print(revisions())'
+```
+
+En el TOML externo, habilita `[providers.codex]` y `[providers.cursor]` con `enabled = true` y sus ejecutables `codex` y `agent`, respectivamente. Ajusta la entrada del destino en el registro existente.
+
+```toml
+[[repositories]]
+slug = "OWNER/REPO"
+enabled = true
+label = "masf:ready"
+setup = []
+checks = [["python3", "-m", "unittest", "discover", "-s", "tests"]]
+
+[repositories.routing]
+plan = "codex"
+build = "codex"
+review = "cursor"
+```
+
+Con la issue sin etiqueta y la cola en reposo, aplica al servicio la configuración mediante una recreación si la cambiaste. Usa los mismos montajes y las rutas de autenticación de la instalación. Guarda las versiones que devuelve `doctor` para los ejecutables del runner del destino. Confirma `repo.routing` en `status --json` y el proveedor y `cli_version` de cada intento registrado durante la tarea.
+
+```bash
+pilot_masf() { "${control[@]}" exec -T controller masf --config /etc/masf/pilot.toml "$@"; }
+pilot_masf doctor --offline
+pilot_masf doctor
+```
+
+Define `pilot_repo` con el slug, `pilot_base_ref` con la rama efectiva (`base_branch` o la predeterminada), `pilot_checkout` con la ruta absoluta de un clon desechable y limpio del destino y `pilot_image` con la imagen efectiva (`runner_image` o `runner.image`). Para el caso de saludo sin perfil Compose, usa el mismo runner para verificar base y candidato. Registra `docker image inspect --format '{{.Id}}' "$pilot_image"` y conserva los comandos, su salida y sus códigos de salida. Continúa tras comprobar el éxito de cada comando.
+
+```bash
+pilot_base=$(gh api "repos/$pilot_repo/commits/$pilot_base_ref" --jq .sha)
+git -C "$pilot_checkout" fetch --no-tags origin "$pilot_base"
+git -C "$pilot_checkout" switch --detach "$pilot_base"
+git -C "$pilot_checkout" rev-parse HEAD
+pilot_checks() {
+  docker run --rm --pull=never --network none --user "$(id -u):$(id -g)" \
+    --cap-drop ALL --security-opt no-new-privileges -e HOME=/tmp \
+    --mount "type=bind,source=$pilot_checkout,target=/workspace" -w /workspace \
+    "$pilot_image" python3 -m unittest discover -s tests -v
+}
+pilot_checks
+```
+
+Antes de etiquetar, comprueba que pasa al menos la prueba de base de `saludo("Ana")`. Mantén estable la base durante el ensayo y contrasta su SHA con `base` y `base_checked` del trabajo.
+
+### Admisión, borrador y trazabilidad
+
+1. Crea la issue de saludo sin la etiqueta. Define `pilot_issue` como su número y `pilot_target="$pilot_repo#$pilot_issue"`. Guarda `pilot_masf status --json` y `pilot_masf scan --dry-run`. Comprueba que la issue carece de trabajo y de resultado elegible. Guarda también un sondeo sin errores de `"${control[@]}" logs --timestamps controller` mientras la issue sigue sin etiqueta.
+2. Aplica la etiqueta efectiva del TOML y registra la hora UTC y el actor del evento de GitHub. Repite `pilot_masf scan --dry-run` para confirmar elegibilidad. Deja la admisión y la ejecución a cargo de `serve`. Guarda el log con la línea `OWNER/REPO#N queued` y el cierre del sondeo correspondiente, `MASF sondeo completado, errores=0`.
+3. Sigue `pilot_masf status --json` hasta `pr_open` y guarda `pilot_masf history "$pilot_target"`. Define `pilot_pr` con el `pr_number` del trabajo. Consulta el PR, verifica `isDraft: true`, la base aprobada, la rama `masf/issue-N` y el vínculo `Closes #N` en el cuerpo.
+
+   ```bash
+   gh pr view "$pilot_pr" -R "$pilot_repo" \
+     --json number,url,state,isDraft,body,baseRefName,baseRefOid,headRefName,headRefOid
+   pilot_head=$(gh pr view "$pilot_pr" -R "$pilot_repo" --json headRefOid --jq .headRefOid)
+   git -C "$pilot_checkout" fetch --no-tags origin "$pilot_head"
+   git -C "$pilot_checkout" switch --detach "$pilot_head"
+   git -C "$pilot_checkout" rev-parse HEAD
+   git -C "$pilot_checkout" diff "$pilot_base" "$pilot_head"
+   pilot_checks
+   ```
+
+   Revisa que el diff se limite al saludo y sus pruebas. Identifica en el diff y en la salida de checks las pruebas para `"  Ana  "` → `"Hola, Ana"`, `"   "` → `"Hola, mundo"` y `"Eva"` → `"Hola, Eva"`. Si hay CI, registra enlace, intento, SHA ejecutado y conclusión, distinguiendo un posible SHA de merge del head del PR.
+
+4. En la fila del trabajo de `status --json` y sus eventos de `history`, sigue los IDs de `stage_attempts` y conserva los artefactos señalados por `evidence_file` y `explanation.evidence`. Los originales quedan en `evidence/<repo_id>-<número>/` bajo el directorio de estado.
+
+   | Etapa | Campos que deben concordar |
+   | --- | --- |
+   | Plan | `plan_attempt` identifica el intento de Codex. Anota su `input_sha`, que debe ser la base aprobada, su `cli_version` y el plan devuelto. |
+   | Build | `build.stage_attempt` identifica el intento de Codex. Su evidencia referencia `plan_attempt`. Registra su `input_sha`, versión y `candidate_sha`, y contrasta este último con el evento que guardó el candidato. |
+   | Checks | Los intentos de base y de candidato se distinguen por `purpose`. El intento de `checks.stage_attempt` registra `result.passed = true`, códigos de salida cero y el SHA del candidato. |
+   | Review | `review.stage_attempt` identifica a Cursor y su versión. Su `input_sha` debe ser el candidato y su `result.verdict` debe ser `pass`. Contrasta sus referencias al plan y a los checks. |
+   | Publicación | El intento `publish` debe confirmar el PR. Su SHA, `candidate`, `published_head` y el head consultado en GitHub deben coincidir con los SHA de checks y revisión. |
+
+Si el trabajo se bloquea o cambia el head, conserva el historial y registra la incidencia. Acredita los criterios cuando el candidato publicado tenga su cadena completa en el mismo trabajo.
+
+### Dos sondeos y recreación del controlador
+
+Tras abrirse el borrador, toma una captura inicial de estado, historial y PR. Guarda dos líneas distintas de `MASF sondeo completado, errores=0` posteriores a esa captura, con sus marcas de tiempo. Toma una segunda captura y, con la cola en reposo, ejecuta `"${control[@]}" up -d --force-recreate controller` con el mismo proyecto Compose, configuración y montajes de estado y trabajos. Registra los IDs de contenedor anterior y nuevo con `"${control[@]}" ps -q controller` y guarda los logs anteriores antes de recrearlo. En nativo, reinicia la misma unidad conservando su directorio de estado y consulta su journal. Toma la tercera captura después del primer sondeo sin errores del controlador recreado.
+
+En cada captura, cuenta las filas del mismo `slug` y número de issue en `status --json`. Debe existir una sola, con el mismo identificador (`repo_id`, `number`) y los mismos `pr_number`, `pr` y `published_head`. Comprueba que el historial conserva los intentos originales. El siguiente filtro recibe por stdin cada captura de `status --json` y devuelve la identidad que se compara entre las tres.
+
+```bash
+pilot_identity() {
+  python3 -c '
+import json
+import sys
+
+slug, issue = sys.argv[1:]
+jobs = [json.loads(line) for line in sys.stdin if line.strip()]
+matches = [job for job in jobs if job["slug"] == slug and job["number"] == int(issue)]
+if len(matches) != 1 or matches[0]["state"] != "pr_open":
+    sys.exit("Se esperaba un único trabajo con PR abierto")
+fields = ("repo_id", "number", "pr_number", "pr", "published_head")
+print(json.dumps({field: matches[0][field] for field in fields}))
+' "$pilot_repo" "$pilot_issue"
+}
+```
+
+Lista los PR de la rama del trabajo en todos los estados con el comando siguiente y revisa los vínculos de la issue por si apuntan a otro PR del piloto.
+
+```bash
+gh api --paginate --method GET "repos/$pilot_repo/pulls" \
+  -f state=all -f "head=${pilot_repo%%/*}:masf/issue-$pilot_issue" -F per_page=100 \
+  --jq '.[] | {number, url: .html_url, draft, head: .head.sha}'
+```
+
+Debe aparecer un único PR con el mismo número, URL y head en cada captura. Deja el borrador abierto y el servicio activo para la decisión del operador.
+
+### Plantilla de evidencia del operador
+
+| Dato | Valor o ruta privada de la captura |
+| --- | --- |
+| Operador, host, fecha y ventana UTC | |
+| Revisión probada e instalada, huellas del motor y la política, IDs de imágenes | |
+| Registro efectivo, destino, rama y etiqueta, asignación por rol y versiones de CLI | |
+| Issue y PR (número y URL), clave del trabajo y SHA de base, candidato y head | |
+| Checks de base y del head (comandos, pruebas ejecutadas, salida y códigos) | |
+| Estado sin etiqueta, actor y hora de etiquetado, elegibilidad y sondeo de admisión | |
+| IDs, proveedores, SHA, resultados y artefactos de plan, build, checks, review y publish | |
+| CI de base y de PR si aplica (enlaces, intento, SHA y conclusión) | |
+| Dos sondeos posteriores, recreación y primer sondeo nuevo (horas, comandos y resultados) | |
+| Comparación de las tres capturas (conteos, clave del trabajo, PR y head) | |
+| Intervenciones (hora, actor, motivo, comando y resultado) y criterios pendientes | |
+
+Guarda las credenciales y los registros originales en la instalación del operador. En la evidencia compartida, usa referencias a capturas depuradas.
+
+### Cobertura registrada
+
+| Combinación | Roles y tramo observado | Evidencia |
+| --- | --- | --- |
+| Codex real | Plan, build y review del PR completo previo con Codex. | Resultado previo comunicado en el encargo. La referencia del PR y su SHA quedan por incorporar desde el registro del operador. |
+| Cursor real | Plan en una captura independiente con Cursor Agent `2026.11.11-b912975`. | [Catálogo de muestras](../tests/fixtures/README.md). |
+| Cursor real | Review de un candidato publicado como borrador en el PR #30. También se registró una revisión sobre `51f338905ecbc645789b3805c7885ff14db981fd` con veredicto `pass`. | [Recuperación del 24 de noviembre](#evidencia-de-recuperación-autónoma-del-24-de-noviembre-de-2026). |
+| Codex y Cursor reales | Build de Codex y review de Cursor en la intervención del PR #23. La revisión pidió cambios y el trabajo quedó en `needs_input`. | [Intervención del 25 de noviembre](#intervención-operativa-del-25-de-noviembre-de-2026). |
+| Claude, Codex y Cursor con dobles | Plan de Claude, build de Codex y review de Cursor intercambian plan y diff verificado hasta un PR simulado. Las pruebas de contrato ejercitan los tres roles por adaptador y las de recuperación comprueban la unicidad tras fallos simulados. | [Flujo con remoto temporal](../tests/test_factory.py), [contratos](../tests/test_operation.py) y [recuperación de procesos](../tests/test_process_recovery.py). |
+| Codex, Codex y Cursor reales mediante `serve` | Plan, build y review de una sola issue, desde el sondeo de admisión hasta el borrador y su persistencia. | Pendiente de ejecutar en el host del operador y completar la plantilla. |
 
 ## 4. Decidir si ampliar el uso
 

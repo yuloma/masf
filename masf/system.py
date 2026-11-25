@@ -55,10 +55,11 @@ def filtered(value):
 
 
 class ProcessError(RuntimeError):
-    def __init__(self, message, stdout="", stderr=""):
+    def __init__(self, message, stdout="", stderr="", returncode=None):
         super().__init__(message)
         self.stdout = clean(stdout)
         self.stderr = clean(stderr or "")
+        self.returncode = returncode
 
 
 class TaskStopped(RuntimeError):
@@ -171,6 +172,7 @@ def command(
                 f"{args[0]} ({proc.returncode}): " + clean(detail)[-1800:],
                 "" if on_stdout_line else stdout,
                 stderr,
+                proc.returncode,
             )
         return stdout.rstrip("\n")
 

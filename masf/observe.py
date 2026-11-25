@@ -452,7 +452,9 @@ def close_job(db, pr):
     ident = pr["repo_id"], pr["job"]["number"]
     row = db.execute(
         """SELECT data FROM jobs WHERE repo_id=? AND number=?
-        AND (state='pr_open' OR (state='closed' AND ?='merged'))""",
+        AND (state='pr_open' OR (state='closed' AND ?='merged'))
+        AND NOT EXISTS (SELECT 1 FROM leases WHERE leases.repo_id=jobs.repo_id
+                        AND leases.number=jobs.number AND expires>unixepoch())""",
         (*ident, pr["state"]),
     ).fetchone()
     job = load_row(row)
@@ -460,6 +462,7 @@ def close_job(db, pr):
         return
     job.pop("attempt", None)
     job["state"] = pr["state"]
+    job["integration_approval"] = None
     db.execute("UPDATE jobs SET state=?,data=? WHERE repo_id=? AND number=?", (
         pr["state"], json.dumps(filtered(job)), *ident,
     ))

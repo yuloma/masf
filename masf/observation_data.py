@@ -159,6 +159,7 @@ def stage(value):
     public["result"] = stage_result(value.get("role"), value.get("result"))
     for key, names in (("ci_origin", "id pr sha"), ("ci_result", "pr sha")):
         public[key] = fields(value[key], names) if mapping(value.get(key)) else None
+    public["conflict_origin"] = conflict(value.get("conflict_origin"))
     return public
 
 
@@ -234,6 +235,14 @@ def repair(value):
     return fields(value, "id sha pr decision") | {
         "limits": fields(value.get("counters"), "rounds functional build_limit technical technical_limit"),
         "diagnostics": [diagnostic(item) for item in items(value.get("diagnostics"))],
+    }
+
+
+def conflict(value):
+    if not mapping(value):
+        return None
+    return fields(value, "pr base head candidate status attempt decision") | {
+        "paths": strings(value.get("paths"))
     }
 
 

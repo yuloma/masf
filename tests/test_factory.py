@@ -6,8 +6,10 @@ import sys
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing
 from pathlib import Path
+from threading import Event
 from unittest.mock import patch
 from urllib.parse import quote
 
@@ -1158,24 +1160,34 @@ class Delivery(TemporaryTest):
         self.ci_logs = None
         self.prs[0]["head"].update(ref="masf/issue-1")
         self.prs[0]["head"]["repo"]["id"] = 123
-        self.prs[0]["base"] = {"ref": "main", "repo": {"id": 123}}
+        self.prs[0]["base"] = {"ref": "main", "repo": {"id": 123}, "sha": self.base}
+        self.prs[0].update(id=300, html_url=f"https://github.com/{self.job['slug']}/pull/3")
         self.pr_lookups = []
         self.feedback = []
         self.checks_seen = []
         self.fail_push_response = None
         self.extra_check_pending = False
+        self.pull_error = None
 
-        def lookup(endpoint, *, raw=False):
+        def lookup(endpoint, *, raw=False, with_headers=False):
+            if with_headers:
+                return {}, lookup(endpoint, raw=raw)
+            if "/pulls?state=open" in endpoint:
+                return [self.prs[0]] if self.prs[0]["state"] == "open" else []
             if endpoint.endswith("/pulls/3"):
+                if self.pull_error:
+                    raise self.pull_error
                 self.pr_lookups.append(3)
                 return json.loads(json.dumps(self.prs[0]))
             if "/git/ref/heads/" in endpoint:
-                return {"object": {"sha": self.worker.remote_head()}}
+                sha = self.worker.remote_base() if endpoint.endswith("/main") else self.worker.remote_head()
+                return {"object": {"sha": sha}}
             if "/actions/runs?" in endpoint:
                 sha = endpoint.split("head_sha=")[1].split("&")[0]
                 different = sha != self.old_head
                 run = dict(head_sha=sha, head_branch="masf/issue-1",
                            id=9 if different else 7,
+                           workflow_id=3,
                            run_attempt=1 if different else self.action_attempt,
                            status="completed" if different else self.action_state,
                            conclusion="success" if different else self.action_result)
@@ -1184,6 +1196,7 @@ class Delivery(TemporaryTest):
             if "/attempts/" in endpoint:
                 different = "/runs/9/" in endpoint
                 item = dict(id=90 if different else 70 + self.action_attempt,
+                            head_sha=self.prs[0]["head"]["sha"],
                             name="unit tests", status="completed",
                             conclusion="success" if different else self.action_result,
                             check_run_url="https://test.invalid/check-runs/42",
@@ -1206,6 +1219,10 @@ class Delivery(TemporaryTest):
                 return {"id": 123, "default_branch": "main"}
             if "/commits/main" in endpoint:
                 return {"sha": self.base}
+            if endpoint.endswith("/protection/required_status_checks"):
+                return {"contexts": []}
+            if "/rules/branches/" in endpoint:
+                return []
             self.fail(f"Unexpected endpoint {endpoint}")
 
         def git_or_gh(args, **kwargs):
@@ -1255,6 +1272,422 @@ class Delivery(TemporaryTest):
             if observe_only:
                 stack.enter_context(patch.object(cli, "process_task", return_value=0))
             return cli.tick(self.worker.db, self.cfg, CONFIG, self.root / "state", True)
+
+    def advance_open_pr(self, *, conflict=True, delete=False, message="base behavior"):
+        readme = self.source / "README"
+        if delete:
+            readme.unlink()
+        elif conflict:
+            readme.write_text(message + "\n")
+        (self.source / "base-feature").write_text(message)
+        command(["git", "add", "-A"], cwd=self.source)
+        command(["git", "-c", "user.name=test", "-c", "user.email=test@example.org",
+                 "commit", "-m", message], cwd=self.source)
+        self.base = command(["git", "rev-parse", "HEAD"], cwd=self.source)
+        self.prs[0]["base"]["sha"] = self.base
+        self.prs[0].update(mergeable=not conflict, mergeable_state="dirty" if conflict else "clean")
+
+    def open_conflicting_pr(self, *, delete=False):
+        self.changed = "README"
+        self.open_ci_pr()
+        self.action_result = "success"
+        self.advance_open_pr(delete=delete)
+
+    def resolve_open_conflict(self, role, job, cfg, workspace, inputs, owner, **kwargs):
+        if role != "build":
+            return self.agent(role, job, cfg, workspace, inputs, owner, **kwargs)
+        self.roles.append(role)
+        recovery = inputs["recovery"]
+        self.assertEqual(recovery["type"], "base_conflict")
+        self.assertEqual(recovery["paths"], ["README"])
+        self.assertEqual(recovery["candidate"], self.old_head)
+        self.assertEqual(recovery["base"], self.base)
+        self.assertEqual(inputs["plan"]["criteria"], ["AC1 greet"])
+        self.assertEqual((inputs["title"], inputs["body"]), (self.issue["title"], self.issue["body"]))
+        self.assertTrue((workspace / "base-feature").is_file())
+        self.assertFalse((workspace / ".git").exists())
+        (workspace / "README").write_text("2\n" + (workspace / "base-feature").read_text() + "\n")
+        return {"result": {"changes": ["AC1"]}, "provider": "test",
+                "model": {"name": "fixture-model", "availability": "available"}}
+
+    def test_open_pr_content_conflict_same_pr_evidence_and_new_ci(self):
+        from masf import cli, observe
+
+        self.open_conflicting_pr()
+        before = self.ci_job()
+        queue.save(self.worker.db, before, "pr_open", integration_approval={"sha": self.old_head})
+
+        def builder(role, job, cfg, workspace, inputs, owner, **kwargs):
+            if role == "build":
+                self.assertIn("<<<<<<<", (workspace / "README").read_text())
+            return self.resolve_open_conflict(role, job, cfg, workspace, inputs, owner, **kwargs)
+
+        def check(sha):
+            workspace = self.worker.checkout(sha)
+            self.assertEqual((workspace / "base-feature").read_text(), "base behavior")
+            if sha != self.base:
+                self.assertEqual((workspace / "README").read_text(), "2\nbase behavior\n")
+            return {"sha": sha, "passed": True, "commands": []}
+
+        with (patch.object(providers, "invoke", builder), patch.object(self, "check", check),
+              patch.object(cli, "observe", observe.observe)):
+            self.assertEqual(self.ci_tick(), 0)
+        job = self.ci_job()
+        sha = job["published_head"]
+        self.assertEqual(job["state"], "pr_open")
+        self.assertEqual(self.checks_seen, [self.base, sha])
+        self.assertEqual(job["review"]["sha"], sha)
+        self.assertEqual(job["checks"]["sha"], sha)
+        self.assertEqual(job["ci"]["state"], "waiting")
+        self.assertEqual(job["conflict_result"]["candidate"], sha)
+        self.assertIsNone(job["integration_approval"])
+        self.assertEqual(len(self.prs), 1)
+        self.assertEqual(job["pr_number"], 3)
+        self.assertEqual(self.worker.remote_head(), sha)
+        for parent in (self.base, self.old_head):
+            self.worker.git("merge-base", "--is-ancestor", parent, sha)
+        self.worker.git("merge-tree", "--write-tree", self.base, sha)
+        self.prs[0].update(mergeable=True, mergeable_state="clean")
+        with patch.object(cli, "observe", observe.observe):
+            self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["merge_observation"]["status"], "compatible")
+        self.assertEqual(self.ci_job()["ci"]["state"], "success")
+        self.assertEqual(self.ci_job()["ci"]["sha"], sha)
+        snapshots = {row["sha"]: json.loads(row["data"]) for row in self.worker.db.execute(
+            "SELECT sha,data FROM pull_ci WHERE repo_id=123 AND number=3"
+        )}
+        self.assertEqual(set(snapshots), {self.old_head, sha})
+        self.assertTrue(any(check["conclusion"] == "success"
+                            for check in snapshots[sha]["checks"].values()))
+        stages = queue.stage_attempts(self.worker.db, job)
+        build, = [stage for stage in stages if stage["role"] == "build" and stage["conflict_origin"]]
+        self.assertEqual(build["conflict_origin"]["head"], self.old_head)
+        self.assertEqual(build["model"]["name"], "fixture-model")
+        self.assertTrue(any(stage["role"] == "review" and stage["input_sha"] == self.old_head for stage in stages))
+
+    def test_open_pr_modify_delete_conflict_with_lost_push_response(self):
+        self.open_conflicting_pr(delete=True)
+        self.fail_push_response = RuntimeError
+
+        def builder(role, job, cfg, workspace, inputs, owner, **kwargs):
+            if role == "build":
+                self.assertEqual((workspace / "README").read_text(), "2")
+            result = self.resolve_open_conflict(role, job, cfg, workspace, inputs, owner, **kwargs)
+            if role == "build":
+                (workspace / "README").rename(workspace / "greeting")
+            return result
+
+        with patch.object(providers, "invoke", builder):
+            self.assertEqual(self.ci_tick(), 0)
+        job = self.ci_job()
+        self.assertEqual(job["state"], "pr_open")
+        self.assertEqual(job["published_head"], self.worker.remote_head())
+        resolved = self.worker.checkout(job["published_head"])
+        self.assertFalse((resolved / "README").exists())
+        self.assertEqual((resolved / "greeting").read_text(), "2\nbase behavior\n")
+        self.assertEqual(len(self.prs), 1)
+
+    def test_open_pr_observation_does_not_treat_ci_or_rules_as_conflicts(self):
+        self.open_ci_pr()
+        self.advance_open_pr(conflict=False)
+        self.action_state = "in_progress"
+        self.action_result = None
+        for mergeable, merge_state, expected in [
+            (None, "unknown", "pending"), (True, "unstable", "compatible"),
+            (True, "blocked", "compatible"), (False, "blocked", "pending"),
+        ]:
+            self.prs[0].update(mergeable=mergeable, mergeable_state=merge_state)
+            self.assertEqual(self.ci_tick(), 0)
+            job = self.ci_job()
+            self.assertEqual(job["state"], "pr_open")
+            self.assertEqual(job["merge_observation"]["status"], expected)
+            self.assertFalse(job.get("recoveries"))
+        self.pull_error = ProcessError("HTTP 503")
+        self.assertEqual(self.ci_tick(), 1)
+        pending = self.ci_job()
+        self.assertEqual(pending["merge_observation"]["status"], "pending")
+        self.assertFalse(pending.get("recoveries"))
+        self.pull_error = None
+        self.prs[0].update(mergeable=True, mergeable_state="blocked")
+        with patch("masf.cli.time.time", return_value=pending["ci_retry_at"] + 1):
+            self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["merge_observation"]["status"], "compatible")
+        self.assertEqual(self.roles, ["plan", "build", "review"])
+
+    def test_open_pr_merge_disagreement_keeps_observing_ci(self):
+        self.open_ci_pr()
+        self.advance_open_pr(conflict=False)
+        self.prs[0].update(mergeable=False, mergeable_state="dirty")
+        self.action_state = "in_progress"
+        self.action_result = None
+
+        self.assertEqual(self.ci_tick(), 0)
+        job = self.ci_job()
+        self.assertEqual(job["state"], "pr_open")
+        self.assertEqual(job["merge_observation"]["status"], "pending")
+        disagreement = job["conflict_result"]
+        self.assertEqual(disagreement["status"], "disagreement")
+        self.assertEqual((disagreement["base"], disagreement["head"]), (self.base, self.old_head))
+
+        for run_state, result, ci_state in [
+            ("in_progress", None, "pending"), ("completed", "success", "success"),
+        ]:
+            self.action_state, self.action_result = run_state, result
+            lookups = len(self.pr_lookups)
+            self.assertEqual(self.ci_tick(observe_only=True), 0)
+            self.assertEqual(len(self.pr_lookups), lookups + 1)
+            job = self.ci_job()
+            self.assertEqual(job["state"], "pr_open")
+            self.assertEqual(job["merge_observation"]["status"], "pending")
+            self.assertEqual(job["conflict_result"], disagreement)
+            self.assertIsNone(job["pr_conflict"])
+            self.assertFalse(job.get("recoveries"))
+            self.assertEqual((job["ci"]["sha"], job["ci"]["state"]), (self.old_head, ci_state))
+
+        self.prs[0].update(mergeable=True, mergeable_state="clean")
+        self.assertEqual(self.ci_tick(observe_only=True), 0)
+        self.assertEqual(self.ci_job()["merge_observation"]["status"], "compatible")
+        self.assertEqual(self.roles, ["plan", "build", "review"])
+
+    def test_open_pr_conflict_base_advances_during_review(self):
+        self.open_conflicting_pr()
+        original_base = self.base
+
+        def agent(role, job, cfg, workspace, inputs, owner, **kwargs):
+            result = self.resolve_open_conflict(role, job, cfg, workspace, inputs, owner, **kwargs)
+            if role == "review" and self.base == original_base:
+                self.advance_open_pr(message="newest behavior")
+            return result
+
+        with patch.object(providers, "invoke", agent):
+            self.assertEqual(self.ci_tick(), 0)
+            waiting = self.ci_job()
+            self.assertEqual(waiting["state"], "retry_wait")
+            self.assertEqual([attempt["base"] for attempt in waiting["recoveries"]], [original_base, self.base])
+            self.assertEqual(self.worker.remote_head(), self.old_head)
+            self.assertEqual(self.ci_tick(), 0)
+            self.assertEqual(self.ci_job()["state"], "retry_wait")
+            with patch("masf.cli.time.time", return_value=waiting["recovery_wait"]["until"] + 1):
+                self.assertEqual(self.ci_tick(), 0)
+        job = self.ci_job()
+        self.assertEqual(job["state"], "pr_open")
+        self.worker.git("merge-base", "--is-ancestor", self.base, job["published_head"])
+        self.assertIn(self.base, self.checks_seen)
+
+    def test_open_pr_conflict_invalid_markers_exhaustion_and_manual_resume(self):
+        from masf import cli
+
+        self.open_conflicting_pr()
+
+        def leave_markers(role, *args, **kwargs):
+            self.assertEqual(role, "build")
+            return {"result": {"changes": ["AC1"]}}
+
+        with patch.object(providers, "invoke", leave_markers):
+            self.assertEqual(self.ci_tick(), 1)
+            waiting = self.ci_job()
+            self.assertEqual(waiting["state"], "retry_wait")
+            self.assertIn("marcadores", waiting["reason"])
+            with patch("masf.cli.time.time", return_value=waiting["recovery_wait"]["until"] + 1):
+                self.assertEqual(self.ci_tick(), 1)
+        blocked = self.ci_job()
+        self.assertEqual(blocked["state"], "blocked")
+        self.assertEqual(len(blocked["recoveries"]), 2)
+        self.assertEqual(self.worker.remote_head(), self.old_head)
+        workspace = self.worker.checkout(self.old_head)
+        (workspace / "README").write_text("2\nbase behavior\n")
+        self.worker.git("add", "-A", "--", ".", workspace=workspace)
+        tree = self.worker.git("write-tree")
+        incomplete = self.worker.git("commit-tree", tree, "-p", self.base, "-m", "missing head")
+        stale_base = self.worker.git("commit-tree", tree, "-p", self.old_head, "-m", "missing base")
+        resolved = self.worker.git("commit-tree", tree, "-p", self.old_head, "-p", self.base, "-m", "resolved")
+        with (patch.object(cli, "latest", return_value=self.base),
+              patch.dict("os.environ", {"MASF_JOBS_DIR": str(self.root / "jobs")})):
+            for invalid in (incomplete, stale_base):
+                with self.assertRaisesRegex(ValueError, "ancestros"):
+                    cli.resume(self.worker.db, self.cfg, self.target, resolved_commit=invalid)
+            cli.resume(self.worker.db, self.cfg, self.target, resolved_commit=resolved)
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["published_head"], resolved)
+
+    def test_open_pr_conflict_third_party_push_in_final_window(self):
+        from masf import cli
+
+        self.open_conflicting_pr()
+        third_party = self.worker.git("commit-tree", self.old_head + "^{tree}",
+                                      "-p", self.old_head, "-m", "third party")
+        self.worker.git("push", self.worker.url, third_party + ":refs/heads/third-party")
+        original = worker.Worker.git
+
+        def update_head(instance, *args, **kwargs):
+            if args[0] == "push":
+                command(["git", "branch", "-f", "masf/issue-1", third_party], cwd=self.source)
+                self.prs[0]["head"]["sha"] = third_party
+            return original(instance, *args, **kwargs)
+
+        with (patch.object(providers, "invoke", self.resolve_open_conflict),
+              patch.object(worker.Worker, "git", update_head)):
+            self.assertEqual(self.ci_tick(), 0)
+        job = self.ci_job()
+        self.assertEqual(job["state"], "needs_input")
+        self.assertEqual(job["head_conflict"]["observed"], third_party)
+        self.assertEqual(self.worker.remote_head(), third_party)
+        cli.resume(self.worker.db, self.cfg, self.target, accept_head=third_party, evidence="Revisado")
+        self.assertEqual(self.ci_job()["published_head"], third_party)
+        self.assertIsNone(self.ci_job()["repair_intent"])
+
+    def test_open_pr_conflict_checks_eligibility_and_pr_state_after_review(self):
+        from masf import cli
+
+        for change in ("closed", "merged", "cancelled", "provenance", "scope"):
+            with self.subTest(change=change):
+                if not self.prs:
+                    self.open_conflicting_pr()
+                else:
+                    self.prs[0].update(state="open", merged_at=None, body=pr_body)
+                    self.issue.update(body=self.job["body"], labels=[{"name": self.repo["label"]}])
+                    stored = self.ci_job() | self.job | {
+                        "state": "pr_open", "recoveries": [], "pr_conflict": None,
+                        "repair_intent": None, "ci_retry_at": 0, "build_workspace": None,
+                        "scope_conflict": None, "build_recovery": None,
+                    }
+                    queue.save(self.worker.db, stored, "pr_open")
+                pr_body = self.prs[0]["body"]
+
+                def agent(role, job, cfg, workspace, inputs, owner, **kwargs):
+                    result = self.resolve_open_conflict(role, job, cfg, workspace, inputs, owner, **kwargs)
+                    if role == "review":
+                        if change in {"closed", "merged"}:
+                            self.prs[0].update(state="closed", merged_at="now" if change == "merged" else None)
+                        elif change == "cancelled":
+                            self.issue["labels"] = []
+                        elif change == "provenance":
+                            self.prs[0]["body"] = "Different provenance"
+                        else:
+                            self.issue["body"] += " revised"
+                    return result
+
+                with patch.object(providers, "invoke", agent):
+                    self.assertEqual(self.ci_tick(), 0)
+                job = self.ci_job()
+                expected = {"scope": "needs_input", "provenance": "blocked"}.get(change, change)
+                self.assertEqual(job["state"], expected)
+                self.assertEqual(self.worker.remote_head(), self.old_head)
+        cli.resume(self.worker.db, self.cfg, self.target)
+        self.assertNotEqual(self.ci_job()["fingerprint"], self.job["fingerprint"])
+        with patch.object(providers, "invoke", self.resolve_open_conflict):
+            self.assertEqual(self.ci_tick(), 0)
+            waiting = self.ci_job()
+            self.assertEqual(waiting["state"], "retry_wait")
+            with patch("masf.cli.time.time", return_value=waiting["recovery_wait"]["until"] + 1):
+                self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["state"], "pr_open")
+
+    def test_open_pr_conflict_repeated_polls_concurrent_workers_and_restart(self):
+        from masf import cli
+
+        self.open_conflicting_pr()
+        self.assertEqual(self.ci_tick(observe_only=True), 0)
+        queued = self.ci_job()
+        self.assertEqual(queued["pr_conflict"]["status"], "queued")
+        self.assertEqual(self.ci_tick(observe_only=True), 0)
+        entered, proceed = Event(), Event()
+
+        def interrupted(role, *args, **kwargs):
+            self.assertEqual(role, "build")
+            entered.set()
+            self.assertTrue(proceed.wait(5))
+            raise KeyboardInterrupt("simulated death in conflict resolution")
+
+        with (ThreadPoolExecutor(max_workers=2) as pool, patch.object(providers, "invoke", interrupted)):
+            def process():
+                return cli.process_task(self.cfg, CONFIG, self.root / "state", queued)
+
+            first = pool.submit(process)
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertEqual(pool.submit(process).result(timeout=5), 0)
+                self.assertEqual(self.ci_tick(observe_only=True), 0)
+            finally:
+                proceed.set()
+            with self.assertRaises(KeyboardInterrupt):
+                first.result(timeout=5)
+        self.assertEqual(len(self.ci_job()["recoveries"]), 1)
+        self.assertEqual(self.ci_tick(), 0)
+        waiting = self.ci_job()
+        self.assertEqual(waiting["state"], "retry_wait")
+        self.assertEqual(len(waiting["recoveries"]), 2)
+        self.assertEqual(self.ci_tick(), 0)
+        self.fail_push_response = KeyboardInterrupt
+        with (patch.object(providers, "invoke", self.resolve_open_conflict),
+              patch("masf.cli.time.time", return_value=waiting["recovery_wait"]["until"] + 1)):
+            with self.assertRaises(KeyboardInterrupt):
+                self.ci_tick()
+        intent = self.ci_job()["repair_intent"]
+        self.assertEqual(self.worker.remote_head(), intent["target"])
+        self.prs[0]["head"]["sha"] = self.old_head
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["state"], "publishing")
+        self.prs[0]["head"]["sha"] = intent["target"]
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["published_head"], intent["target"])
+        self.assertEqual(len(self.prs), 1)
+
+    def test_open_pr_conflict_zero_budget_has_operator_diagnostic(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        from masf import cli
+        from masf.observation_api import Query, View
+
+        self.open_conflicting_pr()
+        self.cfg["service"]["max_recovery_attempts"] = 0
+        self.assertEqual(self.ci_tick(), 1)
+        job = self.ci_job()
+        self.assertEqual(job["state"], "blocked")
+        self.assertFalse(job.get("recoveries"))
+        self.assertEqual(self.worker.remote_head(), self.old_head)
+        view = View(self.worker.db, self.root / "state", CONFIG)
+        observed = view.dispatch(["jobs", "123", "1"], Query(""))["data"]
+        self.assertEqual(observed["pr_conflict"]["paths"], ["README"])
+        self.assertIn("resume --resolved-commit", observed["intervention"]["conflict_action"])
+        output = StringIO()
+        with (patch.object(cli, "xdg", return_value=self.root / "state"),
+              patch.object(sys, "argv", ["masf", "--config", str(CONFIG), "status", "--json"]),
+              redirect_stdout(output)):
+            self.assertEqual(cli.main(), 0)
+        self.assertEqual(json.loads(output.getvalue())["conflict_action"],
+                         observed["intervention"]["conflict_action"])
+        events = view.dispatch(["jobs", "123", "1", "events"], Query(""))["data"]
+        self.assertTrue(any((event["pr_conflict"] or {}).get("base") == self.base for event in events))
+
+    def test_open_pr_conflict_protected_path_and_push_permissions(self):
+        from masf import cli
+
+        self.open_conflicting_pr()
+        job = self.ci_job()
+        job["repo"]["protected_paths"].append("README")
+        queue.save(self.worker.db, job, "pr_open")
+        with patch.object(providers, "invoke", self.resolve_open_conflict):
+            self.assertEqual(self.ci_tick(), 1)
+        self.assertEqual(self.ci_job()["blocked_paths"], ["README"])
+        self.assertEqual(self.worker.remote_head(), self.old_head)
+        cli.resume(self.worker.db, self.cfg, self.target, ["README"])
+        original = worker.Worker.git
+
+        def denied(instance, *args, **kwargs):
+            if args[0] == "push":
+                raise ProcessError("remote: protected branch")
+            return original(instance, *args, **kwargs)
+
+        with patch.object(worker.Worker, "git", denied):
+            self.assertEqual(self.ci_tick(), 1)
+        self.assertIn("Revisa permisos", self.ci_job()["reason"])
+        self.assertEqual(self.worker.remote_head(), self.old_head)
+        cli.resume(self.worker.db, self.cfg, self.target)
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["published_head"], self.worker.remote_head())
+        self.assertEqual(self.roles.count("build"), 2)
 
     def test_ci_repair_delivers_and_observes_same_pr(self):
         self.open_ci_pr()

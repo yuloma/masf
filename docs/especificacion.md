@@ -33,6 +33,7 @@ La unidad de trabajo es `(id numérico del repositorio de GitHub, número de iss
 | `checking` | El servicio comprueba rutas protegidas y ejecuta los checks sobre ese commit. Un fallo funcional devuelve el trabajo a `building` si queda una ronda. Un cambio en una ruta protegida lleva a `blocked`. El operador puede autorizar archivos exactos para ese trabajo mediante `resume --allow-protected-path RUTA`. El permiso queda registrado y vinculado a la huella vigente de la issue. |
 | `reviewing` | El rol `review` lee el diff, los criterios y la evidencia de checks del mismo SHA. Devuelve `pass` o `changes_requested` con hallazgos concretos. Se permite otra ronda dentro del límite. |
 | `publishing` → `pr_open` | Con checks y revisión favorables para el SHA vigente, el servicio publica una rama `masf/issue-<n>` y abre o recupera su PR. La descripción incluye criterios, resultado de checks y `Closes #<n>`. |
+| `pr_open` → `building` | Un conflicto de integración observado en un PR vinculado reserva el trabajo para contrastar sus referencias con Git y recuperar el árbol combinado. |
 | `retry_wait` | Un timeout, una salida incompleta o un fallo temporal reconocido conserva la etapa, SHA y evidencia. El servicio espera hasta la fecha persistida y vuelve a reclamar el trabajo. El plazo de GitHub tiene prioridad sobre la espera exponencial. |
 | `needs_input` / `blocked` | El operador ve el motivo mediante `status`. Se requiere intervención para preguntas, acceso denegado, rutas protegidas, errores no recuperables o presupuesto agotado. `resume` reevalúa la elegibilidad y permite continuar tras atender la causa. |
 | `merged` / `closed` / `cancelled` | El servicio refleja un PR fusionado o cerrado. Si la issue se cierra o pierde la etiqueta antes de publicar, cancela el trabajo pendiente. |
@@ -99,6 +100,18 @@ Se consultan las ejecuciones de GitHub Actions del head y la rama del PR, los ch
 
 Los códigos numéricos de cuota, acceso e infraestructura requieren contexto HTTP explícito, como `HTTP 429`, `status code: 403` o `response code: 503`. Los tiempos de construcción (`4.429`) y los nombres de pruebas aprobadas (`test_rate_limit`) no bastan para bloquear el trabajo. Con esos mensajes incidentales y un `AssertionError`, el diagnóstico sigue siendo funcional y permite reparar dentro del límite de rondas.
 
+### Conflictos de integración en un PR abierto
+
+El sondeo valida el vínculo, la procedencia y las ramas del PR. Contrasta los SHAs de base y head con sus referencias y registra la observación como `pending`, `compatible` o `conflicting`. Un resultado de mergeabilidad desconocido, una discrepancia en las referencias o un error temporal de GitHub deja pendiente la observación. Se vuelve a consultar sin gastar presupuesto de resolución. Los checks pendientes y las reglas de protección se observan por separado.
+
+Si GitHub devuelve `dirty` y Git obtiene una integración limpia para esos SHAs, el trabajo vuelve a `pr_open` con la mergeabilidad pendiente y el resultado `disagreement`. Los siguientes sondeos consultan de nuevo la mergeabilidad y siguen observando el CI del head. Mientras persista el desacuerdo para la misma combinación de PR, base, head y alcance, el controlador evita encolar otra resolución.
+
+Una reserva por trabajo evita que dos sondeos o workers tramiten a la vez la misma combinación de PR, base, head y huella de alcance. El controlador confirma el conflicto con `git merge-tree` y entrega al implementador la copia aislada del árbol combinado, las rutas en conflicto, la issue, el plan y sus criterios. La resolución debe preservar el comportamiento de la base y el cambio de la issue. El candidato conserva ambos ancestros y pasa por la validación de marcadores, rutas protegidas, checks de la base y del candidato y revisión del candidato. Los intentos comparten el presupuesto y la espera exponencial persistente de `base_conflict`.
+
+Antes del push se revalidan el PR abierto, su procedencia, la elegibilidad y el alcance de la issue y las referencias de Git. Si avanza la base, se recalcula sobre las referencias vigentes. Si cambia el head, se pide revisar y autorizar ese SHA. El controlador guarda la intención con los SHAs y actualiza la rama del mismo PR con una condición sobre el head esperado. Tras un reinicio o una respuesta perdida, consulta el remoto y el PR para confirmar ese mismo intento. El candidato actualizado inicia su propia observación de CI y los checks, revisiones y observaciones anteriores siguen disponibles por SHA. Las referencias obsoletas invalidan la autorización de integración registrada. El operador conserva la decisión de merge.
+
+Git aplica la condición al head en el servidor. La base se comprueba justo antes del push y el siguiente sondeo vuelve a observar el PR si hay otro avance.
+
 ### Operaciones del controlador
 
 Ejecuta estos comandos con el TOML y el estado habituales de la instalación. La evidencia indica qué verificó el operador y qué autoriza. Las decisiones quedan asociadas a su identidad local, el trabajo, la huella de la issue y los SHAs correspondientes.
@@ -111,10 +124,13 @@ masf history 'OWNER/REPO#10'
 masf resume 'OWNER/REPO#10' --accept-head SHA --evidence 'Diff y procedencia del nuevo head revisados'
 masf resume 'OWNER/REPO#10' --add-rounds 1 --evidence 'Autorizada una ronda para el fallo registrado'
 masf resume 'OWNER/REPO#10' --allow-protected-path .github/workflows/factory.yml
+masf resume 'OWNER/REPO#10' --resolved-commit SHA
 masf link-pr 'OWNER/REPO#10' --pr 23 --head SHA --evidence 'Issue, PR y alcance verificados'
 ```
 
 `--accept-head` requiere el SHA observado en el conflicto y lo contrasta con el PR y su referencia. `--add-rounds` amplía un límite agotado para la huella vigente y puede acompañar la reconciliación del head. Un fallo de CI de acceso, cuota, configuración o evidencia insuficiente se reexamina con `resume` tras atender la causa y solicitar un rerun. Las autorizaciones de rutas siguen siendo por archivo exacto y por trabajo. `link-pr` exige una issue elegible, un PR abierto del mismo repositorio y la rama `masf/issue-N` hacia la base configurada. La vinculación permite iniciar el diagnóstico y solicitar la planificación cuando falte un plan.
+
+`--resolved-commit` selecciona un commit local revisado por el operador que conserva la base y el head vigentes. Se admite al bloquearse una actualización de base, antes de la primera publicación o con el PR abierto. `status --json` expone `merge_observation`, la recuperación `pr_conflict`, el último `conflict_result` y la acción `conflict_action` cuando procede.
 
 ## Proveedores y contrato de etapa
 

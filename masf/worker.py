@@ -11,8 +11,8 @@ from urllib.parse import urlencode
 
 from . import checks, ci, providers
 from .evidence import agent_explanation, explanation, model, provenance, timestamp, usage, write_artifact
-from .queue import api, interrupt_stages, latest, record_stage, require_lease, save, stage_attempts
-from .recovery import RecoverableFailure, reserve
+from .queue import api, interrupt_stages, latest, record_stage, require_lease, retry_delay, save, stage_attempts
+from .recovery import RecoverableFailure, reserve, wait
 from .system import ProcessError, TaskStopped, clean, command, docker_env, filtered
 
 
@@ -124,6 +124,7 @@ class Worker:
             "pr": job.get("pr_number"),
             "ci_origin": {"pr": job.get("pr_number"), "sha": repair["sha"], "key": repair["key"], "id": repair.get("id")}
                          if repair.get("key") and repair.get("sha") else None,
+            "conflict_origin": job.get("pr_conflict"),
         }
         start = time.monotonic()
         record_stage(self.db, job, record, boundary="started")
@@ -279,21 +280,166 @@ class Worker:
             checks.remove_profiles(stop, Path(workspace))
             file.unlink()
 
+    def merge_tree(self, base, candidate):
+        try:
+            return self.git("merge-tree", "--write-tree", "-z", base, candidate).rstrip("\0"), []
+        except ProcessError as exc:
+            if exc.returncode != 1:
+                raise
+            tree, *entries = exc.stdout.split("\0")
+            if not re.fullmatch(r"(?:[a-f0-9]{40}|[a-f0-9]{64})", tree):
+                raise
+            paths = set()
+            index = 0
+            while entries[index]:
+                paths.add(entries[index].split("\t", 1)[1])
+                index += 1
+            index += 1
+            while index < len(entries) and entries[index]:
+                count = int(entries[index])
+                if entries[index + count + 1].startswith("CONFLICT"):
+                    paths.update(entries[index + 1:index + count + 1])
+                index += count + 3
+            if not paths:
+                raise
+            return tree, sorted(paths)
+
+    def check_resolution(self, candidate, base, head, paths):
+        for ancestor in (base, head):
+            try:
+                self.git("merge-base", "--is-ancestor", ancestor, candidate)
+            except ProcessError as exc:
+                if exc.returncode != 1:
+                    raise
+                raise RecoverableFailure(
+                    "La resolución debe conservar el head de entrada y la base como ancestros"
+                ) from None
+        changed = self.git("diff", "--no-renames", "--name-only", "-z", base, candidate)
+        tracked = {entry.split("\t", 1)[1] for entry in
+                   self.git("ls-tree", "-r", "-z", candidate).split("\0")
+                   if entry and entry.split(" ", 2)[1] == "blob"}
+        for path in sorted((set(changed.split("\0")) | set(paths)) & tracked):
+            content = self.git("show", f"{candidate}:{path}")
+            if re.search(r"^(?:<{7,}|={7,}|>{7,}|\|{7,})(?:[ \t].*)?$", content, re.MULTILINE) or (
+                path in paths and re.search(r"^<+ .+\n[\s\S]*?^=+\n[\s\S]*?^>+ .+$", content, re.MULTILINE)
+            ):
+                raise RecoverableFailure("La resolución conservó marcadores de conflicto")
+
+    def start_base_conflict(self, base, candidate, tree, paths, *, pull=None):
+        j = self.job
+        conflict = {"base": base, "candidate": candidate, "paths": paths}
+        action = "Resolver el árbol combinado y preservar los criterios de la issue y el comportamiento de la base"
+        updates = {"base_conflict": conflict}
+        if pull:
+            pull = pull | {"paths": paths, "status": "confirmed", "decision": action}
+            updates.update(pr_conflict=pull, integration_approval=None,
+                           candidate=candidate, base_checked=None, checks={}, review={}, repair_intent=None,
+                           build_workspace=None, build_recovery=None)
+        self.git("update-ref", "refs/masf/conflict-tree", tree)
+        self.update("building" if pull else "publishing", **updates)
+        try:
+            history = reserve(j, self.cfg, "resolve_base", **conflict)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"{exc}. Conflicto en {', '.join(paths)}. Usa resume --resolved-commit SHA"
+            ) from None
+        updates = dict(base=base, recoveries=history, repair_intent=None, build_workspace=None,
+                       build_recovery=conflict | {"type": "base_conflict", "tree": tree},
+                       feedback={"type": "base_conflict", "paths": paths, "instruction": action})
+        if pull:
+            updates["pr_conflict"] = pull | {"status": "resolving", "attempt": len(history)}
+        else:
+            base_report = self.test(base)
+            if not base_report["passed"]:
+                if base_report.get("retryable"):
+                    raise RecoverableFailure("Infraestructura temporal en la nueva base")
+                raise RuntimeError("Fallan los checks de la nueva base")
+            updates["base_checked"] = base
+        if pull and len(history) > 1:
+            self.update("retry_wait", recovery_wait=wait(self.cfg, history, "building"), **updates)
+        else:
+            self.update("building", **updates)
+
+    def remote_base(self):
+        output = self.git("ls-remote", "--refs", self.url, "refs/heads/" + self.job["branch"])
+        return output.split()[0] if output else None
+
+    def pending_merge(self, reason, *, pr=None):
+        j = self.job
+        observation = {"pr": j["pr_number"], "fingerprint": j["fingerprint"], "status": "pending",
+                       "base": (pr or {}).get("base", {}).get("sha"),
+                       "head": (pr or {}).get("head", {}).get("sha")}
+        self.update(j["state"], merge_observation=observation, reason=reason,
+                    ci_retry_at=time.time() + max(retry_delay(), self.cfg["service"].get("ci_retry_seconds", 60)))
+
+    def defer_pr_observation(self, exc):
+        if re.search(ci.SIGNALS["access"], str(exc), re.I) and not retry_delay():
+            raise RuntimeError("Acceso insuficiente. Revisa los permisos de GitHub y usa resume") from exc
+        self.pending_merge("Observación del PR pendiente: " + ci.excerpt(str(exc)))
+        return True
+
+    def sync_pr_conflict(self):
+        """Validate the PR and its Git refs, then refresh recovery if its input changed."""
+        j = self.job
+        conflict = j["pr_conflict"]
+        try:
+            pr = ci.pull(j, api)
+            head = ci.expected_head(j)
+            if not ci.validate(self.db, j, pr, {head}) or not self.admission():
+                return False
+            remote_head = self.remote_head()
+            if remote_head != head:
+                ci.head_conflict(self.db, j, pr["head"]["sha"], remote_head)
+                return False
+            base = self.remote_base()
+        except (OSError, ProcessError, KeyError, TypeError, ValueError) as exc:
+            self.defer_pr_observation(exc)
+            return False
+        if not base or base != pr["base"].get("sha"):
+            self.pending_merge("GitHub aún no refleja la base vigente del PR", pr=pr)
+            return False
+        current = (base, head, j["fingerprint"])
+        recorded = (conflict["base"], conflict["head"], conflict["fingerprint"])
+        if current == recorded and conflict["status"] in {"resolving", "resolved"}:
+            return True
+        status = ci.merge_status(pr)
+        if status == "pending":
+            self.pending_merge("Mergeabilidad del PR pendiente en GitHub", pr=pr)
+            return False
+        for sha in (base, head):
+            self.git("fetch", "--no-tags", self.url, sha)
+        tree, paths = self.merge_tree(base, head)
+        observation = {"pr": pr["number"], "base": base, "head": head,
+                       "fingerprint": j["fingerprint"], "status": status}
+        if not paths:
+            outcome = "disagreement" if status == "conflicting" else "compatible"
+            reason = ("Git no confirma el conflicto de GitHub para estas referencias"
+                      if outcome == "disagreement" else "La base vigente es compatible con el head")
+            self.update("pr_open", merge_observation=observation | {
+                            "status": "pending" if outcome == "disagreement" else outcome},
+                        pr_conflict=None, conflict_result=observation | {"status": outcome, "decision": reason},
+                        candidate=head, build_workspace=None,
+                        build_recovery=None, base_conflict=None, repair_intent=None,
+                        **{key: j.get(key, {}) if (j.get(key) or {}).get("sha") == head else {}
+                           for key in ("checks", "review")},
+                        integration_approval=None, reason=reason, ci_retry_at=0)
+            return False
+        if status != "conflicting":
+            self.pending_merge("Git y GitHub discrepan sobre la mergeabilidad vigente", pr=pr)
+            return False
+        self.update(j["state"], merge_observation=observation, ci_retry_at=0)
+        self.start_base_conflict(base, head, tree, paths, pull=observation)
+        return j["state"] != "retry_wait"
+
     def process(self):
         j = self.job
         repo = j["repo"]
         interrupt_stages(self.db, j)
         self.update(j["state"])
         self.recover()
-        if j.get("pr_number"):
-            pr = ci.pull(j, api)
-            if pr["state"] != "open":
-                ci.validate(self.db, j, pr, set())
-                return
-            if not self.admission():
-                return
-            if j.get("repair_intent") and self.publication(self.publish_repair, recover=True):
-                return
+        if j.get("repair_intent") and self.publication(self.publish_repair, recover=True):
+            return
+        if j.get("pr_number") and not j.get("pr_conflict"):
             if not self.pr_head():
                 return
             if j.get("ci_repair") and j["state"] in {"building", "checking"}:
@@ -305,12 +451,15 @@ class Worker:
                     return
                 if j.get("ci_retry_at", 0) > time.time():
                     return
-        elif j.get("intent") and self.publication(self.reconcile_publication):
-            return
-        if not self.admission():
+        elif not j.get("pr_number") and j.get("intent") and self.publication(self.reconcile_publication):
             return
         if not self.store.exists():
             command(["git", "init", "--bare", str(self.store)])
+        if j.get("pr_conflict"):
+            if not self.sync_pr_conflict():
+                return
+        elif not self.admission():
+            return
         self.git("fetch", "--no-tags", self.url, j["base"])
         if j.get("pr_number"):
             self.git("fetch", "--no-tags", self.url, ci.expected_head(j))
@@ -321,9 +470,9 @@ class Worker:
                     raise RecoverableFailure(
                         "Infraestructura temporal al comprobar la base"
                     )
-                raise RuntimeError(
-                    "Fallan los checks de la base: " + str(report["commands"][-1])
-                )
+                commands = report.get("commands")
+                detail = f": {commands[-1]}" if commands else ""
+                raise RuntimeError("Fallan los checks de la base" + detail)
             self.update(j["state"] if j.get("pr_number") else "planning", base_checked=j["base"])
         if not j.get("plan"):
             planning = self.role("plan", j["base"], self.checkout(j["base"]))
@@ -334,9 +483,14 @@ class Worker:
                 return
             self.update("building", plan=result, reason="", plan_attempt=planning.get("stage_attempt"))
         while self.admission():
+            conflict = j.get("pr_conflict")
             candidate = j.get("candidate")
             if not candidate or j["state"] == "building":
-                if j.get("pr_number") and not self.pr_head():
+                if conflict:
+                    base = j["base"]
+                    if not self.sync_pr_conflict() or j["base"] != base:
+                        return
+                elif j.get("pr_number") and not self.pr_head():
                     return
                 recovery = j.get("build_recovery") or {}
                 checkpoint = j.get("build_workspace") or {}
@@ -349,6 +503,13 @@ class Worker:
                 ):
                     history = reserve(j, self.cfg, "resume_build", candidate=candidate)
                     recovery = {**(recovery or {"type": "retry"}), "started": False}
+                    if conflict:
+                        reason = "Resolución interrumpida. Reintento programado"
+                        self.update("retry_wait", recoveries=history, build_recovery=recovery,
+                                    recovery_wait=wait(self.cfg, history, "building"),
+                                    reason=reason, pr_conflict=conflict | {
+                                        "attempt": len(history), "decision": reason})
+                        return
                     self.update("building", recoveries=history, build_recovery=recovery)
                 normal_rounds = j["rounds"] - j.get("recovery_builds", 0)
                 counts = ci.limits(j, self.cfg)
@@ -389,7 +550,7 @@ class Worker:
                 }
                 if not same_round:
                     fields = {}
-                    if j.get("pr_number"):
+                    if j.get("pr_number") and not conflict:
                         fields["ci_rounds"] = j.get("ci_rounds", 0) + 1
                     self.update(
                         "building", rounds=checkpoint["round"], build_workspace=checkpoint,
@@ -421,24 +582,10 @@ class Worker:
                     raise RuntimeError("Metadatos Git dentro de la copia del agente")
                 self.git("add", "-A", "--", ".", workspace=workspace)
                 tree = self.git("write-tree")
-                if recovery.get("type") == "base_conflict":
-                    tracked = set(
-                        self.git("ls-tree", "-r", "--name-only", tree).splitlines()
-                    )
-                    for path in recovery["paths"]:
-                        content = (
-                            self.git("show", f"{tree}:{path}")
-                            if path in tracked
-                            else ""
-                        )
-                        if re.search(
-                            r"^(?:<<<<<<< |=======\s*$|>>>>>>> )", content, re.MULTILINE
-                        ):
-                            raise RecoverableFailure(
-                                "El agente conservó marcadores de conflicto"
-                            )
                 parent = start if j.get("pr_number") and recovery.get("type") != "base_conflict" else j["base"]
-                if tree == self.git("rev-parse", parent + "^{tree}"):
+                if (recovery.get("type") != "base_conflict" or not j.get("pr_number")) and (
+                    tree == self.git("rev-parse", parent + "^{tree}")
+                ):
                     if j.get("pr_number"):
                         self.update("building", build=build, build_workspace=None,
                                     feedback={"previous": j.get("feedback"),
@@ -449,7 +596,21 @@ class Worker:
                 if recovery.get("type") == "base_conflict":
                     parents += ["-p", recovery["candidate"]]
                 candidate = self.git("commit-tree", tree, *parents, "-m", j["title"])
+                if recovery.get("type") == "base_conflict":
+                    try:
+                        self.check_resolution(candidate, j["base"], recovery["candidate"], recovery["paths"])
+                    except RecoverableFailure as exc:
+                        if conflict:
+                            self.git("update-ref", f"refs/masf/invalid/{candidate}", candidate)
+                            self.update("building", build=build, build_workspace=None,
+                                        conflict_result=conflict | {"status": "invalid",
+                                                                    "candidate": candidate, "decision": str(exc)})
+                        raise
                 self.git("update-ref", "refs/heads/candidate", candidate)
+                resolved = {}
+                if conflict:
+                    conflict = conflict | {"status": "resolved", "candidate": candidate}
+                    resolved["pr_conflict"] = conflict
                 self.update(
                     "checking",
                     candidate=candidate,
@@ -457,6 +618,7 @@ class Worker:
                     build_workspace=None,
                     build_recovery=None,
                     base_conflict=None,
+                    **resolved,
                 )
             paths = self.git(
                 "diff", "--no-renames", "--name-only", "-z", j["base"], candidate
@@ -473,7 +635,7 @@ class Worker:
                 report = self.test(candidate)
                 if not report["passed"]:
                     if report.get("failure_kind") == "infrastructure":
-                        if j.get("pr_number"):
+                        if j.get("pr_number") and not conflict:
                             counts = ci.limits(j, self.cfg)
                             if counts["technical"] < counts["technical_limit"]:
                                 self.update("checking", checks=report,
@@ -493,6 +655,8 @@ class Worker:
                             "Fallo de infraestructura en checks, reanudar tras corregirlo"
                         )
                     self.update("building", feedback=report, checks=report)
+                    if conflict:
+                        self.retry_resolution(candidate, "Fallaron los checks de la resolución")
                     continue
                 self.update("reviewing", checks=report)
             repair = j.get("ci_repair") or {}
@@ -516,81 +680,21 @@ class Worker:
                 )
                 if review["result"]["verdict"] != "pass":
                     self.update("building", feedback=review["result"], review=review)
+                    if conflict:
+                        self.retry_resolution(candidate, "La revisión pidió cambios en la resolución")
                     continue
                 self.update("publishing", review=review)
             if not self.admission():
                 return
+            if conflict:
+                self.publication(self.publish_repair)
+                return
             current = latest(j["slug"], j["branch"])
             if current != j["base"]:
                 self.git("fetch", "--no-tags", self.url, current)
-                try:
-                    tree = self.git("merge-tree", "--write-tree", current, candidate)
-                except ProcessError as exc:
-                    if "CONFLICT" not in exc.stdout:
-                        raise
-                    paths = sorted(
-                        set(
-                            re.findall(
-                                r"^\d+ [0-9a-f]+ [123]\t(.+)$", exc.stdout, re.MULTILINE
-                            )
-                        )
-                    )
-                    self.update(
-                        "publishing",
-                        base_conflict={
-                            "base": current,
-                            "candidate": candidate,
-                            "paths": paths,
-                        },
-                    )
-                    tree = exc.stdout.splitlines()[0]
-                    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", tree):
-                        raise RuntimeError(
-                            "Git no devolvió un árbol de conflicto válido"
-                        ) from None
-                    try:
-                        history = reserve(
-                            j,
-                            self.cfg,
-                            "resolve_base",
-                            base=current,
-                            candidate=candidate,
-                            paths=paths,
-                        )
-                    except RuntimeError as exhausted:
-                        raise RuntimeError(
-                            str(exhausted)
-                            + ". Conflicto en "
-                            + ", ".join(paths)
-                            + ". Revisa la resolución y usa resume --resolved-commit SHA"
-                        ) from None
-                    base_report = self.test(current)
-                    if not base_report["passed"]:
-                        if base_report.get("retryable"):
-                            raise RecoverableFailure(
-                                "Infraestructura temporal en la nueva base"
-                            )
-                        raise RuntimeError("Fallan los checks de la nueva base")
-                    self.update(
-                        "building",
-                        base=current,
-                        base_checked=current,
-                        recoveries=history,
-                        repair_intent=None,
-                        build_workspace=None,
-                        build_recovery={
-                            "type": "base_conflict",
-                            "tree": tree,
-                            "base": current,
-                            "candidate": candidate,
-                            "paths": paths,
-                        },
-                        feedback={
-                            "type": "base_conflict",
-                            "paths": paths,
-                            "instruction": "Resolve conflict markers preserving the issue criteria and current base behavior.",
-                        },
-                    )
+                tree, paths = self.merge_tree(current, candidate)
+                if paths:
+                    self.start_base_conflict(current, candidate, tree, paths)
                     continue
                 prior = ["-p", candidate] if j.get("pr_number") else []
                 rebased = self.git("commit-tree", tree, "-p", current, *prior, "-m", j["title"])
@@ -618,6 +722,15 @@ class Worker:
             else:
                 self.publication(self.publish)
             return
+
+    def retry_resolution(self, candidate, reason):
+        j = self.job
+        conflict = j["pr_conflict"]
+        self.update("building", build_workspace=None, build_recovery={
+            "type": "base_conflict", "candidate": candidate, "base": j["base"],
+            "paths": conflict["paths"], "tree": self.git("rev-parse", candidate + "^{tree}"),
+        })
+        raise RecoverableFailure(reason)
 
     def remote_head(self):
         args = ("ls-remote", self.url, "refs/heads/" + ci.branch(self.job))
@@ -679,30 +792,48 @@ class Worker:
         sha = j["candidate"]
         expected = ci.expected_head(j)
         require_lease(self.db, j)
-        pr = ci.pull(j, api)
+        try:
+            pr = ci.pull(j, api)
+        except (OSError, ProcessError, KeyError, TypeError) as exc:
+            if not j.get("pr_conflict"):
+                raise
+            return self.defer_pr_observation(exc)
         if pr["state"] != "open":
             ci.validate(self.db, j, pr, set())
             return True
-        if not self.admission():
-            return True
         intent = j.get("repair_intent")
+        expected_intent = {"pr": j["pr_number"], "expected": expected, "target": sha}
+        if j.get("pr_conflict"):
+            expected_intent.update(base=j["base"], fingerprint=j["fingerprint"])
         if not (j.get("checks", {}).get("passed")
                 and j["checks"]["sha"] == j.get("review", {}).get("sha") == sha
                 and j["review"]["result"]["verdict"] == "pass"):
             raise RuntimeError("Falta la aprobación del SHA reparado")
         if not ci.validate(self.db, j, pr, {expected, sha} if intent else {expected}):
             return True
-        remote = self.remote_head()
+        try:
+            remote = self.remote_head()
+        except (OSError, ProcessError) as exc:
+            if not j.get("pr_conflict"):
+                raise
+            return self.defer_pr_observation(exc)
         if intent:
-            if intent != {"pr": j["pr_number"], "expected": expected, "target": sha}:
+            if intent != expected_intent:
                 raise RuntimeError("Intención de actualización incompatible con el trabajo")
             if remote == sha:
                 if pr["head"]["sha"] == sha:
+                    conflict = j.get("pr_conflict")
                     self.update(
                         "pr_open", published_head=sha, repair_intent=None, ci_repair=None,
                         ci_intervention=False, ci_retry_at=0,
                         ci={"sha": sha, "state": "waiting", "checks": [], "pending_runs": []},
                         reason="",
+                        **({"pr_conflict": None, "integration_approval": None,
+                            "conflict_result": conflict | {"status": "published", "candidate": sha},
+                            "merge_observation": {"pr": j["pr_number"], "base": j["base"],
+                                                  "head": sha, "status": "pending",
+                                                  "fingerprint": j["fingerprint"]}}
+                           if conflict else {}),
                     )
                 return True
             if remote != expected or pr["head"]["sha"] != expected:
@@ -717,16 +848,31 @@ class Worker:
 
         if sha == expected:
             raise RuntimeError("La reparación no produjo un SHA nuevo")
-        if not self.admission() or not self.pr_head():
+        if not j.get("pr_conflict") and (not self.admission() or not self.pr_head()):
             return True
-        intent = {"pr": j["pr_number"], "expected": expected, "target": sha}
+        intent = expected_intent
         if getattr(self, "publication_record", None) is not None:
             self.publication_record["publication_intent"] = intent
         self.update("publishing", repair_intent=intent, publication_intent_attempt=j.get("_stage"))
+        if j.get("pr_conflict"):
+            self.check_resolution(sha, j["base"], expected, j["pr_conflict"]["paths"])
+            if not self.sync_pr_conflict() or j.get("candidate") != sha:
+                return True
         ref = "refs/heads/" + ci.branch(j)
         push = ("push", "--force-with-lease=" + ref + ":" + expected, self.url, sha + ":" + ref)
         self.publication_command("git", *push)
-        self.git(*push, guard=lambda: require_lease(self.db, j))
+        try:
+            self.git(*push, guard=lambda: require_lease(self.db, j))
+        except (OSError, RuntimeError) as exc:
+            if j.get("pr_conflict") and self.publish_repair(recover=True):
+                return True
+            if j.get("pr_conflict") and re.search(
+                ci.SIGNALS["access"] + r"|protected branch|repository rule|write access", str(exc), re.I
+            ):
+                raise RuntimeError(
+                    "Git rechazó el push. Revisa permisos y reglas de la rama del PR y usa resume"
+                ) from exc
+            raise
         return self.publish_repair(recover=True)
 
     def existing_pr(self):

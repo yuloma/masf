@@ -25,7 +25,15 @@ def reserve(job, cfg, action, **detail):
     limit = cfg["service"].get("max_recovery_attempts", 2)
     if len(history) >= limit:
         raise RuntimeError("Recuperaciones automáticas agotadas")
-    return [*history, {"action": action, "at": time.time(), **detail}]
+    conflict = job.get("pr_conflict") or {}
+    inputs = {key: conflict[key] for key in ("pr", "base", "head", "fingerprint", "paths")
+              if key in conflict}
+    return [*history, {"action": action, "at": time.time(), **inputs, **detail}]
+
+
+def wait(cfg, history, stage, minimum_delay=0):
+    delay = cfg["service"].get("recovery_backoff_seconds", 30) * 2 ** (len(history) - 1)
+    return {"stage": stage, "until": time.time() + max(delay, minimum_delay)}
 
 
 def retryable(exc):
@@ -70,6 +78,7 @@ def schedule(job, cfg, exc, *, minimum_delay=0):
     )
     if not retryable(exc) and not rate_limited:
         return None
+    conflict = job.get("pr_conflict")
     try:
         history = reserve(
             job,
@@ -81,13 +90,9 @@ def schedule(job, cfg, exc, *, minimum_delay=0):
         )
     except RuntimeError:
         return None
-    delay = cfg["service"].get("recovery_backoff_seconds", 30) * 2 ** (len(history) - 1)
     updates = {
         "recoveries": history,
-        "recovery_wait": {
-            "stage": job["state"],
-            "until": time.time() + max(delay, minimum_delay),
-        },
+        "recovery_wait": wait(cfg, history, job["state"], minimum_delay),
         "reason": text,
     }
     if job["state"] == "building":
@@ -95,4 +100,6 @@ def schedule(job, cfg, exc, *, minimum_delay=0):
             **(job.get("build_recovery") or {"type": "retry"}),
             "started": False,
         }
+    if conflict:
+        updates["pr_conflict"] = conflict | {"attempt": len(history), "decision": text}
     return updates

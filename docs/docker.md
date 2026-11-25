@@ -145,13 +145,13 @@ El modo no interactivo de Cursor permite ejecutar las herramientas necesarias du
 
 Si la rama base avanza y Git detecta un conflicto, el servicio registra las rutas y devuelve el árbol combinado al implementador dentro del presupuesto de recuperación. El nuevo candidato incluye ambos padres y necesita checks y revisión propios. Cuando se agota el presupuesto o es necesaria una decisión humana, el operador puede resolver el merge en un clon independiente y traer el commit resultante al almacén Git del trabajo.
 
-El commit de resolución debe incluir como antecesores tanto el candidato conservado como la base actual. Tras revisar la resolución, se puede seleccionar con el comando siguiente.
+El commit de resolución debe incluir como antecesores la base actual y el candidato conservado antes de publicar, o el head vigente si el PR ya está abierto. Tras revisar la resolución e importar el commit al almacén del trabajo, se puede seleccionar con el comando siguiente.
 
 ```bash
 "${control[@]}" run --rm controller resume OWNER/REPO#N --resolved-commit SHA_COMPLETO
 ```
 
-Esta operación se aplica a una publicación bloqueada antes de registrar un PR. Conserva el plan y las rondas, registra los SHAs anteriores y la resolución, e inicia la comprobación de la nueva base y del candidato resuelto. El nuevo SHA recibe checks y revisión antes de publicarse.
+Esta operación se aplica a una actualización de base bloqueada. Conserva el plan y las rondas, registra los SHAs anteriores y la resolución, e inicia la comprobación de la nueva base y del candidato resuelto. El nuevo SHA recibe checks y revisión antes de publicar. Si ya existe un PR, la publicación actualiza su rama y el sondeo de CI continúa sobre el nuevo head.
 
 ## Recuperación autónoma limitada
 

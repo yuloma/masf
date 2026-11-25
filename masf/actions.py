@@ -335,6 +335,7 @@ class Actions:
                                candidate=ci.expected_head(job) if job.get("pr_number") else None,
                                build_workspace=None, build_recovery=None, head_conflict=None,
                                ci_handled=[], ci_repair=None, ci_intervention=False, repair_intent=None)
+                updates.update(ci.restart_conflict(job))
                 entry["previous_fingerprint"] = job["fingerprint"]
             case "answer":
                 updates.update(plan=None, plan_attempt=None)
@@ -371,7 +372,8 @@ class Actions:
         if state == "building" and kind in {"resolve", "assign_provider", "add_rounds"}:
             current = job.get("build_workspace")
             copy = current | {"operator_resume": True} if current in copies.values() else None
-            updates.update(build_workspace=copy, build_recovery=None)
+            updates.update(build_workspace=copy, build_recovery=job.get("build_recovery")
+                           if job.get("pr_conflict") else None)
         updates["operator_feedback"] = {"source": "operator", "instruction": entry["evidence"],
                                         "type": kind, "sha": entry["candidate"], "question": offer.get("question")}
         updates["decisions"] = [*job.get("decisions", []), entry]

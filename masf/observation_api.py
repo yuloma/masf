@@ -501,13 +501,18 @@ class View:
                 "build_checkpoint": public.build_checkpoint(job) if row["state"] in {"blocked", "needs_input"} else None,
                 "ci": bool(job.get("ci_intervention")) and row["state"] in {"blocked", "needs_input"},
                 "retry_stage": JOB_STAGE.get(job.get("retry")),
+                "conflict_action": public.scalar(ci.conflict_action(job)),
                 "head_conflict": public.fields(job["head_conflict"], "expected observed remote")
                 if public.mapping(job.get("head_conflict")) else None,
             },
             "limits": limits, "ci": public.local_ci(job.get("ci")),
             "ci_poll_error": public.observation_error(job["ci_poll_error"]) if job.get("ci_poll_error") else None,
             "repair": public.repair(job.get("ci_repair")),
-            "retry_at": public.scalar(job.get("ci_retry_at")) or None,
+            "merge_observation": public.conflict(job.get("merge_observation")),
+            "pr_conflict": public.conflict(job.get("pr_conflict")),
+            "conflict_result": public.conflict(job.get("conflict_result")),
+            "retry_at": (public.scalar(public.mapping(job.get("recovery_wait")).get("until"))
+                         if row["state"] == "retry_wait" else public.scalar(job.get("ci_retry_at"))) or None,
         }
 
     def job_events(self, identity, query):
@@ -546,6 +551,14 @@ class View:
             "feedback": public.feedback(detail.get("feedback")),
             "checks": public.check_report(detail.get("checks")),
             "repair": public.repair(detail.get("ci_repair")),
+            "merge_observation": public.conflict(detail.get("merge_observation")),
+            "pr_conflict": public.conflict(detail.get("pr_conflict")),
+            "conflict_result": public.conflict(detail.get("conflict_result")),
+            "recoveries": [
+                public.fields(item, "action at base head candidate pr stage reason") |
+                {"paths": public.strings(public.mapping(item).get("paths"))}
+                for item in public.items(detail.get("recoveries"))
+            ],
             "stage": public.stage(stage) if stage else None,
             "historical_stages": historic,
             "ci": public.local_ci(detail.get("ci")),

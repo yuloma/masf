@@ -158,7 +158,10 @@ Para interrumpir un check real dentro de Compose, usa un Docker Engine local con
 MASF_TEST_ENGINE=1 python3 -m unittest tests.test_process_recovery.ComposeProcessRecovery -v
 ```
 
-El caso Compose espera una señal escrita por el check dentro del contenedor antes de matar el controlador. Después cambia el volumen declarado en el perfil del operador. El reemplazo retira el proyecto anterior con el manifiesto congelado, completa el check en un proyecto nuevo y retira sus recursos y su journal. Un proyecto Compose de control conserva su contenedor, su red y el dato guardado en su volumen durante y después de la recuperación.
+El caso Compose espera una señal escrita por el check dentro del contenedor antes de matar el controlador. Después cambia el volumen declarado en el perfil del operador. El reemplazo retira el proyecto anterior con el manifiesto congelado, completa el check en un proyecto nuevo y retira sus recursos y su journal. La espera del reemplazo exige la señal de un checkout asociado a un journal distinto. La señal anterior permanece en su checkout tras la caída. Un proyecto Compose de control conserva su contenedor, su red y el dato guardado en su volumen durante y después de la recuperación.
 
-**Resultado observado con Python 3.11.2.** `python3 -m unittest discover -v` descubrió 55 pruebas. Pasaron 45, incluidos los cinco casos de recuperación sin Engine, y se omitieron 10 por requerir Docker Engine. El caso de recuperación con Compose queda pendiente de ejecución en un entorno con Docker local.
+**Resultado local con Python 3.11.2.** `python3 -m unittest discover -v` descubrió 59 pruebas. Pasaron 49, incluidos los cinco casos de recuperación con `SIGKILL` sin Engine, y se omitieron 10 por requerir Docker Engine. Una comprobación local con journals y marcadores temporales confirmó que la espera solo acepta el marcador nuevo.
+
+**Resultado con Engine.** La ejecución previa de CI alcanzó el caso Compose y falló al identificar el proyecto de reemplazo, porque la espera aceptó la señal que dejó el controlador terminado. Queda pendiente ejecutar el caso corregido con Docker Engine.
+
 La aceptación de I2 incluye autorizar con `resume --allow-protected-path RUTA` un archivo exacto de un trabajo bloqueado. La regresión debe conservar el candidato y las rondas, rechazar comodines y rutas no canónicas, mantener la comprobación de otros archivos e invalidar el permiso si cambia la huella de la issue.

@@ -510,11 +510,12 @@ class ComposeProcessRecovery(RecoveryHarness):
             "control-data",
         )
 
-    def active_check(self, child, expected):
+    def active_check(self, child, expected, *, previous_journal=None):
         def ready():
-            journals = list(self.evidence.glob("*/cleanup.json"))
-            self.assertLessEqual(len(journals), 1, journals)
-            for journal in journals:
+            for journal in self.evidence.glob("*/cleanup.json"):
+                # A killed controller leaves both the journal and the ready marker.
+                if journal == previous_journal:
+                    continue
                 try:
                     argv, workspace = json.loads(journal.read_text())
                 except (FileNotFoundError, json.JSONDecodeError):
@@ -544,6 +545,7 @@ class ComposeProcessRecovery(RecoveryHarness):
     def test_check_interrupted(self):
         child = self.start()
         report, old_journal, frozen, _ = self.active_check(child, "first candidate check")
+        self.assertEqual(list(self.evidence.glob("*/cleanup.json")), [old_journal])
         old = report["name"]
         frozen_cleanup = json.loads(old_journal.read_text())
         original_manifest = self.profile.read_text()
@@ -567,7 +569,7 @@ class ComposeProcessRecovery(RecoveryHarness):
         self.profile.write_text(replacement_manifest)
         child = self.recover(previous)
         report, journal, profile, workspace = self.active_check(
-            child, "replacement candidate check"
+            child, "replacement candidate check", previous_journal=old_journal
         )
         active = report["name"]
         self.assertEqual(report["sha"], candidate)

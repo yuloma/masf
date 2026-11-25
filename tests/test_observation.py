@@ -62,6 +62,7 @@ class GitHub:
     def __init__(self):
         self.pulls = [[pull()]]
         self.details = {}
+        self.issue_details = {}
         self.checks = {}
         self.statuses = {}
         self.runs = {}
@@ -88,6 +89,8 @@ class GitHub:
             result = {"id": 7, "default_branch": "main"}
         elif endpoint == f"{REPO}/issues":
             result = self.issues
+        elif endpoint.startswith(f"{REPO}/issues/"):
+            result = self.issue_details[int(endpoint.rsplit("/", 1)[-1])]
         elif endpoint == f"{REPO}/pulls":
             result = self.pulls[page - 1] if page <= len(self.pulls) else []
             if page < len(self.pulls):
@@ -167,7 +170,10 @@ class Observation(unittest.TestCase):
             )
 
     def poll(self):
-        with patch("masf.cli.process_task", return_value=0):
+        with (
+            patch("masf.cli.process_task", return_value=0),
+            patch("masf.cli.poll_ci_jobs", return_value=0),
+        ):
             return cli.tick(self.db, self.cfg, self.config, self.root, True)
 
     def output(self, *args):
@@ -239,6 +245,70 @@ class Observation(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT state FROM jobs").fetchone()[0], "blocked")
         self.assertEqual(sum(entry.get("kind") == "pr_job" for entry in self.events()), 1)
 
+    def test_combined_poll_records_ci_and_dispatches_repair_with_retry_delay(self):
+        issue = {
+            "number": 10, "state": "open", "labels": [{"name": "masf:ready"}],
+            "title": "Repair CI", "body": "Keep the existing PR",
+        }
+        self.cfg["service"]["max_build_rounds"] = 5
+        self.cfg["repositories"][0]["routing"] = {"build": "fake"}
+        self.github.issue_details[10] = issue
+        self.github.details[23] = pull(sha=CANDIDATE)
+        self.github.pulls = [[self.github.details[23]]]
+        self.github.checks[CANDIDATE] = [
+            check(11, "completed", "failure") | {"head_sha": CANDIDATE},
+        ]
+        self.insert_job(
+            linked_pr=23, repo=self.cfg["repositories"][0],
+            fingerprint=queue.fingerprint(issue), plan={"summary": "Fix the failing check"},
+        )
+        original_command = self.github.command
+
+        def command(args):
+            result = original_command(args)
+            if "/annotations?" in args[3]:
+                return result.replace("failure api_key", "FAIL: test_ci_repair api_key")
+            return result
+
+        with (
+            patch("masf.queue.command", side_effect=command),
+            patch("masf.cli.process_task", return_value=0) as process,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(cli.tick(self.db, self.cfg, self.config, self.root, True), 0)
+            process.assert_called_once()
+            repaired = process.call_args.args[-1]
+            self.assertEqual(repaired["state"], "building")
+            self.assertEqual(repaired["ci"]["sha"], CANDIDATE)
+            self.assertEqual(repaired["ci_repair"]["diagnostics"][0]["kind"], "functional")
+            self.assertEqual(self.status()["ci"]["checks"]["check:11"]["conclusion"], "failure")
+            handled = repaired["ci_handled"]
+            queue.save(self.db, repaired, "checking", ci_retry_at=cli.time.time() + 3600)
+            process.reset_mock()
+            self.assertEqual(cli.tick(self.db, self.cfg, self.config, self.root, True), 0)
+            process.assert_not_called()
+            persisted = json.loads(self.db.execute("SELECT data FROM jobs").fetchone()[0])
+            self.assertEqual(persisted["ci_handled"], handled)
+            self.assertEqual(persisted["rounds"], 3)
+
+    def test_cli_keeps_repair_link_and_json_job_status(self):
+        with patch("masf.cli.link_pr") as link:
+            self.assertEqual(self.output(
+                "link-pr", f"{SLUG}#10", "--pr", "23", "--head", CANDIDATE,
+                "--evidence", "Reviewed scope",
+            ), [])
+            link.assert_called_once()
+            self.assertEqual(link.call_args.args[2:], (
+                f"{SLUG}#10", 23, CANDIDATE, "Reviewed scope",
+            ))
+        self.cfg["service"]["max_build_rounds"] = 5
+        self.insert_job()
+        self.assertEqual(self.poll(), 0)
+        rows = self.output("status", "--json")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["number"], 10)
+        self.assertEqual(rows[0]["limits"]["build_limit"], 5)
+
     def test_pilot_keeps_candidate_and_rounds_during_serve_worker_and_records_merge(self):
         self.insert_job()
         self.github.issues = [{
@@ -268,6 +338,7 @@ class Observation(unittest.TestCase):
             patch("masf.cli.load", return_value=self.cfg),
             patch("masf.cli.xdg", return_value=self.root),
             patch("masf.cli.process_task", side_effect=process) as worker,
+            patch("masf.cli.poll_ci_jobs", return_value=0),
             patch("masf.cli.time", wraps=cli.time) as clock,
             patch("sys.argv", ["masf", "serve"]),
             redirect_stdout(io.StringIO()),

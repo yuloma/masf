@@ -7,7 +7,7 @@ import time
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 
-from .system import ProcessError, command
+from .system import ProcessError, TaskStopped, command
 
 
 _retry_at = 0
@@ -153,33 +153,50 @@ def connect(root):
     return db
 
 
+def write_event(db, job, state, updates):
+    db.execute(
+        "INSERT INTO events(repo_id,number,attempt,state,detail) VALUES(?,?,?,?,?)",
+        (job["repo_id"], job["number"], job.get("attempt"), state, json.dumps(updates)),
+    )
+
+
 def save(db, job, state, **updates):
     next_job = job | updates | {"state": state}
+    persisted = {key: value for key, value in next_job.items() if key != "attempt"}
     with db:
         db.execute("BEGIN IMMEDIATE")
-        if job.get("attempt"):
-            active = db.execute(
-                "SELECT 1 FROM leases WHERE repo_id=? AND number=? AND token=? AND expires>unixepoch()",
-                (job["repo_id"], job["number"], job["attempt"]),
-            ).fetchone()
-            if not active:
-                raise RuntimeError("La reserva del trabajo ha vencido")
-        db.execute(
-            "INSERT INTO events(repo_id,number,attempt,state,detail) VALUES(?,?,?,?,?)",
-            (
-                job["repo_id"],
-                job["number"],
-                job.get("attempt"),
-                state,
-                json.dumps(updates),
-            ),
-        )
+        if not lease_active(db, job):
+            raise RuntimeError("La reserva del trabajo ha vencido")
+        write_event(db, job, state, updates)
         db.execute(
             "UPDATE jobs SET state=?,data=? WHERE repo_id=? AND number=?",
-            (state, json.dumps(next_job), job["repo_id"], job["number"]),
+            (state, json.dumps(persisted), job["repo_id"], job["number"]),
         )
     job.update(next_job)
     print(f"{job['slug']}#{job['number']} {state}", flush=True)
+
+
+def save_link(db, job, approval):
+    key = (job["repo_id"], job["number"])
+    persisted = {key: value for key, value in job.items() if key != "attempt"}
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        if not lease_active(db, job):
+            raise RuntimeError("La reserva del trabajo ha vencido")
+        conflict = db.execute(
+            "SELECT 1 FROM jobs WHERE repo_id=? AND json_extract(data, '$.pr_number')=?",
+            (job["repo_id"], job["pr_number"]),
+        ).fetchone()
+        row = db.execute("SELECT state FROM jobs WHERE repo_id=? AND number=?", key).fetchone()
+        if conflict or (row and row["state"] != "queued"):
+            raise ValueError("El PR está vinculado o la issue ya tiene un trabajo activo")
+        db.execute(
+            """INSERT INTO jobs VALUES (?,?,?,?,?)
+            ON CONFLICT(repo_id, number) DO UPDATE SET state=excluded.state,data=excluded.data""",
+            (*key, job["slug"], "pr_open", json.dumps(persisted)),
+        )
+        write_event(db, job, "pr_open", {"decisions": [approval], "ci": job["ci"]})
+    print(f"{job['slug']}#{job['number']} pr_open", flush=True)
 
 
 def scan(cfg, db=None, *, repository_ids=None):
@@ -259,3 +276,25 @@ def renew(db, job, token, ttl):
             repo_id=? AND number=? AND token=? AND expires>unixepoch()""",
             (ttl, job["repo_id"], job["number"], token),
         ).rowcount
+
+
+def leased_job(db, job, token):
+    row = db.execute(
+        "SELECT data, state FROM jobs WHERE repo_id=? AND number=?",
+        (job["repo_id"], job["number"]),
+    ).fetchone()
+    current = json.loads(row["data"])
+    current.update(state=row["state"], attempt=token)
+    return current
+
+
+def lease_active(db, job):
+    return not job.get("attempt") or db.execute(
+        "SELECT 1 FROM leases WHERE repo_id=? AND number=? AND token=? AND expires>unixepoch()",
+        (job["repo_id"], job["number"], job["attempt"]),
+    ).fetchone() is not None
+
+
+def require_lease(db, job):
+    if not lease_active(db, job):
+        raise TaskStopped("La reserva del trabajo ha vencido")

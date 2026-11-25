@@ -83,3 +83,14 @@ Desde I4 arranca el controlador con `"${control[@]}" up -d controller` en Docker
 | Coste del proceso | Quedan anotados tiempo por etapa, rondas, intervenciones y uso disponible. Si no hay datos de coste, el informe lo indica. |
 
 Conserva en la instalación del operador la revisión de MASF, versiones de las CLIs ejecutadas, id del trabajo, SHA, URL del PR y el resultado de cada criterio. En una instalación operativa, deja `serve` activo con los repositorios autorizados. Si el operador solicitó únicamente un ensayo desechable, detén su instancia y deshabilita sus entradas de prueba al terminar.
+
+## Aceptación de CI del PR 23
+
+El ensayo real está pendiente de una ejecución autorizada en la instalación del operador. Las referencias de preparación son el PR #23 abierto, el head `d8cda48a51ee46eb285ac866e8b58d4ad89415db` y la ejecución de CI `45406357312`, con el fallo `test_check_interrupted`. El trabajo #10 conservaba el candidato `bb747e16b42c2aaf05ac9275c9625cde90a49aec` y dos rondas consumidas. Estos datos son el punto de partida del ensayo.
+
+1. Antes de ejecutar la fábrica, registra el estado efectivo del PR #23, su head, el ID e intento de la ejecución, el nombre del check y el fallo observado. Recoge el candidato, los contadores y límites del trabajo #10 mediante `status --json` e `history 'yuloma/masf#10'`.
+2. Ejecuta un sondeo y registra la discrepancia de head si persiste. Si el operador confirma que el head efectivo corresponde al trabajo, ejecuta `resume 'yuloma/masf#10' --accept-head SHA --evidence 'Evidencia revisada del PR y del diff'`. Si el límite vigente sigue agotado, añade `--add-rounds 1` a esa decisión o autoriza la ronda tras registrar el agotamiento. Conserva el operador, la huella y los SHAs de la decisión.
+3. Deja que `serve` o `run --once` diagnostique el fallo observado. Comprueba la construcción con el plan vigente y el diagnóstico de `test_check_interrupted`, y conserva proveedor, modelo cuando se conozca, ronda y SHA del candidato reparado.
+4. Registra el resultado de checks y revisión del mismo SHA, el head esperado del push y el nuevo head del PR #23. Comprueba que el número del PR se conserva y registra el ID, intento, SHA y conclusión de su nuevo CI. Conserva el PR abierto para la decisión de integración.
+
+La suite local simula GitHub y el proveedor y usa un remoto Git temporal. El historial de esa prueba y el de campo se guardan en las instalaciones donde se ejecuten.

@@ -153,3 +153,13 @@ La entrada de procesos usa un archivo temporal privado para conservar prompts gr
 La aceptación de I2 incluye autorizar con `resume --allow-protected-path RUTA` un archivo exacto de un trabajo bloqueado. La regresión debe conservar el candidato y las rondas, rechazar comodines y rutas no canónicas, mantener la comprobación de otros archivos e invalidar el permiso si cambia la huella de la issue.
 
 La aceptación de recuperación de I2 incluye una construcción interrumpida tras escribir archivos. La reanudación debe reutilizar la copia registrada del mismo SHA y alcance, conservar el plan, contar el siguiente intento y pasar después por checks y revisión. `resume --reuse-workspace RUTA` permite recuperar una copia histórica del propio trabajo y rechaza rutas de otro trabajo o del almacén Git.
+
+### Seguimiento y reparación de CI del mismo PR
+
+**Aceptación local.** Con la configuración de [ejemplo](../examples/factory.toml), verificar que `status` muestra etapa, CI, SHA, consumo e intervención. `status --json` e `history OWNER/REPO#N` deben mostrar la evidencia por SHA y las decisiones por intento. Un remoto Git temporal, GitHub simulado y un proveedor de prueba deben reproducir PR abierto, fallo confirmado, construcción, checks y revisión del mismo candidato, push condicionado al head observado y CI correcto del mismo PR.
+
+El CI pendiente y el rerun en curso dejan la rama intacta. Un sondeo duplicado conserva el mismo diagnóstico y una sola ronda. Probar fallos técnicos con espera y límite, diagnóstico insuficiente, rondas agotadas y las operaciones `resume --accept-head`, `resume --add-rounds`, `resume --allow-protected-path` y `link-pr`. Comprobar que el cambio de alcance, cierre o head ajeno impide escribir en el remoto. Simular la interrupción durante construcción y después del push y comprobar que el historial conserva los SHA de ambos ciclos.
+
+Comprobar también el ciclo combinado de observación y reparación: el mismo sondeo conserva el snapshot de CI por SHA y despacha el trabajo a `building`; un trabajo en `checking` con espera técnica futura no se ejecuta ni duplica el diagnóstico. Mantener el sondeo concurrente durante los workers, las dos formas de `link-pr` documentadas y las salidas de `status --json`, `status --pr` y `logs --pr`.
+
+**Aceptación de campo.** Ejecutar el [ensayo del PR 23](piloto.md#aceptación-de-ci-del-pr-23) con autorización del operador y conservar el PR abierto hasta que decida sobre la integración.

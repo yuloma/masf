@@ -680,6 +680,365 @@ class Delivery(TemporaryTest):
                 saved_workspace(self.worker.root, path)
 
 
+    def open_ci_pr(self):
+        from masf import cli
+
+        self.worker.process()
+        self.old_head = self.job["candidate"]
+        self.action_attempt = 1
+        self.action_state = "completed"
+        self.action_result = "failure"
+        self.annotation = "FAIL: test_check_interrupted (tests.Checks) token ghp_secret123"
+        self.prs[0]["head"].update(ref="masf/issue-1")
+        self.prs[0]["head"]["repo"]["id"] = 123
+        self.prs[0]["base"] = {"ref": "main", "repo": {"id": 123}}
+        self.pr_lookups = []
+        self.feedback = []
+        self.checks_seen = []
+        self.fail_push_response = None
+        self.extra_check_pending = False
+
+        def lookup(endpoint, *, raw=False):
+            if endpoint.endswith("/pulls/3"):
+                self.pr_lookups.append(3)
+                return json.loads(json.dumps(self.prs[0]))
+            if "/git/ref/heads/" in endpoint:
+                return {"object": {"sha": self.worker.remote_head()}}
+            if "/actions/runs?" in endpoint:
+                sha = endpoint.split("head_sha=")[1].split("&")[0]
+                different = sha != self.old_head
+                run = dict(head_sha=sha, head_branch="masf/issue-1",
+                           id=9 if different else 7,
+                           run_attempt=1 if different else self.action_attempt,
+                           status="completed" if different else self.action_state,
+                           conclusion="success" if different else self.action_result)
+                return {"workflow_runs": [run, run | {"head_sha": self.base}]}
+            if "/attempts/" in endpoint:
+                different = "/runs/9/" in endpoint
+                item = dict(id=90 if different else 70 + self.action_attempt,
+                            name="unit tests", status="completed",
+                            conclusion="success" if different else self.action_result,
+                            check_run_url="https://test.invalid/check-runs/42",
+                            steps=[dict(name="Run unittest", conclusion="failure")])
+                return {"jobs": [item]}
+            if "/check-runs?" in endpoint:
+                sha = endpoint.split("/commits/")[1].split("/")[0]
+                items = [dict(id=99, name="external", head_sha=sha, status="in_progress")] if self.extra_check_pending else []
+                return {"check_runs": items}
+            if "/statuses?" in endpoint:
+                return []
+            if "/annotations?" in endpoint:
+                return [dict(message=self.annotation)]
+            if endpoint.endswith("/logs"):
+                self.assertTrue(raw)
+                return "setup complete\n" + self.annotation
+            if "/issues/1" in endpoint:
+                return self.issue
+            if endpoint == f"repos/{self.job['slug']}":
+                return {"id": 123, "default_branch": "main"}
+            if "/commits/main" in endpoint:
+                return {"sha": self.base}
+            self.fail(f"Unexpected endpoint {endpoint}")
+
+        def git_or_gh(args, **kwargs):
+            if args[0] == "gh":
+                self.fail("Repair would create another PR")
+            result = command(args, **kwargs)
+            if "push" in args and args[0] == "git":
+                self.prs[0]["head"]["sha"] = self.worker.remote_head()
+                if self.fail_push_response:
+                    raise self.fail_push_response("simulated death after push")
+            return result
+
+        def agent(role, job, cfg, workspace, inputs, owner, *, guard=None, on_activity=None):
+            if role == "build":
+                self.feedback.append(inputs)
+            return self.agent(role, job, cfg, workspace, inputs, owner, guard=guard, on_activity=on_activity)
+
+        def check(sha):
+            self.checks_seen.append(sha)
+            return self.check(sha)
+
+        def create_worker(db, cfg, config_file, state, jobs, job):
+            instance = worker.Worker(db, cfg, config_file, state, self.root / "jobs", job)
+            instance.url = self.worker.url
+            instance.recover = lambda: None
+            instance.test = check
+            return instance
+
+        for target, name, value in [
+            (cli, "api", lookup), (worker, "api", lookup),
+            (cli, "scan", lambda *_, **__: 0), (cli, "observe", lambda *_: 0),
+            (cli, "Worker", create_worker),
+            (worker, "command", git_or_gh), (providers, "invoke", agent),
+        ]:
+            patcher = patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.target = f"{self.job['slug']}#1"
+
+    def ci_job(self):
+        return json.loads(self.worker.db.execute("SELECT data FROM jobs").fetchone()[0])
+
+    def ci_tick(self, *, observe_only=False):
+        from masf import cli
+
+        with ExitStack() as stack:
+            if observe_only:
+                stack.enter_context(patch.object(cli, "process_task", return_value=0))
+            return cli.tick(self.worker.db, self.cfg, CONFIG, self.root / "state", True)
+
+    def test_ci_repair_delivers_and_observes_same_pr(self):
+        self.open_ci_pr()
+        self.assertEqual(self.ci_tick(), 0)
+        repaired = self.ci_job()
+        sha = repaired["candidate"]
+        self.assertEqual(repaired["state"], "pr_open")
+        self.assertNotEqual(sha, self.old_head)
+        self.assertEqual(self.worker.remote_head(), sha)
+        self.assertEqual(repaired["pr_number"], 3)
+        self.assertEqual(len(self.prs), 1)
+        self.assertEqual(self.roles, ["plan", "build", "review", "build", "review"])
+        self.assertEqual(self.checks_seen, [sha])
+        self.assertEqual(repaired["review"]["sha"], sha)
+        self.assertEqual(repaired["checks"]["sha"], sha)
+        self.assertEqual(repaired["ci_rounds"], 1)
+        feedback = self.feedback[0]
+        self.assertEqual(feedback["sha"], self.old_head)
+        self.assertEqual(feedback["plan"]["criteria"], ["AC1 greet"])
+        failure = feedback["feedback"]["diagnostics"][0]
+        self.assertEqual((failure["check"]["run"], failure["check"]["attempt"]), (7, 1))
+        self.assertIn("test_check_interrupted", failure["evidence"])
+        self.assertNotIn("secret123", failure["evidence"])
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["ci"]["state"], "success")
+        self.assertEqual(self.ci_job()["ci"]["sha"], sha)
+        history = [json.loads(row[0]) for row in self.worker.db.execute("SELECT detail FROM events")]
+        self.assertTrue(any(event.get("ci", {}).get("sha") == self.old_head
+                            and event["ci"]["state"] == "failed" for event in history))
+        self.assertTrue(any(event.get("review", {}).get("sha") == self.old_head for event in history))
+
+    def test_ci_pending_duplicate_and_rerun(self):
+        self.open_ci_pr()
+        self.action_state = "in_progress"
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["ci"]["state"], "pending")
+        self.action_state = "completed"
+        self.extra_check_pending = True
+        self.ci_tick()
+        self.assertEqual(self.ci_job()["ci"]["state"], "pending")
+        self.extra_check_pending = False
+        self.ci_tick(observe_only=True)
+        self.assertEqual(self.ci_job()["state"], "building")
+        events = self.worker.db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        self.ci_tick(observe_only=True)
+        self.assertEqual(self.worker.db.execute("SELECT COUNT(*) FROM events").fetchone()[0], events)
+        self.action_attempt = 2
+        self.action_state = "queued"
+        self.ci_tick()
+        self.assertEqual(self.ci_job()["ci"]["pending_runs"], [[7, 2]])
+        self.action_state = "completed"
+        self.action_result = "success"
+        self.ci_tick()
+        self.assertEqual(self.ci_job()["ci"]["state"], "success")
+        self.assertEqual(self.ci_job()["rounds"], 1)
+        self.assertEqual(self.roles, ["plan", "build", "review"])
+        self.assertEqual(self.worker.remote_head(), self.old_head)
+
+    def test_ci_infrastructure_and_unknown_need_intervention(self):
+        from masf import cli
+
+        self.open_ci_pr()
+        self.cfg["service"]["ci_retry_seconds"] = 0
+        self.cfg["service"]["max_ci_technical_retries"] = 1
+        self.annotation = "Runner unavailable"
+        self.ci_tick()
+        job = self.ci_job()
+        self.assertEqual(job["state"], "needs_input")
+        self.assertEqual(job["ci_technical"], 1)
+        self.assertEqual(job["rounds"], 1)
+        self.assertEqual(self.checks_seen, [self.old_head])
+        self.assertEqual(self.feedback, [])
+        cli.resume(self.worker.db, self.cfg, self.target)
+        self.ci_tick()
+        self.assertEqual(self.ci_job()["state"], "pr_open")
+        self.action_attempt = 2
+        self.ci_tick()
+        self.assertIn("agotados", self.ci_job()["reason"])
+        self.assertEqual(self.ci_job()["ci_technical"], 1)
+        cli.resume(self.worker.db, self.cfg, self.target)
+        self.action_attempt = 3
+        self.annotation = "step failed"
+        self.ci_tick()
+        self.assertIn("insuficiente", self.ci_job()["reason"])
+        self.assertEqual(self.worker.remote_head(), self.old_head)
+
+    def test_ci_third_party_head_and_exhausted_rounds_require_approval(self):
+        from masf import cli
+
+        self.open_ci_pr()
+        self.cfg["service"]["max_build_rounds"] = 1
+        self.ci_tick()
+        self.assertIn("Rondas agotadas", self.ci_job()["reason"])
+        command(["git", "branch", "-f", "masf/issue-1", self.base], cwd=self.source)
+        self.prs[0]["head"]["sha"] = self.base
+        self.ci_tick()
+        self.assertEqual(self.ci_job()["head_conflict"]["observed"], self.base)
+        with self.assertRaises(ValueError):
+            cli.resume(self.worker.db, self.cfg, self.target, accept_head=self.old_head, evidence="Reviewed")
+        self.assertEqual(self.worker.remote_head(), self.base)
+        self.old_head = self.base
+        cli.resume(self.worker.db, self.cfg, self.target, accept_head=self.base,
+                   add_rounds=1, evidence="Reviewed the new head and approved one round")
+        self.assertEqual(self.ci_job()["rounds"], 1)
+        self.assertEqual([entry["kind"] for entry in self.ci_job()["decisions"]], ["head", "rounds"])
+        self.ci_tick()
+        self.assertEqual(self.ci_job()["state"], "pr_open")
+        self.assertEqual(self.ci_job()["rounds"], 2)
+        self.assertNotEqual(self.worker.remote_head(), self.base)
+
+    def test_ci_protected_paths_and_lost_push_response(self):
+        from masf import cli
+
+        self.open_ci_pr()
+        self.changed = ".github/workflows/factory.yml"
+        self.assertEqual(self.ci_tick(), 1)
+        blocked = self.ci_job()
+        self.assertEqual(blocked["state"], "blocked")
+        self.assertEqual(self.worker.remote_head(), self.old_head)
+        cli.resume(self.worker.db, self.cfg, self.target, [self.changed])
+        self.fail_push_response = RuntimeError
+        self.assertEqual(self.ci_tick(), 1)
+        job = self.ci_job()
+        self.assertEqual(job["repair_intent"]["expected"], self.old_head)
+        self.assertEqual(job["repair_intent"]["target"], self.worker.remote_head())
+        cli.resume(self.worker.db, self.cfg, self.target)
+        self.fail_push_response = False
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["state"], "pr_open")
+        self.assertEqual(self.ci_job()["ci_rounds"], 1)
+        self.assertEqual(self.roles.count("build"), 2)
+        self.assertEqual(len(self.prs), 1)
+
+    def test_ci_preserves_third_party_push_before_publication(self):
+        self.open_ci_pr()
+        run_agent = providers.invoke
+
+        def update_remote_after_review(*args, **kwargs):
+            result = run_agent(*args, **kwargs)
+            if args[0] == "review":
+                command(["git", "branch", "-f", "masf/issue-1", self.base], cwd=self.source)
+                self.prs[0]["head"]["sha"] = self.base
+            return result
+
+        with patch.object(providers, "invoke", update_remote_after_review):
+            self.assertEqual(self.ci_tick(), 0)
+        job = self.ci_job()
+        self.assertEqual(job["state"], "needs_input")
+        self.assertEqual(job["head_conflict"]["expected"], self.old_head)
+        self.assertEqual(job["review"]["sha"], job["candidate"])
+        self.assertEqual(self.worker.remote_head(), self.base)
+        self.assertIsNone(job.get("repair_intent"))
+
+    def test_ci_restart_after_build_result_reuses_round(self):
+        self.open_ci_pr()
+        original = worker.Worker.git
+
+        def crash_after_build(instance, *args, **kwargs):
+            if args[0] == "add" and (instance.job.get("build_workspace") or {}).get("result"):
+                raise KeyboardInterrupt("simulated abrupt exit")
+            return original(instance, *args, **kwargs)
+
+        with patch.object(worker.Worker, "git", crash_after_build):
+            with self.assertRaises(KeyboardInterrupt):
+                self.ci_tick()
+        checkpoint = self.ci_job()["build_workspace"]
+        self.assertIn("result", checkpoint)
+        self.assertEqual(self.worker.remote_head(), self.old_head)
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["state"], "pr_open")
+        self.assertEqual(self.ci_job()["ci_rounds"], 1)
+        self.assertEqual(self.roles.count("build"), 2)
+
+    def test_ci_restart_after_push_waits_for_confirmation(self):
+        self.open_ci_pr()
+        self.fail_push_response = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.ci_tick()
+        pushed = self.worker.remote_head()
+        self.assertEqual(self.ci_job()["state"], "publishing")
+        self.assertNotEqual(pushed, self.old_head)
+        self.prs[0]["head"]["sha"] = self.old_head
+        self.ci_tick()
+        self.assertEqual(self.ci_job()["state"], "publishing")
+        self.prs[0]["head"]["sha"] = pushed
+        self.ci_tick()
+        self.assertEqual(self.ci_job()["published_head"], pushed)
+        self.assertEqual(self.ci_job()["state"], "pr_open")
+        self.assertEqual(self.roles.count("build"), 2)
+
+    def test_ci_access_quota_and_configuration(self):
+        from masf import cli
+
+        self.open_ci_pr()
+        for attempt, (line, category) in enumerate([
+            ("Permission denied", "access"),
+            ("Quota exceeded", "quota"),
+            ("Invalid workflow", "configuration"),
+        ], 1):
+            self.action_attempt = attempt
+            self.annotation = line
+            self.ci_tick()
+            job = self.ci_job()
+            self.assertEqual(job["state"], "blocked")
+            self.assertEqual(job["ci_repair"]["diagnostics"][0]["kind"], category)
+            self.assertEqual(job["rounds"], 1)
+            self.assertEqual(job.get("ci_technical", 0), 0)
+            cli.resume(self.worker.db, self.cfg, self.target)
+        self.assertEqual(self.roles.count("build"), 1)
+        self.assertEqual(self.worker.remote_head(), self.old_head)
+
+    def test_ci_cancel_checks_eligibility_before_agent(self):
+        self.open_ci_pr()
+        self.ci_tick(observe_only=True)
+        self.issue["labels"] = []
+        self.ci_tick()
+        self.assertEqual(self.ci_job()["state"], "cancelled")
+        self.assertEqual(self.ci_job()["rounds"], 1)
+        self.assertEqual(self.worker.remote_head(), self.old_head)
+
+    def test_ci_close_and_scope_change_after_routing(self):
+        self.open_ci_pr()
+        self.ci_tick(observe_only=True)
+        self.issue["body"] = "New scope"
+        self.ci_tick()
+        self.assertEqual(self.ci_job()["state"], "needs_input")
+        self.assertEqual(self.ci_job()["retry"], "planning")
+        self.assertEqual(self.worker.remote_head(), self.old_head)
+        self.assertEqual(self.roles.count("build"), 1)
+        self.prs[0].update(state="closed", merged_at="2026-11-24")
+        self.ci_tick()
+        self.assertEqual(self.ci_job()["state"], "merged")
+
+    def test_ci_explicit_link_bootstraps_plan(self):
+        from masf import cli
+
+        self.open_ci_pr()
+        self.worker.db.execute("DELETE FROM jobs")
+        self.worker.db.commit()
+        self.ci_tick()
+        self.assertIsNone(self.worker.db.execute("SELECT data FROM jobs").fetchone())
+        cli.link_pr(self.worker.db, self.cfg, self.target, 3, self.old_head, "Scope approved")
+        self.assertEqual(self.ci_job()["decisions"][0]["kind"], "link")
+        self.ci_tick()
+        self.assertEqual(self.ci_job()["retry"], "planning")
+        cli.resume(self.worker.db, self.cfg, self.target)
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["state"], "pr_open")
+        self.assertEqual(self.ci_job()["pr_number"], 3)
+        self.assertEqual(self.roles, ["plan", "build", "review", "plan", "build", "review"])
+
+
 class Leases(TemporaryTest):
     def test_expired_attempt_cannot_publish(self):
         db = queue.connect(self.root)

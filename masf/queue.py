@@ -2,14 +2,16 @@ import hashlib
 import json
 import sqlite3
 import sys
+import threading
 import time
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 
-from .system import ProcessError, command
+from .system import ProcessError, TaskStopped, command
 
 
 _retry_at = 0
+_rate_lock = threading.Lock()
 
 
 def retry_delay():
@@ -29,8 +31,33 @@ def response_body(output):
     return headers, output
 
 
-def api(endpoint, *opts):
+def http_status(exc):
+    if isinstance(exc, ProcessError):
+        first = exc.stdout.partition("\n")[0].split()
+        if len(first) > 1 and first[0].startswith("HTTP/") and first[1].isdigit():
+            return int(first[1])
+    return None
+
+
+def set_retry(headers, *, limited=False):
     global _retry_at
+    if not (limited or "retry-after" in headers or headers.get("x-ratelimit-remaining") == "0"):
+        return
+    try:
+        if "retry-after" in headers:
+            try:
+                wait = float(headers["retry-after"])
+            except ValueError:
+                wait = parsedate_to_datetime(headers["retry-after"]).timestamp() - time.time()
+        else:
+            wait = float(headers.get("x-ratelimit-reset", time.time() + 60)) - time.time()
+    except (ValueError, TypeError, OverflowError):
+        wait = 60
+    with _rate_lock:
+        _retry_at = max(_retry_at, time.monotonic() + max(1, wait))
+
+
+def api(endpoint, *opts, raw=False, with_headers=False):
     if retry_delay():
         raise RuntimeError(
             f"GitHub: límite de peticiones, esperar {retry_delay():.0f}s"
@@ -39,26 +66,38 @@ def api(endpoint, *opts):
         output = command(["gh", "api", "--include", endpoint, *opts])
     except ProcessError as exc:
         headers, _ = response_body(exc.stdout)
-        if (
-            headers.get("x-ratelimit-remaining") == "0"
-            or "retry-after" in headers
+        limited = (
+            http_status(exc) == 429
             or "HTTP 429" in exc.stderr
-        ):
-            wait = 60
-            if "retry-after" in headers:
-                try:
-                    wait = float(headers["retry-after"])
-                except ValueError:
-                    wait = (
-                        parsedate_to_datetime(headers["retry-after"]).timestamp()
-                        - time.time()
-                    )
-            elif "x-ratelimit-reset" in headers:
-                wait = float(headers["x-ratelimit-reset"]) - time.time()
-            _retry_at = time.monotonic() + max(1, wait)
+            or "secondary rate limit" in (exc.stdout + exc.stderr).lower()
+            or "rate limit exceeded" in (exc.stdout + exc.stderr).lower()
+        )
+        set_retry(headers, limited=limited)
         raise
-    _, body = response_body(output)
-    return json.loads(body)
+    headers, body = response_body(output)
+    set_retry(headers)
+    result = body if raw else json.loads(body)
+    return (headers, result) if with_headers else result
+
+
+def pages(request, endpoint, key=None):
+    separator = "&" if "?" in endpoint else "?"
+    page = 1
+    while True:
+        headers, result = request(
+            f"{endpoint}{separator}per_page=100&page={page}", with_headers=True,
+        )
+        items = result[key] if key else result
+        if not isinstance(items, list):
+            raise ValueError("Página de GitHub inválida")
+        yield from items
+        links = headers.get("link")
+        has_next = 'rel="next"' in links if links is not None else len(items) == 100
+        if not has_next:
+            if key and result.get("total_count", 0) > (page - 1) * 100 + len(items):
+                raise RuntimeError("GitHub devolvió un listado incompleto")
+            return
+        page += 1
 
 
 def eligible(issue, repo):
@@ -92,39 +131,75 @@ def connect(root):
     db.execute("""CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY, at TEXT DEFAULT CURRENT_TIMESTAMP, repo_id INTEGER,
         number INTEGER, attempt TEXT, state TEXT, detail TEXT)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS pull_requests (
+        repo_id INTEGER, number INTEGER, slug TEXT, state TEXT, sha TEXT, data TEXT,
+        PRIMARY KEY(repo_id, number))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS pull_ci (
+        repo_id INTEGER, number INTEGER, sha TEXT, data TEXT,
+        PRIMARY KEY(repo_id, number, sha))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS pull_events (
+        id INTEGER PRIMARY KEY, at TEXT DEFAULT CURRENT_TIMESTAMP, repo_id INTEGER,
+        number INTEGER, sha TEXT, kind TEXT, detail TEXT)""")
+    db.execute("""CREATE INDEX IF NOT EXISTS pull_events_lookup
+        ON pull_events(repo_id, number, sha, id)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS pull_sources (
+        slug TEXT PRIMARY KEY, error TEXT, changed_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS pull_source_events (
+        id INTEGER PRIMARY KEY, at TEXT DEFAULT CURRENT_TIMESTAMP, slug TEXT,
+        source TEXT, error TEXT)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS pull_links (
+        repo_id INTEGER, number INTEGER, job_number INTEGER,
+        PRIMARY KEY(repo_id, number), UNIQUE(repo_id, job_number))""")
     return db
+
+
+def write_event(db, job, state, updates):
+    db.execute(
+        "INSERT INTO events(repo_id,number,attempt,state,detail) VALUES(?,?,?,?,?)",
+        (job["repo_id"], job["number"], job.get("attempt"), state, json.dumps(updates)),
+    )
 
 
 def save(db, job, state, **updates):
     next_job = job | updates | {"state": state}
+    persisted = {key: value for key, value in next_job.items() if key != "attempt"}
     with db:
         db.execute("BEGIN IMMEDIATE")
-        if job.get("attempt"):
-            active = db.execute(
-                "SELECT 1 FROM leases WHERE repo_id=? AND number=? AND token=? AND expires>unixepoch()",
-                (job["repo_id"], job["number"], job["attempt"]),
-            ).fetchone()
-            if not active:
-                raise RuntimeError("La reserva del trabajo ha vencido")
-        db.execute(
-            "INSERT INTO events(repo_id,number,attempt,state,detail) VALUES(?,?,?,?,?)",
-            (
-                job["repo_id"],
-                job["number"],
-                job.get("attempt"),
-                state,
-                json.dumps(updates),
-            ),
-        )
+        if not lease_active(db, job):
+            raise RuntimeError("La reserva del trabajo ha vencido")
+        write_event(db, job, state, updates)
         db.execute(
             "UPDATE jobs SET state=?,data=? WHERE repo_id=? AND number=?",
-            (state, json.dumps(next_job), job["repo_id"], job["number"]),
+            (state, json.dumps(persisted), job["repo_id"], job["number"]),
         )
     job.update(next_job)
     print(f"{job['slug']}#{job['number']} {state}", flush=True)
 
 
-def scan(cfg, db=None):
+def save_link(db, job, approval):
+    key = (job["repo_id"], job["number"])
+    persisted = {key: value for key, value in job.items() if key != "attempt"}
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        if not lease_active(db, job):
+            raise RuntimeError("La reserva del trabajo ha vencido")
+        conflict = db.execute(
+            "SELECT 1 FROM jobs WHERE repo_id=? AND json_extract(data, '$.pr_number')=?",
+            (job["repo_id"], job["pr_number"]),
+        ).fetchone()
+        row = db.execute("SELECT state FROM jobs WHERE repo_id=? AND number=?", key).fetchone()
+        if conflict or (row and row["state"] != "queued"):
+            raise ValueError("El PR está vinculado o la issue ya tiene un trabajo activo")
+        db.execute(
+            """INSERT INTO jobs VALUES (?,?,?,?,?)
+            ON CONFLICT(repo_id, number) DO UPDATE SET state=excluded.state,data=excluded.data""",
+            (*key, job["slug"], "pr_open", json.dumps(persisted)),
+        )
+        write_event(db, job, "pr_open", {"decisions": [approval], "ci": job["ci"]})
+    print(f"{job['slug']}#{job['number']} pr_open", flush=True)
+
+
+def scan(cfg, db=None, *, repository_ids=None):
     errors = 0
     for repo in cfg["repositories"]:
         if not repo["enabled"]:
@@ -132,6 +207,8 @@ def scan(cfg, db=None):
         slug = repo["slug"]
         try:
             meta = api(f"repos/{slug}")
+            if repository_ids is not None:
+                repository_ids[slug] = meta["id"]
             branch = repo.get("base_branch") or meta["default_branch"]
             page = 1
             base = None
@@ -172,19 +249,22 @@ def scan(cfg, db=None):
                 if len(issues) < 100:
                     break
                 page += 1
-        except (RuntimeError, OSError) as exc:
+        except (RuntimeError, OSError, ValueError, TypeError, KeyError) as exc:
             print(f"{slug}: {exc}", file=sys.stderr, flush=True)
             errors += 1
+            if retry_delay():
+                break
     return errors
 
 
-def claim(db, job, token, ttl):
+def claim(db, job, token, ttl, limit=None):
     with db:
         result = db.execute(
-            """INSERT INTO leases VALUES(?,?,?,unixepoch()+?)
+            """INSERT INTO leases SELECT ?,?,?,unixepoch()+?
+            WHERE ? IS NULL OR (SELECT count(*) FROM leases WHERE expires>unixepoch()) < ?
             ON CONFLICT(repo_id, number) DO UPDATE SET token=excluded.token, expires=excluded.expires
             WHERE leases.expires<=unixepoch()""",
-            (job["repo_id"], job["number"], token, ttl),
+            (job["repo_id"], job["number"], token, ttl, limit, limit),
         )
         return bool(result.rowcount)
 
@@ -196,3 +276,25 @@ def renew(db, job, token, ttl):
             repo_id=? AND number=? AND token=? AND expires>unixepoch()""",
             (ttl, job["repo_id"], job["number"], token),
         ).rowcount
+
+
+def leased_job(db, job, token):
+    row = db.execute(
+        "SELECT data, state FROM jobs WHERE repo_id=? AND number=?",
+        (job["repo_id"], job["number"]),
+    ).fetchone()
+    current = json.loads(row["data"])
+    current.update(state=row["state"], attempt=token)
+    return current
+
+
+def lease_active(db, job):
+    return not job.get("attempt") or db.execute(
+        "SELECT 1 FROM leases WHERE repo_id=? AND number=? AND token=? AND expires>unixepoch()",
+        (job["repo_id"], job["number"], job["attempt"]),
+    ).fetchone() is not None
+
+
+def require_lease(db, job):
+    if not lease_active(db, job):
+        raise TaskStopped("La reserva del trabajo ha vencido")

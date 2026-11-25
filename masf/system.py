@@ -9,11 +9,25 @@ from contextlib import ExitStack
 
 def clean(value):
     value = re.sub(
-        r'(?i)(bearer\s+|(?:access_token|refresh_token|api_key|password)["\s:=]+)\S+',
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)",
+        "[redacted]", value,
+    )
+    value = re.sub(
+        r'''(?ix)
+        ( (?:bearer|basic)\s+
+        | \b (?: access[_-]?token | refresh[_-]?token | (?:api|private)[_-]?key
+          | password | passwd | (?:github|gh|npm)?[_-]?token | secret ) ["']?\s*[:=]\s*
+        )
+        (?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s&,;"'<>]+)
+        ''',
         r"\1[redacted]",
         value,
     )
-    return re.sub(r"(?:gh[pousr]_|github_pat_|sk-)[A-Za-z0-9_-]+", "[redacted]", value)
+    value = re.sub(
+        r"\b(?:gh[pousr]_|github_pat_|sk-|AKIA|ASIA)[A-Za-z0-9_-]+",
+        "[redacted]", value,
+    )
+    return re.sub(r"(?i)(https?://)[^/@\s:]+:[^/@\s]+@", r"\1[redacted]@", value)
 
 
 class ProcessError(RuntimeError):
@@ -74,6 +88,8 @@ def command(
                     on_stdout_line(pending)
                     pending = ""
 
+        if guard:
+            guard()
         proc = stack.enter_context(
             subprocess.Popen(
                 args,

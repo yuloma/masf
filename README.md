@@ -53,6 +53,17 @@ export GH_TOKEN="$(gh auth token)"
 
 Para actualizar, construye las imágenes del controlador y del runner de la nueva revisión y ejecuta `"${control[@]}" up -d --force-recreate controller` cuando la cola esté en reposo. Los bind mounts conservan la base y los trabajos. Si un proveedor rechaza la autenticación, renueva el acceso de su CLI y usa `"${control[@]}" run --rm controller resume OWNER/REPO#N`. Una reasignación de roles en el TOML se aplica a una tarea bloqueada al reanudarla.
 
+`serve` registra el CI por SHA de los PR abiertos en los repositorios habilitados. Usa `status --pr` para el head y los resultados actuales, y `logs --pr` para las transiciones, diagnósticos y SHA históricos. Para filtrar un head sustituye `HEAD_SHA` por su SHA completo. [Campos y valores de la observación](docs/especificacion.md#formato-de-observación-v1).
+
+```bash
+masf --config FILE status --pr OWNER/REPO#23
+masf --config FILE logs --pr OWNER/REPO#23 --sha HEAD_SHA
+masf --config FILE link-pr OWNER/REPO#23 OWNER/REPO#10
+"${control[@]}" exec -T controller masf --config /etc/masf/pilot.toml logs --pr OWNER/REPO#23
+```
+
+`link-pr` se usa cuando `status` muestra `job: null` y el operador identifica una issue ya registrada del mismo repositorio. En Docker se ejecuta con el mismo prefijo `exec -T controller masf --config /etc/masf/pilot.toml`.
+
 ## Cómo funciona
 
 1. El operador registra el repositorio, su etiqueta, sus comprobaciones y los proveedores disponibles en la configuración central.

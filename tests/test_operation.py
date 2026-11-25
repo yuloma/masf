@@ -30,11 +30,33 @@ class Commands(unittest.TestCase):
         self.assertEqual(output, str(len(payload)))
 
     def test_guard_terminates_running_process(self):
+        for on_line in (None, lambda line: None):
+            calls = 0
+
+            def stop():
+                nonlocal calls
+                calls += 1
+                if calls > 1:
+                    raise TaskStopped("cancelled")
+
+            with self.subTest(streaming=on_line is not None), self.assertRaises(TaskStopped):
+                command(
+                    [sys.executable, "-c", "import time;time.sleep(30)"],
+                    guard=stop,
+                    on_stdout_line=on_line,
+                )
+
+    def test_cancelled_command_never_starts_with_or_without_streaming(self):
         def stop():
             raise TaskStopped("cancelled")
 
-        with self.assertRaises(TaskStopped):
-            command([sys.executable, "-c", "import time;time.sleep(30)"], guard=stop)
+        for on_line in (None, lambda line: None):
+            with self.subTest(streaming=on_line is not None), patch(
+                "masf.system.subprocess.Popen"
+            ) as launch:
+                with self.assertRaises(TaskStopped):
+                    command([sys.executable, "-c", "pass"], guard=stop, on_stdout_line=on_line)
+                launch.assert_not_called()
 
     def test_stream_requires_completion(self):
         payload = json.dumps({"version": 1, "summary": "Plan", "criteria": ["AC1"]})
@@ -138,7 +160,7 @@ class Monitoring(unittest.TestCase):
                 patch("masf.cli.api", side_effect=RuntimeError("403")),
                 patch("masf.cli.process_task", return_value=0) as process,
             ):
-                self.assertEqual(cli.tick(db, cfg, root / "config.toml", root, True), 1)
+                self.assertEqual(cli.tick(db, cfg, root / "config.toml", root, True), 2)
                 process.assert_called_once()
             db.close()
 

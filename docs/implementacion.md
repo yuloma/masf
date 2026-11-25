@@ -118,6 +118,16 @@ El manifiesto central conserva la misma ruta absoluta de trabajos dentro y fuera
 
 **Aceptación.** Aplicar el protocolo del piloto desde un checkout limpio. La segunda consulta y el reinicio durante la publicación mantienen una única rama y un PR por issue. Un segundo repositorio funciona con la misma instalación y configuración adicional. El informe identifica la versión instalada, el destino, los agentes realmente ejecutados, los checks y las intervenciones humanas.
 
+La aceptación del sondeo de PR se ejecuta localmente con `python3 -m unittest tests.test_observation -v`.
+
+1. Admitir issues y enumerar las páginas de PR de los repositorios habilitados. Identificar los PR sin trabajo en `status --pr`, comprobar la procedencia de la marca antes de vincular automáticamente y permitir una asociación local mediante `link-pr`.
+2. Conservar la identidad, referencias, borrador y estado del PR. Contrastar con el detalle los PR que desaparezcan de un listado completo antes de marcar cierre o merge. Incluir un trabajo cuyo único vínculo registrado sea la URL del PR.
+3. Guardar los check runs, commit statuses, workflows, ejecuciones, jobs e intentos por head. Distinguir requisitos leídos, resultados esperados ausentes y requisitos cuya lectura o aplicación no se pudo verificar.
+4. Registrar estados y conclusiones separados, incluidas peticiones de intervención. Recuperar anotaciones y extractos filtrados de fallo y permitir reintentar los diagnósticos inaccesibles. Comprobar la correlación de checks comunicados después del job y el filtrado de credenciales con escapes de terminal y valores marcados por Actions.
+5. Mantener el sondeo con un worker ocupado y conservar candidato y rondas. Simular errores de consulta y cuota, conservar la última información válida y seguir con otros PR mientras GitHub permita consultar.
+6. Repetir el sondeo y abrir de nuevo la misma SQLite. Consultar mediante `status` y `logs --pr OWNER/REPO#PR --sha SHA` sin duplicar transiciones. Verificar un head nuevo, un rerun que reutilice el ID de un check y una ejecución nueva del mismo workflow. Simular también un fallo temporal al recuperar un intento histórico y comprobar que su estado previo sigue disponible hasta que se restablezca la consulta. [Contrato de observación v1](especificacion.md#formato-de-observación-v1).
+7. Reproducir el PR #23 abierto y vinculado al trabajo #10. La evidencia simulada atribuye el CI al head comunicado por el operador `d8cda48a51ee46eb285ac866e8b58d4ad89415db` y conserva `bb747e16b42c2aaf05ac9275c9625cde90a49aec` como candidato. La simulación representa el merge de `main` en la rama del PR mediante los padres del commit. La comprobación con evidencia real del CI de ese PR queda pendiente.
+
 Publicar en el README los comandos para arrancar y actualizar el controlador mediante Compose, consultar su estado y recrearlo conservando SQLite y trabajos. Usar la vía contenedorizada en el piloto de servicio continuo y comprobar `status` tras la recreación. Mantener la vía nativa para operadores que ya gestionan procesos Linux.
 
 ## Encargo para iniciar I1
@@ -147,3 +157,13 @@ La aceptación de recuperación de I2 incluye una construcción interrumpida tra
 La aceptación de diagnóstico de I3 incluye salida en streaming de Cursor con resultado terminal, rechazo de flujos incompletos y conservación de actividad anterior a un timeout. Un proceso que produce abundante stderr debe terminar y entregar su actividad sin bloquear la captura.
 
 La aceptación de Cursor comprueba además una revisión no interactiva capaz de utilizar Shell para lectura y verificación, con el código montado para lectura. El diff del candidato se entrega con sus saltos de línea y el contenido del transporte estructurado permanece fuera de los mensajes persistidos de error.
+
+### Seguimiento y reparación de CI del mismo PR
+
+**Aceptación local.** Con la configuración de [ejemplo](../examples/factory.toml), verificar que `status` muestra etapa, CI, SHA, consumo e intervención. `status --json` e `history OWNER/REPO#N` deben mostrar la evidencia por SHA y las decisiones por intento. Un remoto Git temporal, GitHub simulado y un proveedor de prueba deben reproducir PR abierto, fallo confirmado, construcción, checks y revisión del mismo candidato, push condicionado al head observado y CI correcto del mismo PR.
+
+El CI pendiente y el rerun en curso dejan la rama intacta. Un sondeo duplicado conserva el mismo diagnóstico y una sola ronda. Probar fallos técnicos con espera y límite, diagnóstico insuficiente, rondas agotadas y las operaciones `resume --accept-head`, `resume --add-rounds`, `resume --allow-protected-path` y `link-pr`. Comprobar que el cambio de alcance, cierre o head ajeno impide escribir en el remoto. Simular la interrupción durante construcción y después del push y comprobar que el historial conserva los SHA de ambos ciclos.
+
+Comprobar también el ciclo combinado de observación y reparación: el mismo sondeo conserva el snapshot de CI por SHA y despacha el trabajo a `building`; un trabajo en `checking` con espera técnica futura no se ejecuta ni duplica el diagnóstico. Mantener el sondeo concurrente durante los workers, las dos formas de `link-pr` documentadas y las salidas de `status --json`, `status --pr` y `logs --pr`.
+
+**Aceptación de campo.** Ejecutar el [ensayo del PR 23](piloto.md#aceptación-de-ci-del-pr-23) con autorización del operador y conservar el PR abierto hasta que decida sobre la integración.

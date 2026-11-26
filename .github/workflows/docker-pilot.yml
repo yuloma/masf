@@ -6,6 +6,8 @@ name: Docker Compose pilot
       - ".github/workflows/docker-pilot.yml"
       - "examples/docker/**"
       - "examples/profiles/**"
+      - "Makefile"
+      - "scripts/**"
   workflow_dispatch: {}
 
 permissions:
@@ -32,4 +34,4 @@ jobs:
           "${control[@]}" config --quiet
           "${control[@]}" -f examples/docker/engine.yaml config --quiet
       - name: Check isolated PostgreSQL projects
-        run: bash examples/docker/smoke-profile.sh
+        run: make smoke

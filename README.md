@@ -30,6 +30,8 @@ El prompt elige Docker Compose para el controlador central salvo que pidas la in
 
 ## Construir y operar el servicio
 
+El [Makefile](Makefile) reúne las operaciones habituales sobre la instalación Compose existente. `make` muestra la ayuda; `make start` arranca la fábrica, `make status` consulta los trabajos y `make logs` muestra los logs. Desde un checkout limpio de `main`, con la cola en reposo, `make update` trae los últimos cambios de `origin/main`, reconstruye controlador y runner y recrea el servicio conservando el registro y el estado. Usa `MASF_PROVIDERS='codex cursor'` para elegir las CLIs del runner. [Recetas, variables y comprobaciones](docs/operacion.md).
+
 Desde el checkout que se va a instalar, construye el controlador y empaqueta las distribuciones Linux independientes de las CLIs elegidas. El ejemplo utiliza Codex y Cursor.
 
 ```bash

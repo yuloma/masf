@@ -13,7 +13,7 @@ from contextlib import closing
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
-from . import ci, observation_data as public, queue, recovery
+from . import ci, integration, observation_data as public, queue, recovery
 from .config import load, xdg
 from .evidence import digest, timestamp
 from .system import ProcessError, command
@@ -177,6 +177,12 @@ class Decisions:
                                             current_limit=counts["build_limit"],
                                             maximum_extra=MAX_ROUNDS
                                             if counts["rounds"] >= counts["build_limit"] else 0)}, {}
+        if request := job.get("merge_intervention"):
+            offers = {"retry_merge_review": describe("retry_merge_review", "pr_open")}
+            if request.get("binding") and not job.get("integration_approval"):
+                offers["record_manual_merge"] = describe(
+                    "record_manual_merge", "needs_input", binding=request["binding"])
+            return offers, {}
         offers = {}
         copies = {}
         checkpoint = job.get("build_workspace") or {}
@@ -319,6 +325,7 @@ class Decisions:
                 "base_conflict": public.conflict(conflict),
                 "resolution_ref_prefix": self.resolution_prefix(job, conflict) if conflict else None,
                 "build_timeout": timeout_context,
+                "merge_intervention": public.merge_intervention(job.get("merge_intervention")),
                 "compatible_build_copies": len(copies)}
 
     def submit(self, db, identity, key, payload, *, defer=False, redact=lambda value: value):
@@ -488,6 +495,17 @@ class Decisions:
         additions = [entry]
         overrides = (job.get("routing_override") or {}).copy()
         match kind:
+            case "retry_merge_review":
+                updates.update(merge_evaluation=None, merge_waits=0, merge_ci_waits=None,
+                               merge_intervention=None, integration_approval=None)
+            case "record_manual_merge":
+                binding = integration.binding_for(job, pr, repo)
+                if (binding != offer["binding"]
+                        or integration.references(job, self.lookup) != (binding["base"], binding["head"])):
+                    raise stale("Cambió la base, el head, el alcance o la política de integración.")
+                entry.update(binding=binding, base=binding["base"], head=binding["head"])
+                updates.update(integration_approval=entry, retry="pr_open",
+                               reason="Decisión registrada. Integra el PR en GitHub con las revisiones autorizadas.")
             case "confirm_scope":
                 updates.update(title=issue["title"], body=issue["body"], fingerprint=scope,
                                scope_conflict=None, scope_review=None, rounds=0, recovery_builds=0, ci_rounds=0,

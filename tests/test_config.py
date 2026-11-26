@@ -63,6 +63,32 @@ class OfflineDoctor(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(result.stdout, "")
 
+    def test_merge_policy_requires_opt_in_and_valid_route_and_evidence(self):
+        from masf.config import load
+
+        base = "".join(CONFIG.values())
+        self.config.write_text(base)
+        self.assertNotIn("merge_policy", load(self.config)["repositories"][0])
+        policy = """[repositories.merge_policy]
+enabled = true
+method = "squash"
+automatic_deploy = false
+allowed_risks = ["low", "elevated"]
+[repositories.merge_policy.required_ci]
+low = ["unit"]
+elevated = ["unit"]
+[repositories.merge_policy.proof_checks]
+integration = ["integration"]
+"""
+        self.assert_invalid(base + policy, REPO + ".routing.merge_review", "falta asignar un proveedor")
+        routed = base + '[repositories.routing]\nmerge_review = "codex"\n'
+        self.config.write_text(routed + policy)
+        self.assertTrue(load(self.config)["repositories"][0]["merge_policy"]["enabled"])
+        self.config.write_text(routed + policy.replace("enabled = true", "enabled = false"))
+        self.assertFalse(load(self.config)["repositories"][0]["merge_policy"]["enabled"])
+        self.assert_invalid(routed + policy.replace('integration = ["integration"]\n', ""),
+                            REPO + ".merge_policy.proof_checks.integration", "la clase elevated exige integración")
+
     def test_required_sections_missing_or_wrong_type(self):
         for section in ("service", "runner", "providers", "routing", "repositories"):
             data = "".join(value for name, value in CONFIG.items() if name != section)

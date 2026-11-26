@@ -85,6 +85,17 @@ Para consultar las acciones de #22, usa `repo_id`, `number` (la issue) y la `rev
 
 En conflictos de integración, `merge_observation` describe la observación más reciente del PR y `pr_conflict` contiene su recuperación. `intervention.conflict_action` indica cómo continuar si requiere intervención. `conflict_result` conserva el último resultado y `retry_at` indica cuándo vence una espera programada. La cronología expone observaciones, recuperaciones y resultados con los SHAs de base, head y candidato, rutas afectadas y decisión cuando están disponibles. Los intentos vinculados incluyen `conflict_origin` junto con el agente, proveedor y modelo que consten en la evidencia.
 
+Las respuestas de trabajo y sus eventos exponen estos campos de integración. Cada campo admite `null` cuando falta el registro correspondiente, incluidos los trabajos históricos.
+
+| Campo | Contenido |
+| --- | --- |
+| `merge_evaluation` | Evaluación versionada con fecha, criterios, rutas, política aplicada y decisión del controlador en `decision`. `reviewer` identifica el intento, proveedor, ejecución y modelo cuando constan. `result` contiene el veredicto del revisor (`auto_merge` o `human_required`), motivos, riesgos, componentes afectados, evidencia, pruebas ausentes y hallazgos bloqueantes. `ci`, `local` y `github_branch_checks` resumen los checks observados. `diff_digest` y `ci_digest` identifican el diff y la evidencia de CI evaluados. |
+| `merge_intervention` | Petición de intervención con fecha `at`, motivos en `reasons` y comprobación o decisión pendiente en `next_action`. |
+| `merge_intent` | Intención persistida antes de mutar el PR, con `operation` (`ready` o `merge`), `method`, contador `attempts` y fecha `at`. Una intención pendiente puede requerir reconciliación con GitHub. |
+| `merge_result` | Último resultado observado en GitHub. `status` indica `ready` al confirmar que el PR está listo, `closed` al cerrar sin merge o `merged` al confirmar el merge con las referencias registradas. `merged_other_head` y `merged_unverified_base` indican que se observó un merge con un head o una base distintos de los registrados, respectivamente. Al observar el cierre incluye `observed_base`, `observed_head` y, si hubo merge y GitHub lo comunica, `merged_sha`. |
+
+El objeto `binding`, cuando está disponible, vincula cada registro con `repo_id`, `pr`, los SHA `base` y `head`, las ramas `base_ref` y `head_ref`, y las huellas `scope` y `policy`. El historial conserva la evidencia de revisiones anteriores. Los consumidores deben usar las referencias vigentes al presentar una decisión como aplicable al PR actual.
+
 La precondición compartida de #22 usa `observation_data.revision(job, last_event_id)` sobre el trabajo persistido sin metadatos temporales de reserva, con el ID máximo de sus eventos o `null`. Una revisión distinta identifica una vista obsoleta. El servicio autenticado de acciones debe comparar ese valor en el ámbito transaccional del controlador antes de aplicar cada decisión, y comprobar además sus permisos y alcance vigentes. El navegador trata la revisión como un valor opaco. Las mutaciones se tramitan en ese servicio y a través de las operaciones del controlador.
 
 Cada intento mantiene su ID y sus SHAs de entrada y de candidato, rol, ejecutor, proveedor, ID de ejecución y fuente, versión de CLI, modelo solicitado y efectivo con su fuente, tiempos, estado y resultado. `usage.measurements` conserva valor, unidad, fuente y, para costes, `kind` igual a `estimated` o `confirmed`. Un cero comunicado se conserva como número. Los checks y las operaciones humanas indican que modelo y uso de CLI no aplican al rol. El mismo `attempt_id` sirve para leer identidad en una etapa activa y consultar después la explicación, con decisiones, criterios, motivo y referencias. Los intentos históricos se adaptan a partir de los registros de SQLite. Si falta el ID original, el adaptador asigna un identificador local estable a la proyección y deja desconocidos el modelo efectivo y los metadatos ausentes.
@@ -122,6 +133,10 @@ El `POST` exige `Content-Type: application/json` y una cabecera `Idempotency-Key
 | `accept_head` | `{"sha":"SHA"}`, con el head observado y `extra` opcional para ampliar rondas |
 | `reuse_workspace` | `{"reference":"REFERENCIA"}`, con una referencia ofrecida |
 | `extend_timeout` | `{"seconds":1200,"reference":"REFERENCIA"}`, con una referencia ofrecida |
+| `retry_merge_review` | `{}` |
+| `record_manual_merge` | `{}` |
+
+Cuando hay una petición de integración, el `GET` de acciones devuelve `merge_intervention`. `retry_merge_review` vuelve a `pr_open`, descarta la evaluación y la autorización registradas y reanuda la observación antes de una nueva evaluación. `record_manual_merge` se ofrece con el `binding` de la petición cuando aún no hay una decisión manual registrada. Al aplicarla, el controlador revalida el PR, las referencias, el alcance y la política y registra el operador, el motivo enviado en `evidence` y el `binding` en el historial. El trabajo permanece en `needs_input` para que el operador integre el PR en GitHub con las revisiones autorizadas. Un cambio posterior de base, head, alcance o política invalida esa autorización.
 
 El POST devuelve HTTP 202 al persistir la aceptación. El recibo en `data` incluye `id`, `operator`, `kind`, `status`, `accepted_at`, `revision`, `origin`, `repo_id`, `number` y `resume_state`. El GET del recibo devuelve HTTP 200 y exige la credencial del operador que lo envió.
 

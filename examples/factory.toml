@@ -38,6 +38,8 @@ executable = "claude"
 plan = "codex"
 build = "codex"
 review = "cursor"
+# El rol de integración se puede asignar globalmente o por repositorio.
+# merge_review = "codex"
 
 [[repositories]]
 # Reemplazar por un destino propio y habilitarlo tras verificar sus checks.
@@ -56,6 +58,25 @@ protected_paths = [".github/workflows/**"]
 # plan = "claude"
 # build = "codex"
 # review = "cursor"
+
+# Para habilitar la revisión independiente, asigna merge_review arriba y añade
+# esta política a la entrada del repositorio. Usa los nombres de sus checks de CI.
+# GitHub requiere intervención cuando solo permite condicionar el head.
+# [repositories.merge_policy]
+# enabled = true
+# method = "squash"
+# automatic_deploy = false
+# allowed_risks = ["low", "elevated"]
+# critical_paths = ["ops/**"]
+# human_only_paths = ["config/production/**"]
+# [repositories.merge_policy.required_ci]
+# low = ["unit tests"]
+# elevated = ["unit tests"]
+# [repositories.merge_policy.proof_checks]
+# integration = ["integration tests"]
+# migration = ["migration dry run"]
+# compatibility = ["compatibility matrix"]
+# recovery = ["restore drill"]
 
 [[repositories]]
 # Proyecto SQL que ejecuta todo en Docker. El perfil vive junto al TOML del operador.

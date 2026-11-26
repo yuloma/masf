@@ -27,7 +27,7 @@ MAX_ARTIFACT_SIZE = 2 * 1024 * 1024
 IDENT = re.compile(r"[A-Za-z0-9_-]{1,128}")
 SHA = re.compile(r"[0-9a-fA-F]{4,64}")
 SLUG = re.compile(r"[\w.-]+/[\w.-]+")
-STAGE_FILE = re.compile(r"(?:plan|build|review|checks|publish)-[A-Za-z0-9_-]+\.json")
+STAGE_FILE = re.compile(r"(?:plan|build|review|merge_review|checks|publish)-[A-Za-z0-9_-]+\.json")
 CHECK_FILE = re.compile(r"[0-9a-f]{32}/checks\.json")
 STATE = re.compile(r"[a-z_]{1,40}")
 DASHBOARD_ASSETS = {
@@ -515,6 +515,10 @@ class View:
             "ci_poll_error": public.observation_error(job["ci_poll_error"]) if job.get("ci_poll_error") else None,
             "repair": public.repair(job.get("ci_repair")),
             "merge_observation": public.conflict(job.get("merge_observation")),
+            "merge_evaluation": public.merge_evaluation(job.get("merge_evaluation")),
+            "merge_intervention": public.merge_intervention(job.get("merge_intervention")),
+            "merge_intent": public.merge_operation(job.get("merge_intent")),
+            "merge_result": public.merge_operation(job.get("merge_result")),
             "pr_conflict": public.conflict(job.get("pr_conflict")),
             "base_conflict": public.conflict(job.get("base_conflict")),
             "observed_base": public.scalar(public.mapping(job.get("base_conflict")).get("observed_base")),
@@ -567,6 +571,10 @@ class View:
             "checks": public.check_report(detail.get("checks")),
             "repair": public.repair(detail.get("ci_repair")),
             "merge_observation": public.conflict(detail.get("merge_observation")),
+            "merge_evaluation": public.merge_evaluation(detail.get("merge_evaluation")),
+            "merge_intervention": public.merge_intervention(detail.get("merge_intervention")),
+            "merge_intent": public.merge_operation(detail.get("merge_intent")),
+            "merge_result": public.merge_operation(detail.get("merge_result")),
             "pr_conflict": public.conflict(detail.get("pr_conflict")),
             "conflict_result": public.conflict(detail.get("conflict_result")),
             "recoveries": [
@@ -631,7 +639,7 @@ class View:
 
 
 JOB_STAGE = {"planning": "plan", "building": "build", "checking": "checks",
-             "reviewing": "review", "publishing": "publish"}
+             "reviewing": "review", "publishing": "publish", "merge_review": "merge_review"}
 
 
 class ObservationHandler(BaseHTTPRequestHandler):

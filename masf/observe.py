@@ -453,6 +453,7 @@ def close_job(db, pr):
     row = db.execute(
         """SELECT data FROM jobs WHERE repo_id=? AND number=?
         AND (state='pr_open' OR (state='closed' AND ?='merged'))
+        AND json_type(data, '$.merge_intent') IS NOT 'object'
         AND NOT EXISTS (SELECT 1 FROM leases WHERE leases.repo_id=jobs.repo_id
                         AND leases.number=jobs.number AND expires>unixepoch())""",
         (*ident, pr["state"]),

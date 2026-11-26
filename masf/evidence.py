@@ -32,7 +32,7 @@ def digest(value):
 @lru_cache
 def revisions():
     sources = {path.name: path.read_text() for path in Path(__file__).parent.glob("*.py")}
-    policy = ("actions.py", "checks.py", "ci.py", "cli.py", "config.py", "github_ci.py", "observe.py",
+    policy = ("actions.py", "checks.py", "ci.py", "cli.py", "config.py", "github_ci.py", "integration.py", "observe.py",
               "providers.py", "queue.py", "recovery.py", "worker.py")
     return {"engine": "sha256:" + digest(sources),
             "policy": "sha256:" + digest({name: sources[name] for name in policy})}
@@ -87,6 +87,8 @@ def agent_explanation(role, result, refs, plan=None):
     criteria = result.get("criteria", []) if role == "plan" else (plan or {}).get("criteria", [])
     decisions = result.get("changes", []) if role == "build" else result.get("findings", [])
     verdict = result.get("verdict")
+    if role == "merge_review" and result.get("decision"):
+        decisions = [result["decision"], *result.get("reasons", [])]
     if verdict:
         decisions = [verdict, *decisions]
         summary = summary or ("Revisión aprobada" if verdict == "pass" else "Revisión con cambios solicitados")

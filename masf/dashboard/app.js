@@ -20,15 +20,17 @@ const groups = {
 const states = {
   queued: "En cola", planning: "Planificación", building: "Construcción", checking: "Comprobaciones",
   reviewing: "Revisión", publishing: "Publicación", retry_wait: "En espera de reintento",
-  pr_open: "PR abierto", needs_input: "Requiere intervención", blocked: "Bloqueado",
+  pr_open: "PR abierto", merge_review: "Revisión de integración", needs_input: "Requiere intervención", blocked: "Bloqueado",
   merged: "Fusionado", closed: "Cerrado", cancelled: "Cancelado",
 };
 const categories = {
   queued: "queued", planning: "active", building: "active", checking: "active", reviewing: "active",
-  publishing: "active", retry_wait: "active", pr_open: "active", needs_input: "blocked", blocked: "blocked",
+  publishing: "active", retry_wait: "active", pr_open: "active", merge_review: "active",
+  needs_input: "blocked", blocked: "blocked",
   merged: "done", closed: "done", cancelled: "done",
 };
-const roles = { plan: "Planificación", build: "Construcción", checks: "Comprobaciones", review: "Revisión", publish: "Publicación" };
+const roles = { plan: "Planificación", build: "Construcción", checks: "Comprobaciones", review: "Revisión",
+  publish: "Publicación", merge_review: "Revisión de integración" };
 const statuses = {
   active: "En ejecución", completed: "Terminado", failed: "Fallido", interrupted: "Interrumpido",
   cancelled: "Cancelado", pending: "Pendiente", needs_input: "Requiere intervención",
@@ -43,6 +45,7 @@ const eventNames = {
   observation_recovered: "Sondeo recuperado", required_checks: "Cambio de checks requeridos",
 };
 const decisionNames = {
+  record_manual_merge: "Registrar decisión de integración manual", retry_merge_review: "Repetir revisión de integración",
   resume: "Reanudar", resume_planning: "Reanudar planificación", allow_paths: "Autorizar rutas",
   rounds: "Ampliar rondas", reuse_workspace: "Recuperar copia", head: "Aceptar head",
   resolved_commit: "Aceptar commit resuelto", link_pr: "Vincular PR",
@@ -730,6 +733,10 @@ function decisionForm(job, offers) {
       offer.commits.map(commit => [commit, commit]), offer.commits[0]));
   }
   if (offer.kind === "accept_head") controls.push(fields([["Head observado", sha(offer.head)]]));
+  if (offer.kind === "record_manual_merge") {
+    controls.push(fields([["PR", offer.binding.pr], ["Base", sha(offer.binding.base)],
+      ["Head", sha(offer.binding.head)], ["Alcance", offer.binding.scope], ["Política", offer.binding.policy]]));
+  }
   if (offer.kind === "extend_timeout") {
     controls.push(fields([["Plazo anterior", offer.previous_seconds + " s"]]),
       numberControl("seconds", "Nuevo plazo de construcción (segundos)", offer.minimum_seconds, offer.maximum_seconds));
@@ -999,6 +1006,25 @@ function jobPage({ job, attempts, events, ci }) {
     !job.intervention.pending && submission ? section("Envío de decisión", actionPanel(job), "panel") : null,
     active ? section("Etapa activa", attemptCard(active, job, previousFor(active))) : null,
     repairPanel(job),
+    job.merge_evaluation || job.merge_intervention || job.merge_result ? section("Integración del PR", [
+      fields([["Base evaluada", sha(job.merge_evaluation?.binding?.base)],
+        ["Head evaluado", sha(job.merge_evaluation?.binding?.head)],
+        ["Revisor", job.merge_evaluation?.reviewer?.provider],
+        ["Modelo", job.merge_evaluation?.reviewer?.model?.effective || job.merge_evaluation?.reviewer?.model?.requested],
+        ["Política", job.merge_evaluation?.binding?.policy],
+        ["Veredicto del revisor", job.merge_evaluation?.result?.decision],
+        ["Decisión del controlador", job.merge_evaluation?.decision],
+        ["Motivo", job.merge_evaluation?.result?.summary],
+        ["Siguiente paso", job.merge_intervention?.next_action],
+        ["Resultado observado", job.merge_result?.status],
+        ["Commit integrado", sha(job.merge_result?.merged_sha)]]),
+      textList(job.merge_intervention?.reasons || job.merge_evaluation?.reasons || []),
+      job.merge_evaluation?.result ? disclosure("Evidencia y pruebas", [
+        textList(Object.entries(job.merge_evaluation.ci).map(([ref, check]) =>
+          ref + " · " + check.name + " · " + check.conclusion)),
+        textList(job.merge_evaluation.result.missing_tests),
+      ]) : null,
+    ], "panel") : null,
     ci ? section("CI e historial de SHAs", ciHistory(ci, job)) : null,
     job.checks ? section("Última comprobación local", checkReport(job.checks), "panel") : null,
     timeline([...jobEvents, ...ciEvents]),

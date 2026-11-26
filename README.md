@@ -66,12 +66,26 @@ masf --config FILE link-pr OWNER/REPO#23 OWNER/REPO#10
 
 `link-pr` se usa cuando `status` muestra `job: null` y el operador identifica una issue ya registrada del mismo repositorio. En Docker se ejecuta con el mismo prefijo `exec -T controller masf --config /etc/masf/pilot.toml`.
 
+## Revisión independiente de integración
+
+El merge sigue siendo manual por defecto. Para incorporar un repositorio, configura `merge_review` y `repositories.merge_policy` en el [registro central de ejemplo](examples/factory.toml). Tras un CI correcto, una sesión nueva recibe el diff, el código de solo lectura, los criterios y la evidencia del PR. La política indica qué riesgos requieren revisión humana, qué comprobaciones deben pasar y si integrar el PR inicia un despliegue.
+
+Cuando el controlador carece de una operación capaz de condicionar la integración a la base y al head evaluados, conserva el PR y solicita intervención. La operación de GitHub disponible para el controlador condiciona el head. Consulta el motivo, comprueba las revisiones vigentes y registra tu decisión antes de integrar manualmente en GitHub. Si obtienes evidencia nueva, puedes repetir la revisión.
+
+```bash
+masf --config FILE status --json
+masf --config FILE history OWNER/REPO#10
+masf --config FILE resume OWNER/REPO#10 --decision-context
+masf --config FILE resume OWNER/REPO#10 --retry-merge-review --evidence 'CI de integración disponible'
+masf --config FILE resume OWNER/REPO#10 --record-manual-merge --evidence 'Base, head y recuperación verificados'
+```
+
 ## Cómo funciona
 
 1. El operador registra el repositorio, su etiqueta, sus comprobaciones y los proveedores disponibles en la configuración central.
 2. Una persona marca una issue que está lista para desarrollo. El servicio la recoge en el siguiente sondeo y abre un único trabajo para ella.
 3. Un agente prepara el plan, otro puede implementarlo y un tercero puede revisar el diff. El operador puede asignar todos los roles a un proveedor o combinar Codex, Cursor y Claude Code.
-4. La persona que revisa el PR recibe el cambio, los criterios de aceptación y el resultado de los checks. La incorporación de un repositorio requiere acceso a GitHub y una entrada en la configuración central, con cero archivos de MASF en el proyecto destino.
+4. Los PR publicados reciben observación de CI. Si el repositorio activa la etapa de integración, el controlador ejecuta la revisión independiente y expone la decisión y la evidencia a la persona que atiende la intervención.
 
 ## Documentos de trabajo
 

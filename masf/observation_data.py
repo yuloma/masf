@@ -119,6 +119,12 @@ def stage_result(role, value):
         return None
     if role == "checks":
         return check_report(value)
+    if role == "merge_review":
+        return fields(value, "version summary decision base head risk additional_verification") | {
+            key: strings(value.get(key)) for key in (
+                "reasons", "risks", "affected", "evidence", "missing_tests", "blocking_findings", "proofs",
+            )
+        }
     return fields(value, "version summary question verdict confirmed pr sha") | {
         key: strings(value.get(key)) for key in ("criteria", "changes", "findings")
     }
@@ -126,7 +132,7 @@ def stage_result(role, value):
 
 def stage(value):
     active = value.get("status") == "active"
-    applicable = value.get("role") in {"plan", "build", "review"} or bool(value.get("provider"))
+    applicable = value.get("role") in {"plan", "build", "review", "merge_review"} or bool(value.get("provider"))
     public = fields(value, "id role executor provider execution_id execution_id_source cli_version "
                     "input_sha candidate_sha started_at finished_at detected_at duration_seconds "
                     "status error error_type purpose previous_attempt retry_of pr legacy_model configured_timeout_seconds")
@@ -170,6 +176,57 @@ def historical_stage(role, record, ident):
     return None
 
 
+def merge_binding(value):
+    if mapping(value):
+        return fields(value, "repo_id pr base head base_ref head_ref scope policy")
+    return None
+
+
+def merge_intervention(value):
+    if not mapping(value):
+        return None
+    return fields(value, "at next_action") | {
+        "binding": merge_binding(value.get("binding")), "reasons": strings(value.get("reasons")),
+    }
+
+
+def merge_evaluation(value):
+    if not mapping(value):
+        return None
+    reviewer = mapping(value.get("reviewer"))
+    policy = mapping(value.get("policy"))
+    rules = mapping(value.get("github_branch_checks"))
+    return fields(value, "version at decision diff_digest ci_digest") | {
+        "binding": merge_binding(value.get("binding")),
+        "criteria": strings(value.get("criteria")), "reasons": strings(value.get("reasons")),
+        "paths": strings(value.get("paths")),
+        "policy": fields(policy, "enabled method automatic_deploy") | {
+            key: strings(policy.get(key)) for key in ("allowed_risks", "critical_paths", "human_only_paths")
+        } | {key: {name: strings(contexts) for name, contexts in mapping(policy.get(key)).items()}
+             for key in ("required_ci", "proof_checks")},
+        "reviewer": fields(reviewer, "provider execution_id stage_attempt") | {
+            "model": model(reviewer.get("model")),
+        } if reviewer else None,
+        "result": stage_result("merge_review", value.get("result")),
+        "ci": {ref: fields(item, "id name status conclusion run attempt")
+               for ref, item in mapping(value.get("ci")).items()},
+        "github_branch_checks": fields(rules, "known") | {
+            "checks": [fields(item, "name app_id") for item in items(rules.get("checks"))],
+            "errors": error_map(rules.get("errors")),
+        },
+        "local": {ref: check_report(item) for ref, item in mapping(value.get("local")).items()},
+    }
+
+
+def merge_operation(value):
+    if not mapping(value):
+        return None
+    return fields(value, "version status operation method attempts at merged_sha observed_base observed_head "
+                         "source attempted_operation") | {
+        "binding": merge_binding(value.get("binding")),
+    }
+
+
 def operation(value):
     entry = mapping(value.get("decision"))
     executor = scalar(value.get("executor"))
@@ -184,7 +241,8 @@ def operation(value):
                            "result outcome status reason resume_state role provider previous_provider round_limit "
                            "timeout_seconds previous_timeout_seconds workspace origin expected_revision question "
                            "question_attempt answer previous_base previous_candidate previous_fingerprint "
-                           "recoveries recovery_limit error_code") | {"paths": strings(entry.get("paths"))},
+                           "recoveries recovery_limit error_code") | {"paths": strings(entry.get("paths"))} | (
+                               {"binding": merge_binding(entry["binding"])} if "binding" in entry else {}),
         "explanation": explanation(value.get("explanation")),
     }
 

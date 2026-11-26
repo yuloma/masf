@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 import tomllib
@@ -5,6 +6,8 @@ from pathlib import Path
 
 
 ROLES = ("plan", "build", "review")
+MERGE_REVIEW = "merge_review"
+MERGE_PROOFS = {"integration", "migration", "compatibility", "recovery"}
 
 
 class ConfigError(ValueError):
@@ -40,7 +43,7 @@ def routing(value, field):
     routes = table(value, field)
     for role, name in routes.items():
         route = f"{field}.{role}"
-        required(role in ROLES, route, "rol desconocido")
+        required(role in (*ROLES, MERGE_REVIEW), route, "rol desconocido")
         string(name, route)
     return routes
 
@@ -207,7 +210,11 @@ def validate_repo(repo, field, global_routes, providers, runner_image, directory
 
     local_routes = routing(repo.get("routing", {}), field + ".routing")
     repo["routing"] = global_routes | local_routes
-    for role in ROLES:
+    policy = validate_merge_policy(repo.get("merge_policy", {}), field + ".merge_policy")
+    if "merge_policy" in repo:
+        repo["merge_policy"] = policy
+    roles = (*ROLES, MERGE_REVIEW) if policy.get("enabled") or MERGE_REVIEW in repo["routing"] else ROLES
+    for role in roles:
         route = f"{field}.routing.{role}"
         name = repo["routing"].get(role)
         required(name is not None, route, "falta asignar un proveedor")
@@ -238,3 +245,43 @@ def validate_repo(repo, field, global_routes, providers, runner_image, directory
         string(value, f"{paths_field}[{index}]")
     if "compose" in repo:
         validate_compose(repo["compose"], directory, field + ".compose")
+        if policy["enabled"]:
+            try:
+                repo["merge_profile_digests"] = [
+                    hashlib.sha256((directory / name).read_bytes()).hexdigest()
+                    for name in repo["compose"]["files"]
+                ]
+            except OSError as exc:
+                raise ConfigError(f"Configuración inválida: {field}.compose: no se pudo leer el perfil") from exc
+
+
+def validate_merge_policy(value, field):
+    policy = table(value, field).copy()
+    keys = {"enabled", "method", "automatic_deploy", "critical_paths", "human_only_paths",
+            "allowed_risks", "required_ci", "proof_checks"}
+    required(set(policy) <= keys, field, "opción de integración desconocida")
+    required(type(policy.setdefault("enabled", False)) is bool, field + ".enabled", "se requiere un booleano")
+    if not policy["enabled"] and len(policy) == 1:
+        return policy
+    required(policy.get("method") in ("merge", "squash", "rebase"), field + ".method", "método inválido")
+    required(type(policy.get("automatic_deploy")) is bool, field + ".automatic_deploy", "se requiere un booleano")
+    for name in ("critical_paths", "human_only_paths"):
+        for pattern in array(policy.setdefault(name, []), field + "." + name):
+            string(pattern, field + "." + name)
+            required(not pattern.startswith("/") and ".." not in pattern.split("/"),
+                     field + "." + name, "se requiere un patrón relativo")
+    risks = array(policy.get("allowed_risks"), field + ".allowed_risks")
+    required(risks and all(risk in ("low", "elevated") for risk in risks)
+             and len(set(risks)) == len(risks), field + ".allowed_risks", "clases válidas: low, elevated")
+    for key, accepted in (("required_ci", set(risks)), ("proof_checks", MERGE_PROOFS)):
+        values = table(policy.setdefault(key, {}), field + "." + key)
+        required(set(values) <= accepted, field + "." + key, "clave desconocida")
+        for name, contexts in values.items():
+            path = f"{field}.{key}.{name}"
+            required(array(contexts, path), path, "se requiere al menos un check")
+            for context in contexts:
+                string(context, path)
+    required(set(policy["required_ci"]) == set(risks), field + ".required_ci", "faltan checks por clase")
+    required("elevated" not in risks or "integration" in policy["proof_checks"],
+             field + ".proof_checks.integration", "la clase elevated exige integración")
+    return policy

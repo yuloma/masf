@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlencode
 
-from . import checks, ci, providers
+from . import checks, ci, integration, providers
 from .evidence import agent_explanation, digest, explanation, model, provenance, timestamp, usage, write_artifact
 from .queue import api, interrupt_stages, latest, record_stage, require_lease, retry_delay, save, stage_attempts
 from .recovery import BudgetExhausted, RecoverableFailure, limit, reserve, wait
@@ -88,7 +88,8 @@ class Worker:
         return folder
 
     @contextmanager
-    def stage(self, role, sha, *, provider=None, commands=(), evidence_files=(), settings=None):
+    def stage(self, role, sha, *, provider=None, commands=(), evidence_files=(), settings=None,
+              registry=None):
         job = self.job
         settings = self.cfg if settings is None else settings
         prior = stage_attempts(self.db, job, role=role) if self.db is not None else []
@@ -109,9 +110,11 @@ class Worker:
             "execution_id": None, "cli_version": None, "lease": job.get("attempt"),
             "input_sha": sha, "sha": sha, "candidate_sha": None, "started_at": timestamp(),
             "finished_at": None, "duration_seconds": None, "status": "active",
-            "model": model(self.cfg.get("providers", {}).get(provider, {}).get("model"),
+            "model": model(settings.get("providers", {}).get(provider, {}).get("model"),
                            applicable=provider is not None),
-            "usage": usage(), "provenance": provenance(settings, job),
+            "usage": usage(), "provenance": provenance(
+                settings, job if registry is None else job | {"repo": registry},
+            ),
             "configured_timeout_seconds": settings["service"].get("step_timeout_seconds")
                                           if provider or role == "checks" else None,
             "result": None, "error": None, "explanation": explanation(evidence=refs),
@@ -162,17 +165,22 @@ class Worker:
                 else:
                     write_artifact(file, record)
 
-    def test(self, sha):
+    def git_init(self):
+        command(["git", "init", "--bare", str(self.store)])
+
+    def test(self, sha, *, registry=None):
         repo = self.job["repo"]
         current = next((item for item in self.cfg.get("repositories", [])
                         if item["slug"] == self.job["slug"]), {})
         # Reuse private argv values from the registry only when the saved command still matches.
-        repo = repo | {key: current[key] for key in ("setup", "checks")
-                       if key in current and filtered(current[key]) == repo[key]}
+        repo = registry if registry is not None else repo | {
+            key: current[key] for key in ("setup", "checks")
+            if key in current and filtered(current[key]) == repo[key]
+        }
         folder = self.evidence / uuid.uuid4().hex
         artifact = str(folder.relative_to(self.evidence) / "checks.json")
         with self.stage("checks", sha, commands=repo["setup"] + repo["checks"],
-                        evidence_files=[artifact]) as stage:
+                        evidence_files=[artifact], registry=registry) as stage:
             workspace = self.checkout(sha)
             # Compose services can have a different numeric UID.
             workspace.chmod(0o755)
@@ -191,16 +199,18 @@ class Worker:
             report["stage_attempt"] = stage["id"]
         return filtered(report)
 
-    def role(self, role, sha, folder, **inputs):
+    def role(self, role, sha, folder, *, registry=None, configuration=None, **inputs):
         job = self.job
         require_lease(self.db, job)
-        provider = job["repo"]["routing"][role]
-        settings = self.cfg
+        execution_job = job if registry is None else job | {"repo": registry}
+        provider = execution_job["repo"]["routing"][role]
+        settings = self.cfg if configuration is None else configuration
         timeout = (job.get("stage_timeouts") or {}).get(role)
         if timeout is not None:
-            settings = self.cfg | {"service": self.cfg["service"] | {"step_timeout_seconds": timeout}}
-        with self.stage(role, sha, provider=provider, settings=settings) as stage:
-            stage["explanation"]["criteria"] = (inputs.get("plan") or {}).get("criteria", [])
+            settings = settings | {"service": settings["service"] | {"step_timeout_seconds": timeout}}
+        with self.stage(role, sha, provider=provider, settings=settings, registry=registry) as stage:
+            criteria = inputs.get("criteria", (inputs.get("plan") or {}).get("criteria", []))
+            stage["explanation"]["criteria"] = criteria
             activity_file = self.evidence / f"{role}-{stage['id']}.activity.jsonl"
             last_activity_log = 0
             started = time.monotonic()
@@ -234,10 +244,10 @@ class Worker:
             try:
                 if role in (job.get("routing_override") or {}) and not settings["providers"].get(provider, {}).get("enabled"):
                     raise RuntimeError("El proveedor asignado a este trabajo está deshabilitado")
-                if job.get("operator_feedback"):
+                if role != integration.STATE and job.get("operator_feedback"):
                     inputs["operator_feedback"] = job["operator_feedback"]
                 result = providers.invoke(
-                    role, job, settings, folder,
+                    role, execution_job, settings, folder,
                     dict(title=job["title"], body=job["body"], sha=sha, **inputs),
                     self.owner, guard=self.guard, on_activity=activity,
                 )
@@ -260,7 +270,7 @@ class Worker:
             elif result["result"].get("verdict") == "changes_requested":
                 stage["status"] = "changes_requested"
             stage["explanation"] = agent_explanation(
-                role, result["result"], stage["explanation"]["evidence"], inputs.get("plan"),
+                role, result["result"], stage["explanation"]["evidence"], {"criteria": criteria},
             )
             result.update(sha=sha, attempt=job.get("attempt"), stage_attempt=stage["id"],
                           evidence_file=stage["evidence_file"])
@@ -439,6 +449,9 @@ class Worker:
         interrupt_stages(self.db, j)
         self.update(j["state"])
         self.recover()
+        if j["state"] == integration.STATE:
+            integration.Review(self, api).run()
+            return
         if j.get("repair_intent") and self.publication(self.publish_repair, recover=True):
             return
         if j.get("pr_number") and not j.get("pr_conflict"):
@@ -456,7 +469,7 @@ class Worker:
         elif not j.get("pr_number") and j.get("intent") and self.publication(self.reconcile_publication):
             return
         if not self.store.exists():
-            command(["git", "init", "--bare", str(self.store)])
+            self.git_init()
         if j.get("pr_conflict"):
             if not self.sync_pr_conflict():
                 return

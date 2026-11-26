@@ -13,7 +13,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
-from . import ci, recovery
+from . import ci, integration, recovery
 from .actions import ActionError, Decisions, process_pending, recorded_question
 from .config import ConfigError, load, xdg
 from .evidence import UNKNOWN_PROVENANCE, historical_role, provenance
@@ -39,7 +39,8 @@ from .system import TaskStopped, clean, command, docker_env, filtered
 from .worker import ProtectedPaths, Worker
 
 
-RUNNABLE = ("queued", "planning", "building", "checking", "reviewing", "publishing", "retry_wait")
+RUNNABLE = ("queued", "planning", "building", "checking", "reviewing", "publishing", "retry_wait",
+            integration.STATE)
 
 
 def doctor(cfg, offline):
@@ -181,11 +182,12 @@ def poll_ci_jobs(db, cfg):
     errors = 0
     active = {repo["slug"] for repo in cfg["repositories"] if repo["enabled"]}
     for row in db.execute(
-        """SELECT data FROM jobs WHERE state NOT IN ('closed','merged','cancelled')
-        AND json_extract(data, '$.pr_number') IS NOT NULL"""
+        """SELECT data FROM jobs WHERE json_extract(data, '$.pr_number') IS NOT NULL
+        AND (state NOT IN ('closed','merged','cancelled')
+             OR (state='cancelled' AND json_type(data, '$.merge_intent')='object'))"""
     ).fetchall():
         job = json.loads(row[0])
-        if job["slug"] not in active or not job.get("pr_number"):
+        if (job["slug"] not in active and not job.get("merge_intent")) or not job.get("pr_number"):
             continue
         token = uuid.uuid4().hex
         if not claim(db, job, token, 300):
@@ -199,21 +201,34 @@ def poll_ci_jobs(db, cfg):
         observing_pr = True
         try:
             job = leased_job(db, job, token)
-            if job["state"] in TERMINAL:
+            if job["state"] in TERMINAL and not job.get("merge_intent"):
                 continue
             if job["state"] == "pr_open" and job.get("ci_retry_at", 0) > time.time():
                 continue
             pr = ci.pull(job, lookup)
+            if integration.confirm(db, job, pr):
+                continue
+            if job["state"] in TERMINAL:
+                continue
             if pr["state"] != "open":
                 ci.validate(db, job, pr, set())
             elif not job.get("repair_intent") and ci.scope(db, job, lookup):
                 if not ci.validate(db, job, pr, {ci.expected_head(job)}):
                     continue
+                repo = integration.registry_for(cfg, job)
+                intervention = job.get("merge_intervention") or {}
+                prior = (job.get("integration_approval") or intervention).get("binding")
+                if prior and prior != integration.binding_for(job, pr, repo):
+                    save(db, job, "pr_open", integration_approval=None, merge_intervention=None,
+                         merge_evaluation=None, merge_waits=0, ci_retry_at=0,
+                         reason="El contexto de integración cambió")
                 if job["state"] == "pr_open":
                     recovering = ci.observe_merge(db, job, pr, lookup)
                     observing_pr = False
                     if not recovering:
+                        previous = job.get("ci")
                         ci.observe_and_route(db, job, cfg, lookup)
+                        integration.schedule(db, job, pr, repo, previous)
                 elif job.get("ci_intervention") and not job.get("head_conflict"):
                     observation, _ = ci.observe(job, ci.expected_head(job), lookup)
                     observation = filtered(observation)
@@ -320,7 +335,7 @@ def decision_target(db, cfg, target):
 def resume(db, cfg, target, allow_protected_paths=(), reuse_workspace=None, resolved_commit=None, *,
            accept_head=None, add_rounds=None, evidence=None, revision=None, idempotency_key=None,
            answer=False, confirm_scope=False, role_provider=None, timeout=None, workspace_reference=None,
-           add_recoveries=None):
+           add_recoveries=None, retry_merge_review=False, record_manual_merge=False):
     operation, identity = decision_target(db, cfg, target)
     job, current = operation.read_job(db, identity)
     explicit = any(value is not None for value in (revision, idempotency_key))
@@ -356,6 +371,12 @@ def resume(db, cfg, target, allow_protected_paths=(), reuse_workspace=None, reso
         choices.append(("answer", {}))
     if confirm_scope:
         choices.append(("confirm_scope", {}))
+    if retry_merge_review:
+        choices.append(("retry_merge_review", {}))
+    if record_manual_merge:
+        if not evidence:
+            raise ValueError("Indica el motivo de la decisión mediante --evidence")
+        choices.append(("record_manual_merge", {}))
     if len(choices) > 1:
         raise ValueError("Selecciona una sola decisión")
     kind, options = choices[0] if choices else ("resolve", {})
@@ -557,6 +578,8 @@ def main():
     decisions.add_argument("--add-recoveries", type=int)
     decisions.add_argument("--accept-head")
     decisions.add_argument("--add-rounds", type=int)
+    decisions.add_argument("--retry-merge-review", action="store_true")
+    decisions.add_argument("--record-manual-merge", action="store_true")
     decisions.add_argument("--evidence")
     link = subs.add_parser("link-pr")
     link.add_argument("target", type=pull_target)
@@ -624,6 +647,17 @@ def main():
                             j["recovery_wait"]["until"], timezone.utc
                         ).isoformat()) if j["state"] == "retry_wait" else "",
                     )
+                    if request := j.get("merge_intervention"):
+                        binding = request.get("binding") or {}
+                        evaluation = j.get("merge_evaluation") or {}
+                        if evaluation.get("binding") != binding:
+                            evaluation = {}
+                        print(f"  PR {binding.get('pr', j.get('pr_number'))} "
+                              f"base={binding.get('base', '—')} head={binding.get('head', '—')}")
+                        print("  Evidencia:", ", ".join([*evaluation.get("ci", {}), *evaluation.get("local", {})]) or "pendiente")
+                        for reason in request["reasons"]:
+                            print("  " + reason)
+                        print("  " + request["next_action"])
             if args.pr or not args.json:
                 pull_output(db, args.pr)
             return 0
@@ -658,6 +692,8 @@ def main():
                     confirm_scope=args.confirm_scope, role_provider=args.assign_provider,
                     timeout=args.timeout_seconds, workspace_reference=args.workspace_reference,
                     add_recoveries=args.add_recoveries,
+                    retry_merge_review=args.retry_merge_review,
+                    record_manual_merge=args.record_manual_merge,
                 )
             print(json.dumps(result, ensure_ascii=False))
             return 0

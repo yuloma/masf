@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from masf.system import ProcessError, command
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "examples/factory.toml"
+INVOKE_PROVIDER = providers.invoke
 
 FAKE_GH = r"""
 import json
@@ -1747,6 +1749,376 @@ class Delivery(TemporaryTest):
         published = queue.stage_attempts(self.worker.db, repaired, role="publish")[-1]
         self.assertEqual(published["result"]["intent"]["target"], sha)
         self.assertEqual(published["result"]["pr"], 3)
+
+    def open_merge_review_pr(self, *, updater=None):
+        from masf import cli, integration
+
+        self.open_ci_pr()
+        self.prs[0].update(draft=True, mergeable=True, mergeable_state="clean")
+        self.action_result = "success"
+        self.repo["routing"]["merge_review"] = "codex"
+        self.repo["merge_policy"] = config.validate_merge_policy({
+            "enabled": True, "method": "squash", "automatic_deploy": False,
+            "allowed_risks": ["low", "elevated"],
+            "required_ci": {"low": ["unit tests"], "elevated": ["unit tests"]},
+            "proof_checks": {"integration": ["unit tests"], "migration": ["migration dry run"]},
+            "human_only_paths": ["sensitive/**"],
+        }, "fixture")
+        self.merge_inputs = []
+        self.verdict_overrides = {}
+        self.additional = False
+        self.merge_operations = []
+        self.merge_cut = None
+        self.after_ready = None
+        self.check_error = None
+        real_api, regular_role, check = cli.api, providers.invoke, self.check
+
+        def lookup(endpoint, **kwargs):
+            if endpoint == f"repos/{self.job['slug']}":
+                return {"id": 123, "default_branch": "main", "allow_squash_merge": True}
+            if "/check-runs?" in endpoint and self.check_error:
+                raise self.check_error
+            if "/actions/runs?" in endpoint and self.action_state == "absent":
+                return {"workflow_runs": []}
+            return real_api(endpoint, **kwargs)
+
+        def agent(role, job, cfg, workspace, inputs, owner, **kwargs):
+            if role != "merge_review":
+                return regular_role(role, job, cfg, workspace, inputs, owner, **kwargs)
+            self.roles.append(role)
+            self.merge_inputs.append(inputs)
+            self.assertTrue((workspace / self.changed).exists())
+            self.assertFalse((workspace / ".git").exists())
+            return {"result": {
+                "version": 1, "summary": "Evidence supports integration", "decision": "auto_merge",
+                "risk": "low", "base": inputs["base"], "head": inputs["head"],
+                "reasons": ["The change is covered"], "risks": [], "affected": [self.changed],
+                "evidence": [*inputs["ci"], *inputs["checks"]], "missing_tests": [],
+                "blocking_findings": [], "proofs": [],
+                "additional_verification": self.additional and len(self.merge_inputs) == 1,
+            } | self.verdict_overrides, "provider": "codex"}
+
+        def create_worker(db, cfg, config_file, state, jobs, job):
+            instance = worker.Worker(db, cfg, config_file, state, self.root / "jobs", job)
+            instance.url = self.worker.url
+            instance.recover = lambda: None
+            instance.test = lambda sha, **kwargs: check(sha)
+            return instance
+
+        review = integration.Review
+        for obj, attr, value in (
+            (cli, "api", lookup), (worker, "api", lookup),
+            (integration, "load", lambda _: self.cfg), (providers, "invoke", agent),
+            (cli, "Worker", create_worker),
+            (integration, "Review", lambda instance, lookup: review(
+                instance, lookup, conditional_update=updater)),
+        ):
+            patcher = patch.object(obj, attr, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def conditional_fixture_merge(self, intent):
+        pr = self.prs[0]
+        base, head = self.worker.remote_base(), self.worker.remote_head()
+        # The mock has a precondition on both refs and the open PR.
+        if (pr["state"] != "open" or pr["base"]["ref"] != intent["binding"]["base_ref"]
+                or (base, head) != (intent["binding"]["base"], intent["binding"]["head"])):
+            raise ProcessError("Base changed", stdout="HTTP/2 422")
+        action = intent["operation"]
+        with closing(queue.connect(self.root / "state")) as db:
+            persisted = json.loads(db.execute("SELECT data FROM jobs").fetchone()[0])
+        self.assertEqual(persisted["merge_intent"], intent)
+        self.merge_operations.append(action)
+        if action == "ready":
+            self.assertTrue(pr["draft"])
+            pr["draft"] = False
+            if self.after_ready:
+                self.after_ready()
+        else:
+            self.assertFalse(pr["draft"])
+            self.assertEqual(intent["method"], "squash")
+            tree = command(["git", "rev-parse", head + "^{tree}"], cwd=self.source)
+            merged = command(["git", "-c", "user.name=test", "-c", "user.email=test@example.org",
+                              "commit-tree", tree, "-p", base, "-m", "Simulated squash"],
+                             cwd=self.source)
+            command(["git", "update-ref", "--stdin"], cwd=self.source,
+                    stdin=f"verify refs/heads/masf/issue-1 {head}\nupdate refs/heads/main {merged} {base}\n")
+            pr.update(state="closed", merged=True, merge_commit_sha=merged)
+            if self.merge_cut == "response":
+                raise RuntimeError("Response lost")
+
+    def test_independent_review_with_approved_conditional_backend(self):
+        self.open_merge_review_pr(updater=self.conditional_fixture_merge)
+        self.additional = True
+        self.action_state = "in_progress"
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["state"], "pr_open")
+        self.assertEqual(self.roles, ["plan", "build", "review"])
+        self.action_state = "completed"
+        for _ in range(3):
+            self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.merge_operations, ["ready", "merge"])
+        self.assertEqual(self.ci_job()["state"], "merged")
+        self.assertEqual(self.ci_job()["merge_result"]["merged_sha"], self.worker.remote_base())
+        self.assertEqual(command(["git", "diff", self.old_head, "main"], cwd=self.source), "")
+        self.assertEqual(len(self.merge_inputs), 2)
+        request = self.merge_inputs[0]
+        self.assertEqual(set(request), {
+            "title", "body", "sha", "criteria", "policy", "base", "head", "diff", "paths", "checks", "ci",
+            "github_branch_checks",
+        })
+        self.assertEqual(request["criteria"], ["AC1 greet"])
+        self.assertEqual((request["base"], request["head"]), (self.base, self.old_head))
+        self.assertIn("diff --git a/greeting b/greeting", request["diff"])
+        self.assertEqual(request["body"], self.issue["body"])
+        self.assertEqual(request["checks"]["local:1"]["sha"], self.old_head)
+        self.assertEqual(request["ci"]["ci:1"]["name"], "unit tests")
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.merge_operations, ["ready", "merge"])
+
+    def test_github_head_precondition_escalates_and_records_operator(self):
+        from masf import cli
+        from masf.observation_api import Query, View
+
+        self.open_merge_review_pr()
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_tick(), 0)
+        job = self.ci_job()
+        self.assertEqual(job["state"], "needs_input")
+        self.assertTrue(self.prs[0]["draft"])
+        self.assertIn("garantía atómica", job["reason"])
+        self.assertEqual(job["merge_evaluation"]["decision"], "human_required")
+        self.assertEqual(job["merge_evaluation"]["result"]["decision"], "auto_merge")
+        view = View(self.worker.db, self.root / "state", CONFIG)
+        observed = view.dispatch(["jobs", "123", "1"], Query(""))["data"]
+        self.assertEqual(observed["merge_evaluation"]["reviewer"]["provider"], "codex")
+        self.assertEqual(observed["merge_intervention"]["binding"]["head"], self.old_head)
+        receipt = cli.resume(self.worker.db, self.cfg, self.target, evidence="Revisé el cambio",
+                             record_manual_merge=True)
+        self.assertEqual(receipt["status"], "applied")
+        approval = self.ci_job()["integration_approval"]
+        self.assertEqual(approval["binding"], job["merge_evaluation"]["binding"])
+        self.assertEqual(approval["operator"], cli.operator_name())
+        self.advance_open_pr(conflict=False)
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertIsNone(self.ci_job()["integration_approval"])
+        self.assertEqual(self.ci_job()["merge_intervention"]["binding"]["base"], self.base)
+
+    def test_merge_review_rejects_uncovered_risk_and_bad_result(self):
+        self.changed = "sensitive/data"
+        self.open_merge_review_pr(updater=self.conditional_fixture_merge)
+        self.verdict_overrides.update(risk="critical", blocking_findings=["Impacta la persistencia"],
+                                      missing_tests=["Falta recuperar una copia"])
+        self.assertEqual(self.ci_tick(), 0)
+        reasons = self.ci_job()["merge_intervention"]["reasons"]
+        for expected in ("sensitive/data", "critical", "Impacta la persistencia", "Falta recuperar una copia"):
+            self.assertTrue(any(expected in reason for reason in reasons), reasons)
+        self.assertEqual(self.merge_operations, [])
+
+    def test_merge_review_elevated_and_missing_proofs(self):
+        from masf import cli
+
+        self.open_merge_review_pr(updater=self.conditional_fixture_merge)
+        self.verdict_overrides.update(risk="elevated", proofs=["migration"])
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertIn("migration dry run", self.ci_job()["reason"])
+        self.assertEqual(self.merge_operations, [])
+        cli.resume(self.worker.db, self.cfg, self.target, retry_merge_review=True)
+        self.verdict_overrides.update(proofs=[], head="0" * 40)
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertIn("otro SHA", self.ci_job()["reason"])
+        cli.resume(self.worker.db, self.cfg, self.target, retry_merge_review=True)
+        del self.verdict_overrides["head"]
+        for _ in range(3):
+            self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["state"], "merged")
+
+    def test_post_draft_protection_and_ci_change(self):
+        self.open_merge_review_pr(updater=self.conditional_fixture_merge)
+        self.after_ready = lambda: self.prs[0].update(mergeable_state="blocked")
+        for _ in range(3):
+            self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.merge_operations, ["ready"])
+        job = self.ci_job()
+        self.assertEqual(job["state"], "merge_review")
+        self.assertIn("revisiones y protecciones", job["reason"])
+        queue.save(self.worker.db, job, job["state"], ci_retry_at=0)
+        self.action_state = "in_progress"
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["state"], "pr_open")
+        self.assertIsNone(self.ci_job()["merge_evaluation"])
+
+    def test_merge_base_race_is_rejected_by_conditional_backend(self):
+        def race(intent):
+            if intent["operation"] == "merge":
+                self.advance_open_pr(conflict=False)
+            self.conditional_fixture_merge(intent)
+
+        self.open_merge_review_pr(updater=race)
+        for _ in range(3):
+            self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.merge_operations, ["ready"])
+        self.assertEqual(self.ci_job()["state"], "needs_input")
+        self.assertIn("Base changed", self.ci_job()["reason"])
+
+    def test_merge_lost_response_is_reconciled_by_next_poll(self):
+        self.open_merge_review_pr(updater=self.conditional_fixture_merge)
+        self.merge_cut = "response"
+        for _ in range(3):
+            self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["merge_intent"]["operation"], "merge")
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["state"], "merged")
+        self.assertIsNone(self.ci_job()["merge_intent"])
+        self.assertEqual(self.merge_operations, ["ready", "merge"])
+
+    def test_merge_restart_after_controller_process_is_killed(self):
+        from masf import cli
+
+        def update(intent):
+            if intent["operation"] == "ready":
+                self.conditional_fixture_merge(intent)
+                return
+            if phase == "before":
+                os.kill(os.getpid(), signal.SIGKILL)
+            self.conditional_fixture_merge(intent)
+            remote.write_text(json.dumps(self.prs[0]))
+            if phase == "after":
+                os.kill(os.getpid(), signal.SIGKILL)
+
+        self.open_merge_review_pr(updater=update)
+        remote = self.root / "remote.json"
+        for _ in range(2):
+            self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.merge_operations, ["ready"])
+        for phase in ("before", "after"):
+            job = self.ci_job()
+            child = os.fork()
+            if child == 0:
+                cli.process_task(self.cfg, CONFIG, self.root / "state", job)
+                os._exit(1)
+            _, status = os.waitpid(child, 0)
+            self.assertEqual(os.WTERMSIG(status), signal.SIGKILL)
+            self.assertEqual(self.ci_job()["merge_intent"]["operation"], "merge")
+            self.assertEqual(remote.exists(), phase == "after")
+            # Simulate the passage of the lease interval before a new controller claims it.
+            with self.worker.db:
+                self.worker.db.execute("UPDATE leases SET expires=0")
+        self.prs[0].update(json.loads(remote.read_text()))
+        for _ in range(2):
+            self.assertEqual(self.ci_tick(), 0)
+            self.assertEqual(self.ci_job()["state"], "merged")
+        self.assertEqual(self.merge_operations, ["ready"])
+
+    def test_merge_concurrent_workers_keep_single_operation(self):
+        from masf import cli
+
+        started, resume_merge = Event(), Event()
+
+        def update(intent):
+            if intent["operation"] == "merge":
+                started.set()
+                self.assertTrue(resume_merge.wait(5))
+            self.conditional_fixture_merge(intent)
+
+        self.open_merge_review_pr(updater=update)
+        for _ in range(2):
+            self.assertEqual(self.ci_tick(), 0)
+        args = (self.cfg, CONFIG, self.root / "state", self.ci_job())
+        with ThreadPoolExecutor(2) as pool:
+            first = pool.submit(cli.process_task, *args)
+            try:
+                self.assertTrue(started.wait(5))
+                self.assertEqual(pool.submit(cli.process_task, *args).result(5), 0)
+            finally:
+                resume_merge.set()
+            self.assertEqual(first.result(5), 0)
+        self.assertEqual(self.merge_operations, ["ready", "merge"])
+
+    def test_merge_permission_denied_preserves_intent_and_evidence(self):
+        def update(intent):
+            raise ProcessError("Forbidden", stdout="HTTP/2 403")
+
+        self.open_merge_review_pr(updater=update)
+        for _ in range(2):
+            self.assertEqual(self.ci_tick(), 0)
+        job = self.ci_job()
+        self.assertEqual(job["state"], "needs_input")
+        self.assertEqual(job["merge_intent"]["operation"], "ready")
+        self.assertEqual(job["merge_evaluation"]["binding"]["head"], self.old_head)
+        self.assertIn("permisos", job["merge_intervention"]["reasons"][1])
+
+    def test_merge_policy_and_scope_changes_invalidate_evaluation(self):
+        self.open_merge_review_pr(updater=self.conditional_fixture_merge)
+        self.assertEqual(self.ci_tick(), 0)
+        old_policy = self.ci_job()["merge_evaluation"]["binding"]["policy"]
+        self.repo["merge_policy"]["automatic_deploy"] = True
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertNotEqual(self.ci_job()["merge_evaluation"]["binding"]["policy"], old_policy)
+        self.assertEqual(self.merge_operations, [])
+        self.issue["body"] += " New scope."
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertTrue(self.ci_job()["scope_conflict"])
+        self.assertEqual(self.merge_operations, [])
+
+    def test_repaired_head_gets_independent_review(self):
+        self.open_merge_review_pr()
+        self.action_result = "failure"
+        self.assertEqual(self.ci_tick(), 0)
+        repaired = self.ci_job()["published_head"]
+        self.assertNotEqual(repaired, self.old_head)
+        self.assertEqual(self.merge_inputs, [])
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.merge_inputs[0]["head"], repaired)
+
+    def test_merge_reviewer_command_has_fresh_home_and_read_only_checkout(self):
+        self.open_merge_review_pr()
+        self.assertEqual(self.ci_tick(), 0)
+        inputs = self.merge_inputs[0]
+        result = self.ci_job()["merge_evaluation"]["result"]
+        checkout = self.worker.checkout(self.old_head)
+        payload = "\n".join(json.dumps(event) for event in [
+            {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(result)}},
+            {"type": "turn.completed"},
+        ])
+        with patch.object(providers, "command", side_effect=["test-version", payload, ""]) as invoke:
+            returned = INVOKE_PROVIDER("merge_review", self.job, self.cfg, checkout, inputs, "fixture")
+        args = invoke.call_args_list[1].args[0]
+        prompt = invoke.call_args_list[1].kwargs["stdin"]
+        self.assertEqual(returned["result"], result)
+        self.assertIn("--ephemeral", args)
+        self.assertIn(f"{checkout}:/workspace:ro", args)
+        self.assertEqual(args[args.index("-w") + 1], "/tmp")
+        self.assertTrue(any(arg.startswith("/home/agent:uid=") for arg in args))
+        self.assertNotIn("resume", args)
+        self.assertNotIn('"verdict"', prompt)
+        self.assertNotIn('"operator_feedback"', prompt)
+        self.assertIn(inputs["diff"], prompt)
+
+    def test_merge_review_observation_errors_and_third_party_head(self):
+        self.open_merge_review_pr(updater=self.conditional_fixture_merge)
+        self.assertEqual(self.ci_tick(), 0)
+        self.check_error = ProcessError("GitHub unavailable", stdout="HTTP/2 503")
+        self.assertEqual(self.ci_tick(), 0)
+        job = self.ci_job()
+        self.assertIn("GitHub unavailable", job["reason"])
+        self.assertEqual(job["merge_evaluation"]["binding"]["head"], self.old_head)
+        self.assertEqual(self.merge_operations, [])
+        self.check_error = None
+        self.prs[0]["head"]["sha"] = self.base
+        self.assertEqual(self.ci_tick(), 0)
+        self.assertEqual(self.ci_job()["head_conflict"]["observed"], self.base)
+        self.assertEqual(self.merge_operations, [])
+
+    def test_absent_ci_requests_intervention_without_invoking_reviewer(self):
+        self.open_merge_review_pr(updater=self.conditional_fixture_merge)
+        self.action_state = "absent"
+        for state in ("pr_open", "pr_open", "needs_input"):
+            self.assertEqual(self.ci_tick(), 0)
+            self.assertEqual(self.ci_job()["state"], state)
+        self.assertIn("Ejecuta los checks de CI", self.ci_job()["reason"])
+        self.assertEqual(self.merge_inputs, [])
+        self.assertEqual(self.merge_operations, [])
 
     def test_published_summary_filters_role_results_and_commands(self):
         original = self.agent

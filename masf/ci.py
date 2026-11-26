@@ -80,7 +80,8 @@ def observe_merge(db, job, pr, lookup):
                      pr_conflict=observation | {"status": "queued", "decision": reason},
                      reason=reason, ci_repair=None, ci_retry_at=0, ci_poll_error=None,
                      ci_intervention=False, repair_intent=None, build_workspace=None,
-                     build_recovery=None, integration_approval=None)
+                     build_recovery=None, integration_approval=None,
+                     merge_intervention=None, merge_evaluation=None)
                 return True
     if observation != job.get("merge_observation"):
         previous = job.get("merge_observation") or {}
@@ -111,7 +112,7 @@ def validate(db, job, pr, heads):
             raise ValueError("Estado de PR desconocido")
         state = "merged" if pr.get("merged_at") or pr.get("merged") else "closed"
         conflict = job.get("pr_conflict")
-        save(db, job, state, reason="", integration_approval=None,
+        save(db, job, state, reason="", integration_approval=None, merge_intervention=None,
              **({"pr_conflict": None, "conflict_result": conflict | {"status": state}}
                 if conflict else {}))
     elif not provenance(job, pr):
@@ -146,7 +147,7 @@ def head_conflict(db, job, observed, remote=None):
         db, job, "needs_input",
         reason=f"{reason}. {action}",
         retry="pr_open", head_conflict={"expected": expected, "observed": observed, "remote": remote},
-        integration_approval=None,
+        integration_approval=None, merge_intervention=None, merge_evaluation=None,
     )
 
 
@@ -174,7 +175,8 @@ def scope(db, job, lookup=api):
     issue = lookup(f"repos/{job['slug']}/issues/{job['number']}")
     if not eligible(issue, job["repo"]):
         conflict = job.get("pr_conflict")
-        save(db, job, "cancelled", reason="Issue cerrada o etiqueta retirada", integration_approval=None,
+        save(db, job, "cancelled", reason="Issue cerrada o etiqueta retirada",
+             integration_approval=None, merge_intervention=None,
              **({"pr_conflict": None, "conflict_result": conflict | {"status": "cancelled"}}
                 if conflict else {}))
         return False
@@ -186,7 +188,7 @@ def scope(db, job, lookup=api):
             db, job, "needs_input", retry="planning", scope_conflict=observed,
             reason="El contenido de la issue ha cambiado. Confirma el alcance actualizado con resume",
             scope_review=scope_review(job, issue),
-            integration_approval=None,
+            integration_approval=None, merge_intervention=None, merge_evaluation=None,
         )
     return False
 

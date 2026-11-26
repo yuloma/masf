@@ -37,6 +37,8 @@ En Docker, prepara las variables y el array Bash `control` de la guía, incluida
 "${control[@]}" logs --tail 40 controller
 ```
 
+Una vez preparada la instalación Compose, también puedes usar `make start`, `make status` y `make logs` desde el checkout. Para las actualizaciones posteriores desde la rama principal, usa `make update` con la cola en reposo. Las recetas reutilizan el wrapper `control` existente o las variables de despliegue. [Operación con Make](docs/operacion.md).
+
 ## 4. Acredita la instalación con una issue real
 
 - Elige o crea en el piloto una issue pequeña con un comportamiento comprobable. Puedes usar el [ejercicio de saludo](docs/piloto.md#3-ejecutar-una-tarea-observable) en un repo desechable preparado para él. Aplica la etiqueta configurada y deja que **el servicio** descubra la issue, ejecute los agentes y publique. En una reanudación, busca primero la issue, su trabajo y su PR para continuar desde el último paso confirmado.

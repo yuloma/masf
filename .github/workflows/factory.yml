@@ -6,6 +6,8 @@ on:
       - "tests/**"
       - "pyproject.toml"
       - "Dockerfile"
+      - "Makefile"
+      - "scripts/**"
       - ".github/workflows/factory.yml"
   workflow_dispatch: {}
 permissions:
@@ -19,7 +21,8 @@ jobs:
           persist-credentials: false
       - run: python3 -m venv /tmp/masf-venv
       - run: /tmp/masf-venv/bin/pip install .
-      - run: /tmp/masf-venv/bin/python -m unittest discover -v
+      - run: make check
+      - run: make test PYTHON=/tmp/masf-venv/bin/python
       - run: /tmp/masf-venv/bin/masf --config examples/factory.toml doctor --offline
       - run: docker build --target controller -t masf-controller:pilot .
       - run: docker build --target runtime -t masf-runner:pilot .

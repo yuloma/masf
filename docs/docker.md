@@ -137,7 +137,7 @@ Cada etapa conserva un archivo `<rol>-<id>.activity.jsonl` en su directorio de e
 
 Cursor se ejecuta con salida `stream-json`. El adaptador exige un resultado terminal completo y valida su contrato. Los fallos conservan la referencia a la actividad y la versión conocida, de forma que un timeout permita contrastar la última señal recibida. El contenido de argumentos, salidas de herramientas y deltas internos queda limitado al transporte temporal del proceso; la actividad persistida contiene metadatos operativos.
 
-Al actualizar una CLI en el host, reconstruye el runner con `bash examples/docker/build-runner.sh codex cursor` para que el servicio utilice esa distribución.
+Al actualizar una CLI en el host, reconstruye el runner con `bash examples/docker/build-runner.sh codex cursor` para que el servicio utilice esa distribución. El constructor selecciona el Engine local de `MASF_DOCKER_SOCKET` (por defecto `/var/run/docker.sock`). También puedes usar `make build-runner MASF_PROVIDERS='codex cursor'` y las demás [recetas de operación](operacion.md).
 
 El modo no interactivo de Cursor permite ejecutar las herramientas necesarias durante la revisión; Docker monta el código para lectura en los roles plan y review. El encargo se presenta con metadatos legibles y el diff en líneas independientes para que las herramientas de lectura puedan inspeccionarlo sin truncar una única línea JSON extensa.
 

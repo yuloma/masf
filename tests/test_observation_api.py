@@ -86,32 +86,38 @@ class ObservationAPI(unittest.TestCase):
         self.assertEqual(result["version"], 1)
         return result
 
-    def test_cli_loopback_default_and_custom_port_with_readonly_files(self):
+    def test_cli_uses_default_port_without_binding_the_operational_port(self):
+        with patch.object(sys, "argv", ["masf", "--config", str(self.config), "observe-api"]), \
+                patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root.parent)}), \
+                patch.object(cli, "serve_observation") as serve:
+            self.assertEqual(cli.main(), 0)
+        serve.assert_called_once_with(self.root, self.config, DEFAULT_PORT, None)
+
+    def test_cli_loopback_custom_port_with_readonly_files(self):
         with closing(socket.socket()) as probe:
             probe.bind(("127.0.0.1", 0))
-            custom_port = probe.getsockname()[1]
+            port = probe.getsockname()[1]
         self.config.chmod(0o400)
         self.root.chmod(0o500)
         self.addCleanup(self.root.chmod, 0o700)
         (self.root / "queue.sqlite3").chmod(0o400)
         env = {"PATH": os.environ["PATH"], "XDG_STATE_HOME": str(self.root.parent)}
-        for port, options in [(DEFAULT_PORT, []), (custom_port, ["--port", str(custom_port)])]:
-            process = subprocess.Popen(
-                [sys.executable, "-m", "masf.cli", "--config", str(self.config), "observe-api", *options],
-                cwd=PROJECT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            )
-            try:
-                self.assertIn(f"http://127.0.0.1:{port}/v1", process.stdout.readline(),
-                              process.stderr.read() if process.poll() is not None else "")
-                status, _, body = request(port, "/v1/repositories")
-                self.assertEqual(status, 200, body)
-                self.assertEqual(json.loads(body)["data"][0]["slug"], "unused/project")
-                with closing(socket.create_connection(("127.0.0.1", port), timeout=1)):
-                    with self.assertRaises(OSError):
-                        socket.create_connection(("127.0.0.2", port), timeout=1)
-            finally:
-                process.terminate()
-                process.communicate(timeout=5)
+        process = subprocess.Popen(
+            [sys.executable, "-m", "masf.cli", "--config", str(self.config), "observe-api", "--port", str(port)],
+            cwd=PROJECT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            self.assertIn(f"http://127.0.0.1:{port}/v1", process.stdout.readline(),
+                          process.stderr.read() if process.poll() is not None else "")
+            status, _, body = request(port, "/v1/repositories")
+            self.assertEqual(status, 200, body)
+            self.assertEqual(json.loads(body)["data"][0]["slug"], "unused/project")
+            with closing(socket.create_connection(("127.0.0.1", port), timeout=1)):
+                with self.assertRaises(OSError):
+                    socket.create_connection(("127.0.0.2", port), timeout=1)
+        finally:
+            process.terminate()
+            process.communicate(timeout=5)
         self.assertFalse((self.root / "worker.lock").exists())
         absent = self.directory / "missing-state"
         result = subprocess.run(

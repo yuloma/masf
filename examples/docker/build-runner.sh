@@ -26,5 +26,6 @@ for provider in "$@"; do
     *) echo "Proveedor desconocido: $provider" >&2; exit 2 ;;
   esac
 done
-docker build --target runtime -t masf-runtime:pilot "$root"
-docker build -f "$root/examples/docker/Runner.Dockerfile" -t masf-runner:pilot "$context"
+engine=(docker --host "unix://${MASF_DOCKER_SOCKET:-/var/run/docker.sock}")
+"${engine[@]}" build --target runtime -t masf-runtime:pilot "$root"
+"${engine[@]}" build -f "$root/examples/docker/Runner.Dockerfile" -t masf-runner:pilot "$context"

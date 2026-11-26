@@ -21,14 +21,20 @@ import sys
 
 token = secrets.token_hex(32)
 with open(sys.argv[1], "x", encoding="utf-8") as auth:
-    json.dump({"operator": "Operadora local", "token": token}, auth)
+    json.dump({"operator": "Operadora local", "token": token, "permissions": ["intervene"]}, auth)
 print(token)
 PY
 masf --config /ruta/privada/config.toml observe-api --port 8765 \
   --actions-token-file /ruta/privada/dashboard-operator.json
 ```
 
-Ejecuta este modo con acceso de escritura al estado, lectura de las copias conservadas y las credenciales de GitHub de la instalación para revalidar la issue y el PR. Conserva los mismos valores de `XDG_STATE_HOME`, `XDG_DATA_HOME` y `MASF_JOBS_DIR` que el controlador. El puerto sirve únicamente en loopback. Reinicia el servicio HTTP después de cambiar el archivo de autenticación. El Compose del observador monta el estado en solo lectura.
+Ejecuta este modo con acceso de escritura al estado, lectura de las copias conservadas y las credenciales de GitHub de la instalación para revalidar la issue y el PR. Conserva los mismos valores de `XDG_STATE_HOME`, `XDG_DATA_HOME` y `MASF_JOBS_DIR` que el controlador. El puerto sirve únicamente en loopback. Conserva el archivo de credenciales y el directorio de estado fuera de los montajes de agentes y checks. Una lista `permissions` vacía concede solo el acceso de observación disponible en loopback. Reinicia el servicio HTTP después de cambiar el archivo de autenticación. El Compose del observador monta el estado en solo lectura.
+
+Para operar desde otro equipo, abre un túnel SSH autenticado y visita `http://127.0.0.1:8765/dashboard/` en tu navegador local.
+
+```bash
+ssh -N -L 127.0.0.1:8765:127.0.0.1:8765 operador@host-central
+```
 
 En **Intervenciones**, abre el trabajo y escribe el token en **Consultar acciones**. La pestaña lo conserva en memoria mientras mantienes abierto el detalle. La bandeja distingue preguntas, cambios de alcance y bloqueos. El detalle muestra los SHAs y evidencia, el efecto previsto de cada acción y el recibo. El token identifica al operador indicado en el archivo.
 
@@ -46,7 +52,7 @@ En **Intervenciones**, abre el trabajo y escribe el token en **Consultar accione
 
 El panel de recuperaciones muestra la etapa y la fecha de reintento cuando el estado es `retry_wait`. Los bloqueos que requieren una decisión aparecen en **Intervenciones**. [Registrar un commit en el almacén del trabajo](especificacion.md#operaciones-del-controlador).
 
-El controlador recoge el trabajo en su siguiente despacho normal. El dashboard sondea cada 10 segundos mientras la pestaña está visible. **Actualizar** solicita una lectura inmediata. La cronología conserva las operaciones, la evidencia, los intentos y los resultados de CI para los SHAs anteriores. Tras un conflicto, revisa el nuevo contexto y vuelve a marcar la confirmación. Si el transporte falla, **Reintentar el mismo envío** recupera el recibo con la misma clave.
+El servidor devuelve el recibo en estado **Aceptada** cuando registra el envío. El controlador lo procesa en su siguiente sondeo, incluso si se reinició entre ambos pasos. El recibo cambia a **Aplicada** cuando el trabajo puede continuar o a **Rechazada** cuando la revalidación detecta cambios. El dashboard sondea cada 10 segundos mientras la pestaña está visible. **Actualizar** solicita una lectura inmediata. La cronología conserva las operaciones, la evidencia, los intentos y los resultados de CI para los SHAs anteriores. Tras un conflicto, revisa el nuevo contexto y vuelve a marcar la confirmación. Si el transporte falla, **Reintentar el mismo envío** recupera el recibo con la misma clave.
 
 ## Comprobar la instalación
 
@@ -58,4 +64,4 @@ MASF_DASHBOARD_BROWSER=1 MASF_DASHBOARD_EVIDENCE=/tmp/masf-dashboard-evidence \
   python3 -m unittest tests.test_dashboard_browser -v
 ```
 
-Las capturas numeradas cubren cola, etapa activa en móvil, trabajo terminado, error de autenticación, conflicto, respuesta, ruta protegida, checks, reanudación completa, timeout y reparación de CI. La prueba comprueba que las decisiones persisten antes de que el controlador despache el trabajo. [Aceptación de I5](implementacion.md#i5--dashboard-e-intervención).
+Las capturas numeradas cubren cola, etapa activa en móvil, trabajo terminado, error de autenticación, conflicto, respuesta, ruta protegida, checks, reanudación completa, timeout y reparación de CI. La prueba sigue la aceptación y la aplicación mediante el recibo y comprueba que la cronología muestra el avance del mismo trabajo. [Aceptación de I5](implementacion.md#i5--dashboard-e-intervención).

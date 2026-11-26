@@ -101,9 +101,9 @@ Consulta los [contratos de evidencia de etapa y CI](especificacion.md) y la [ace
 
 ## API autenticada de acciones v1
 
-El modo nativo con `--actions-token-file` añade `GET`, `HEAD` y `POST` en `/v1/jobs/{repo_id}/{issue}/actions`. El detalle del trabajo indica su disponibilidad en `actions_enabled`. Las credenciales, el arranque y la aceptación están en la [guía del dashboard](dashboard.md).
+El modo nativo con `--actions-token-file` añade `GET`, `HEAD` y `POST` en `/v1/jobs/{repo_id}/{issue}/actions` y `GET` y `HEAD` en `/v1/jobs/{repo_id}/{issue}/actions/{id}`. El detalle del trabajo indica su disponibilidad en `actions_enabled`. Las credenciales, el arranque y la aceptación están en la [guía del dashboard](dashboard.md).
 
-Las acciones exigen `Authorization: Bearer TOKEN`. El servidor valida el host local y, si el cliente envía `Origin`, exige el mismo origen. El `GET` devuelve la revisión opaca, el operador, el número de copias compatibles y las acciones permitidas. Cada acción incluye `kind` y `resume_state`, con parámetros y contexto según corresponda. El contexto protegido contiene los archivos exactos y un resumen de cambios. El contexto de recuperación contiene referencias opacas a las copias compatibles del propio trabajo. Para un conflicto de base devuelve el candidato, la base registrada, las rutas, el prefijo de referencia local y los commits válidos si existen. El detalle del trabajo expone el estado y el historial de recuperación en `recovery`, con consumo, límite, construcciones, etapa y próximo intento.
+Las acciones exigen `Authorization: Bearer TOKEN` y el permiso `intervene`. El servidor valida el host local, el origen cuando está presente y los metadatos de navegación. El `GET` de acciones devuelve la revisión opaca, el operador, el estado, la causa, el SHA candidato, la etapa de reanudación, el número de copias compatibles y las acciones permitidas. Si existe una decisión en espera, `pending` indica que el trabajo tiene un envío pendiente y `pending_receipt` muestra su recibo al operador que lo envió. Cada acción incluye `kind` y `resume_state`, con parámetros y contexto según corresponda. El contexto protegido contiene los archivos exactos y un resumen de cambios. El campo `build_timeout` informa de la etapa, el plazo agotado y las rondas consumidas y autorizadas. Las opciones de recuperación incluyen referencias opacas a las copias compatibles del propio trabajo. Para un conflicto de base devuelve el candidato, la base registrada, las rutas, el prefijo de referencia local y los commits válidos si existen. El detalle del trabajo expone el estado y el historial de recuperación en `recovery`, con consumo, límite, construcciones, etapa y próximo intento.
 
 El `POST` exige `Content-Type: application/json` y una cabecera `Idempotency-Key` de 16 a 128 caracteres alfanuméricos, guiones o guiones bajos. Este ejemplo usa la revisión devuelta por el servicio.
 
@@ -123,14 +123,47 @@ El `POST` exige `Content-Type: application/json` y una cabecera `Idempotency-Key
 | `reuse_workspace` | `{"reference":"REFERENCIA"}`, con una referencia ofrecida |
 | `extend_timeout` | `{"seconds":1200,"reference":"REFERENCIA"}`, con una referencia ofrecida |
 
-La respuesta 200 contiene un recibo `data` con `id`, `operator`, `kind`, `status: "applied"`, `accepted_at`, `applied_at`, `revision`, `origin` y `state`. La escritura del recibo, la operación en la cronología y la transición son atómicas. Un reenvío de la misma decisión con la misma clave devuelve el mismo recibo. La revisión se compara en la escritura, después de adquirir la reserva compartida del trabajo. El servidor verifica además el alcance, la pertenencia de la copia, el SHA y los límites aplicables.
+El POST devuelve HTTP 202 al persistir la aceptación. El recibo en `data` incluye `id`, `operator`, `kind`, `status`, `accepted_at`, `revision`, `origin`, `repo_id`, `number` y `resume_state`. El GET del recibo devuelve HTTP 200 y exige la credencial del operador que lo envió.
+
+| `status` | Significado |
+| --- | --- |
+| `accepted` | La decisión está persistida y espera al controlador. El trabajo conserva el estado y la revisión de la intervención. |
+| `applied` | El controlador persistió el recibo, el evento y la transición en una transacción. El recibo incluye `applied_at` y el `state` al que se reanudó el trabajo. |
+| `rejected` | La revalidación impidió la aplicación. El recibo incluye `rejected_at` y `error` con el código y un mensaje. |
+
+Un reenvío con la misma clave y contenido devuelve el mismo ID. El estado del recibo determina si el POST repetido responde 202 o 200. Si el transporte falla, reenvía el mismo contenido con la misma clave. Tras un conflicto de revisión, vuelve a leer el trabajo y confirma el contexto con una nueva clave. El controlador revalida el contexto antes de aplicar y continúa mediante su despacho habitual. Los eventos de aceptación y resultado comparten el ID del recibo. Sigue el trabajo en `/v1/jobs/{repo_id}/{issue}`, `/events` y `/attempts`.
 
 | HTTP | Código |
 | --- | --- |
+| 400 | `invalid_request` para solicitudes mal formadas o `invalid_host` para un host ajeno |
 | 401 | `authentication_required` |
-| 403 | `invalid_origin` |
-| 409 | `revision_conflict` para contexto obsoleto, `decision_in_progress` para una reserva activa, `idempotency_conflict` para una clave ligada a otro envío |
+| 403 | `invalid_origin` o `insufficient_permissions` |
+| 404 | `not_found` para un trabajo o recibo inaccesible |
+| 409 | `revision_conflict` para contexto obsoleto, `decision_in_progress` para una reserva activa o una decisión pendiente, `idempotency_conflict` para una clave ligada a otro envío, `incompatible_state` para un estado que no admite intervención |
 | 422 | `invalid_decision` para acciones o valores fuera de las opciones vigentes |
 | 503 | `unavailable` para una validación o escritura temporalmente inaccesible |
 
-Reutiliza la misma clave si falta el recibo por un error de transporte o una reserva activa. Después de un conflicto de revisión, vuelve a leer el trabajo y las acciones y utiliza una nueva clave tras revisar la decisión. Las aplicaciones se reflejan en `/events` y el controlador continúa mediante su despacho habitual.
+Con el dashboard abierto en loopback, este ejemplo se puede ejecutar en la consola del navegador. Cambia los IDs y usa una acción ofrecida por el servicio. Ante un error de transporte, vuelve a llamar a `sendDecision()` en la misma pestaña. Conserva la credencial en memoria durante la consulta y recarga la pestaña al terminar.
+
+```javascript
+const endpoint = "/v1/jobs/123/1/actions";
+const headers = { Authorization: "Bearer " + prompt("Token del operador") };
+const context = await fetch(endpoint, { headers }).then(response => response.json());
+const body = JSON.stringify({
+  kind: "answer", revision: context.data.revision,
+  evidence: "Para Ana", confirm: true, options: {},
+});
+const idempotencyKey = crypto.randomUUID();
+let receipt;
+const sendDecision = async () => {
+  const response = await fetch(endpoint, {
+    method: "POST", body,
+    headers: { ...headers, "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
+  });
+  receipt = await response.json();
+  return receipt;
+};
+const readReceipt = () => fetch(endpoint + "/" + receipt.data.id, { headers })
+  .then(response => response.json());
+await sendDecision();
+```

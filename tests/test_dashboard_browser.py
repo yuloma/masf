@@ -54,8 +54,12 @@ class DashboardBrowser(unittest.TestCase):
 
     def applied(self, state):
         receipt = self.page.get_by_role("heading", name="Recibo de la decisión").locator("..")
+        self.refresh()
         self.expect(receipt.get_by_text("Aplicada", exact=True)).to_be_visible()
         self.expect(receipt.get_by_text(state, exact=True).first).to_be_visible()
+
+    def accepted(self):
+        self.expect(self.page.get_by_text("Aceptada · pendiente de aplicación", exact=True)).to_be_visible()
 
     def test_overview_active_and_terminal_keyboard_mobile(self):
         app = self.app
@@ -144,9 +148,11 @@ class DashboardBrowser(unittest.TestCase):
         self.page.route("**/actions", lose_first_response)
         self.decision("Para Ana")
         self.page.get_by_role("button", name="Reintentar el mismo envío").click()
-        self.applied("Planificación")
+        self.accepted()
         self.assertEqual(idempotency_keys[0], idempotency_keys[1])
         self.page.unroute("**/actions", lose_first_response)
+        self.assertEqual(app.apply_pending(), 0)
+        self.applied("Planificación")
         self.capture("06-respuesta-aplicada")
 
         self.assertEqual(app.run_ready(), 1)
@@ -155,6 +161,8 @@ class DashboardBrowser(unittest.TestCase):
         self.expect(self.page.get_by_text("Confirmo la autorización de todos los archivos enumerados")).to_be_visible()
         self.capture("07-ruta-protegida")
         self.decision("Archivos revisados")
+        self.accepted()
+        self.assertEqual(app.apply_pending(), 0)
         self.applied("Comprobaciones")
         self.assertEqual(app.run_ready(), 1)
         self.refresh()
@@ -162,6 +170,8 @@ class DashboardBrowser(unittest.TestCase):
         self.capture("08-checks-y-bloqueo")
         app.deny = False
         self.decision("Permiso reparado")
+        self.accepted()
+        self.assertEqual(app.apply_pending(), 0)
         self.applied("Publicación")
         self.assertEqual(app.run_ready(), 0)
         self.expect(self.page.get_by_text("PR abierto", exact=True).first).to_be_visible(timeout=15000)
@@ -192,6 +202,8 @@ class DashboardBrowser(unittest.TestCase):
             self.page.get_by_label("Nuevo plazo de construcción (segundos)").fill("1200")
             self.capture("10-timeout")
             self.decision("Continuar con la copia compatible")
+            self.accepted()
+            self.assertEqual(app.apply_pending(), 0)
             self.applied("Construcción")
             self.assertEqual(app.run_ready(), 0)
             self.refresh()
@@ -220,6 +232,8 @@ class DashboardBrowser(unittest.TestCase):
         self.capture("14-ci-intervencion")
         self.authenticate()
         self.decision("Infraestructura restaurada y CI relanzado")
+        self.accepted()
+        self.assertEqual(app.apply_pending(), 0)
         self.applied("PR abierto")
 
         app.action_attempt = 2

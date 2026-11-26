@@ -6,7 +6,6 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .evidence import historical_role
 from .github_ci import filter_log
-from .queue import revision
 from .system import clean
 
 
@@ -185,7 +184,7 @@ def operation(value):
                            "result outcome status reason resume_state role provider previous_provider round_limit "
                            "timeout_seconds previous_timeout_seconds workspace origin expected_revision question "
                            "question_attempt answer previous_base previous_candidate previous_fingerprint "
-                           "recoveries recovery_limit") | {"paths": strings(entry.get("paths"))},
+                           "recoveries recovery_limit error_code") | {"paths": strings(entry.get("paths"))},
         "explanation": explanation(value.get("explanation")),
     }
 

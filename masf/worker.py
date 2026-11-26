@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from . import checks, ci, providers
-from .evidence import agent_explanation, explanation, model, provenance, timestamp, usage, write_artifact
+from .evidence import agent_explanation, digest, explanation, model, provenance, timestamp, usage, write_artifact
 from .queue import api, interrupt_stages, latest, record_stage, require_lease, retry_delay, save, stage_attempts
 from .recovery import BudgetExhausted, RecoverableFailure, limit, reserve, wait
 from .system import ProcessError, TaskStopped, clean, command, docker_env, filtered
@@ -20,7 +20,8 @@ def saved_workspace(root, path):
     folder = Path(path).absolute()
     expected = root.resolve()
     if (
-        folder.resolve() != folder
+        root.is_symlink()
+        or folder.resolve() != folder
         or folder.parent != expected
         or folder.name == "git"
         or not folder.is_dir()
@@ -523,10 +524,14 @@ class Worker:
                 ):
                     raise RuntimeError("Rondas de construcción agotadas")
                 start = candidate or j["base"]
+                plan_digest = digest(j.get("plan"))
                 reused = (
                     checkpoint.get("input_sha") == start
                     and checkpoint.get("fingerprint") == j["fingerprint"]
+                    and checkpoint.get("plan_digest", plan_digest) == plan_digest
                 )
+                if operator_resume and not reused:
+                    raise RuntimeError("La copia autorizada ya no coincide con el plan o el SHA de entrada")
                 same_round = bool(
                     (j.get("pr_number") or operator_resume) and reused and checkpoint.get("round")
                 )
@@ -545,6 +550,7 @@ class Worker:
                     "path": str(workspace),
                     "input_sha": start,
                     "fingerprint": j["fingerprint"],
+                    "plan_digest": plan_digest,
                     "error": checkpoint.get("error") if reused else None,
                     "round": checkpoint["round"] if operator_resume and same_round
                              else j["rounds"] if same_round else j["rounds"] + 1,

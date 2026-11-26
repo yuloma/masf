@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 from . import ci, recovery
-from .actions import ActionError, Decisions, recorded_question
+from .actions import ActionError, Decisions, process_pending, recorded_question
 from .config import ConfigError, load, xdg
 from .evidence import UNKNOWN_PROVENANCE, historical_role, provenance
 from .observation_api import DEFAULT_PORT, port, serve as serve_observation
@@ -294,8 +294,9 @@ class Workers:
 
 
 def tick(db, cfg, config, root, once, workers=None):
+    errors = process_pending(db, cfg, root, lookup=api, latest=latest)
     repository_ids = {}
-    errors = scan(cfg, db, repository_ids=repository_ids) + observe(db, api, cfg, repository_ids)
+    errors += scan(cfg, db, repository_ids=repository_ids) + observe(db, api, cfg, repository_ids)
     errors += poll_ci_jobs(db, cfg)
     if workers is not None:
         return errors + workers.dispatch(db, cfg, config, root, once=once)

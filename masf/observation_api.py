@@ -18,7 +18,7 @@ from . import observation_data as public
 from .actions import ActionError, Actions
 from .config import ConfigError
 from .evidence import digest
-from .queue import connect, decision_details
+from .queue import connect, decision_details, revision, revision_event
 
 DEFAULT_PORT = 8765
 PAGE_SIZE = 50
@@ -413,10 +413,12 @@ class View:
         job = decode(row)
         identity = row["repo_id"], row["number"]
         event_id = None
+        revision_id = None
         if "events" in self.tables:
             event_id = self.db.execute(
                 "SELECT max(id) FROM events WHERE repo_id=? AND number=?", identity,
             ).fetchone()[0]
+            revision_id = revision_event(self.db, identity)
         active = None
         latest = None
         question_attempt = None
@@ -489,7 +491,7 @@ class View:
             ),
             "active_attempt": attempt, "last_attempt_id": public.scalar(latest["id"]) if latest else None,
             "last_event_id": event_id,
-            "revision": public.revision(job, event_id),
+            "revision": revision(job, revision_id),
             "base_sha": public.scalar(job.get("base")), "candidate_sha": public.scalar(job.get("candidate")),
             "published_sha": public.scalar(job.get("published_head")),
             "reason": reason, "checks": public.check_report(job.get("checks")),
@@ -683,13 +685,16 @@ class ObservationHandler(BaseHTTPRequestHandler):
                 IDENT.fullmatch(segment) for segment in segments[2:]
             ):
                 raise invalid()
-            identity = self.action_route(path)
-            if identity and self.server.actions:
+            route = self.action_route(path)
+            if route and self.server.actions:
                 if query:
                     raise invalid()
+                identity, identifier = route
                 self.server.actions.authorize(self.headers, host)
                 with closing(connect_readonly(self.server.root)) as db:
-                    payload = {"data": self.server.actions.context(db, identity)}
+                    data = (self.server.actions.receipt(db, identity, identifier) if identifier
+                            else self.server.actions.context(db, identity))
+                payload = {"data": data}
                 self.respond(200, payload, head=head)
                 return
             with closing(connect_readonly(self.server.root)) as db:
@@ -716,9 +721,10 @@ class ObservationHandler(BaseHTTPRequestHandler):
         return hosts[0]
 
     def action_route(self, path):
-        match = re.fullmatch(r"/v1/jobs/([0-9]{1,18})/([0-9]{1,18})/actions", path)
+        match = re.fullmatch(r"/v1/jobs/([0-9]{1,18})/([0-9]{1,18})/actions(?:/([0-9a-f]{32}))?", path)
         if match:
-            return tuple(positive(value) for value in match.groups())
+            repo, number, identifier = match.groups()
+            return (positive(repo), positive(number)), identifier
         return None
 
     def do_POST(self):
@@ -726,14 +732,16 @@ class ObservationHandler(BaseHTTPRequestHandler):
             return self.reject_method()
         try:
             host = self.local_host()
-            identity = self.action_route(self.path)
-            if not identity:
+            route = self.action_route(self.path)
+            if not route or route[1]:
                 raise missing()
+            identity, _ = route
             self.server.actions.authorize(self.headers, host)
             lengths = self.headers.get_all("Content-Length") or []
             if (self.headers.get("Transfer-Encoding") or len(lengths) != 1
                     or not re.fullmatch(r"[0-9]{1,5}", lengths[0])
                     or not 0 < int(lengths[0]) <= 16384
+                    or len(self.headers.get_all("Content-Type") or []) != 1
                     or self.headers.get_content_type() != "application/json"):
                 raise invalid()
             keys = self.headers.get_all("Idempotency-Key") or []
@@ -744,7 +752,7 @@ class ObservationHandler(BaseHTTPRequestHandler):
             except (ValueError, RecursionError):
                 raise invalid() from None
             receipt = self.server.actions.submit(identity, keys[0], payload)
-            self.respond(200, {"data": receipt})
+            self.respond(202 if receipt["status"] == "accepted" else 200, {"data": receipt})
         except (RequestError, ActionError) as exc:
             self.respond(exc.status, {"error": {"code": exc.code, "message": exc.message}})
         except (sqlite3.Error, ConfigError, OSError, RuntimeError, ValueError, KeyError, TypeError):

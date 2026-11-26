@@ -50,6 +50,7 @@ const decisionNames = {
   assign_provider: "Reasignar proveedor", add_rounds: "Ampliar rondas", extend_timeout: "Ampliar plazo y recuperar copia",
   add_recoveries: "Ampliar presupuesto de recuperación", accept_head: "Aceptar head",
 };
+const decisionResults = { accepted: "Aceptada", applied: "Aplicada", rejected: "Rechazada" };
 const recoveryNames = {
   retry: "Reintentar etapa", resume_build: "Retomar construcción", resolve_base: "Resolver conflicto de base",
   refresh_base: "Integrar el avance de la base",
@@ -170,7 +171,7 @@ let receipt = null;
 let draft = { kind: "", evidence: "", confirmed: false, options: {} };
 const actionURL = "/v1/jobs/" + jobID + "/actions";
 
-async function actionRequest(signal, attempt) {
+async function actionRequest(signal, attempt, receiptID) {
   const headers = { Authorization: "Bearer " + credential };
   const options = { signal, headers, cache: "no-store" };
   if (attempt) {
@@ -179,7 +180,7 @@ async function actionRequest(signal, attempt) {
     options.method = "POST";
     options.body = JSON.stringify(attempt.payload);
   }
-  const response = await fetch(actionURL, options);
+  const response = await fetch(receiptID ? actionURL + "/" + receiptID : actionURL, options);
   const payload = await response.json();
   if (!response.ok) {
     const error = new Error(payload.error?.message || "Error HTTP " + response.status);
@@ -200,6 +201,17 @@ async function readActions(signal, job) {
     actionNotice = error.status ? error.message : "No se pudieron leer las acciones.";
     actionError = true;
     return null;
+  }
+}
+
+async function readReceipt(signal, job) {
+  if (!credential || !job.actions_enabled || receipt?.status !== "accepted") return;
+  const id = receipt.id;
+  try {
+    const current = await actionRequest(signal, null, id);
+    if (receipt?.id === id) receipt = current;
+  } catch {
+    // Keep displaying the confirmed receipt while the service is temporarily unavailable.
   }
 }
 
@@ -245,6 +257,7 @@ async function read(signal) {
       collection(path + "/attempts", signal), collection(path + "/events", signal),
       job.pr ? readPull(job.repo_id + "/" + job.pr.number, signal, false) : null,
       readActions(signal, job),
+      readReceipt(signal, job),
     ]);
     return { job, attempts, events, ci, actions };
   }
@@ -584,7 +597,10 @@ function interventionPanel(job, failed) {
   if (!entry.pending) return null;
   const checkpoint = entry.build_checkpoint;
   const conflict = job.base_conflict;
-  const compatible = actionContext?.revision === job.revision ? actionContext.compatible_build_copies : null;
+  const context = actionContext?.revision === job.revision ? actionContext : null;
+  const compatible = context?.compatible_build_copies;
+  const timeout = context?.build_timeout || (failed?.error_type === "CommandTimeout"
+    ? { stage: failed.role, seconds: failed.timeout_seconds } : null);
   return section("Intervención · " + interventionType(job), [
     fields([["Causa", entry.reason], ["Candidato", sha(job.candidate_sha)],
       ["Etapa registrada para la reanudación", label(roles, entry.retry_stage)],
@@ -595,9 +611,10 @@ function interventionPanel(job, failed) {
         ["Base del conflicto registrado", job.observed_base && sha(conflict.base)],
         ["Candidato conservado", sha(conflict.candidate)]]),
       textList(conflict.paths)] : null,
-    failed?.error_type === "CommandTimeout" ? fields([
-      ["Etapa interrumpida", label(roles, failed.role)], ["Plazo agotado", failed.timeout_seconds == null
-        ? null : failed.timeout_seconds + " s"], ["Rondas consumidas", job.limits?.rounds],
+    timeout ? fields([
+      ["Etapa interrumpida", label(roles, timeout.stage)], ["Plazo agotado", timeout.seconds == null
+        ? null : timeout.seconds + " s"], ["Rondas consumidas", job.limits?.rounds],
+      ["Rondas autorizadas", job.limits?.build_limit],
     ]) : null,
     (entry.questions || []).map(question => node("blockquote", [
       node("p", question.text),
@@ -610,7 +627,7 @@ function interventionPanel(job, failed) {
         ["Coincide con el SHA actual", checkpoint.matches_input], ["Coincide con el alcance actual", checkpoint.matches_scope],
         ["Intento interrumpido", checkpoint.failed_attempt]]),
     ] : null,
-    failed?.error_type === "CommandTimeout" ? fields([
+    timeout ? fields([
       ["Disponibilidad de copia compatible", compatible == null ? "Consulta las acciones del operador"
         : compatible > 0 ? "Disponible (" + compatible + ")" : "Sin copias compatibles"],
     ]) : null,
@@ -767,8 +784,10 @@ function actionPanel(job) {
     actionContext && actionContext.revision !== job.revision && job.intervention.pending
       ? node("p", "El contexto acaba de cambiar. Actualiza el trabajo y revisa la decisión.", { class: "meta" }) : null,
     !credential ? authForm() : null,
-    credential && actionContext && !offers.length ? node("p", "El servidor no ofrece acciones para este estado.") : null,
-    credential && offers.length ? decisionForm(job, offers) : null,
+    credential && (actionContext?.pending || receipt?.status === "accepted")
+      ? node("p", "El controlador tiene una decisión pendiente de aplicación.")
+      : credential && actionContext && !offers.length ? node("p", "El servidor no ofrece acciones para este estado.") : null,
+    credential && offers.length && receipt?.status !== "accepted" ? decisionForm(job, offers) : null,
     credential && submission && !sending ? retry : null,
   ], { id: "operator-actions" });
 }
@@ -787,7 +806,7 @@ async function sendDecision() {
     actionNotice = "";
   } catch (error) {
     actionError = true;
-    const conflict = ["revision_conflict", "idempotency_conflict"].includes(error.code);
+    const conflict = ["revision_conflict", "idempotency_conflict", "incompatible_state"].includes(error.code);
     if (conflict || error.status === 422) {
       submission = null;
       draft.confirmed = false;
@@ -813,7 +832,9 @@ function operationCard(operation, resultingState) {
       ["Origen", decision.origin], ["Revisión esperada", decision.expected_revision],
       ["Modelo", "No aplica"], ["SHA", sha(operation.sha)], ["Estado resultante", label(states, resultingState)],
       ["Motivo del bloqueo", decision.reason], ["Feedback", decision.evidence || operation.explanation?.reason],
-      ["Decisión", decision.result || decision.outcome || label(decisionNames, decision.kind)],
+      ["Recibo", decision.id],
+      ["Resultado", label(decisionResults, decision.result || decision.outcome || label(decisionNames, decision.kind))],
+      ["Código de error", decision.error_code],
       ["Estado reanudado", decision.resume_state ? label(states, decision.resume_state) : null]]),
     decision.rounds == null ? null : fields([["Rondas adicionales", decision.rounds], ["Nuevo límite", decision.round_limit]]),
     decision.provider ? fields([["Rol reasignado", label(roles, decision.role)],
@@ -952,11 +973,16 @@ function jobPage({ job, attempts, events, ci }) {
       ["Rondas consumidas", job.limits?.rounds], ["Límite de rondas", job.limits?.build_limit],
     ]), "panel"),
     receipt ? section("Recibo de la decisión", node("div", [
-      node("p", events.some(event => event.operations?.some(item => item.decision?.id === receipt.id))
-        ? "Aplicada" : "Aceptada · esperando que el sondeo confirme la aplicación", { role: "status" }),
+      node("p", receipt.status === "accepted" ? "Aceptada · pendiente de aplicación"
+        : label(decisionResults, receipt.status), { role: "status" }),
       fields([["Recibo", receipt.id], ["Operador", receipt.operator], ["Decisión", label(decisionNames, receipt.kind)],
-        ["Aceptada", when(receipt.accepted_at)], ["Aplicada por el controlador", when(receipt.applied_at)],
-        ["Estado reanudado", label(states, receipt.state)], ["Estado observado", label(states, job.state)]]),
+        ["Aceptada", when(receipt.accepted_at)],
+        ...(receipt.applied_at ? [["Aplicada por el controlador", when(receipt.applied_at)],
+          ["Estado reanudado", label(states, receipt.state)]] : []),
+        ...(receipt.rejected_at ? [["Rechazada el", when(receipt.rejected_at)],
+          ["Motivo del rechazo", receipt.error?.message]] : []),
+        ["Estado previsto", receipt.status === "accepted" ? label(states, receipt.resume_state) : null],
+        ["Estado observado", label(states, job.state)]]),
     ]), "panel") : null,
     interventionPanel(job, allAttempts.get(job.intervention.failed_attempt || job.last_attempt_id)),
     section("Recuperaciones automáticas", [
@@ -1054,7 +1080,10 @@ function replaceView(data) {
 }
 
 async function refresh(manual = false) {
-  if (pending) return;
+  if (pending) {
+    if (manual) refreshAgain = true;
+    return;
+  }
   pending = true;
   main.setAttribute("aria-busy", "true");
   if (!started) notice.textContent = "Cargando datos…";
@@ -1068,6 +1097,11 @@ async function refresh(manual = false) {
       draft.options = {};
     }
     actionContext = data.actions ?? null;
+    const pendingReceipt = actionContext?.pending_receipt;
+    if (pendingReceipt && submission === null
+        && (receipt?.id !== pendingReceipt.id || receipt.status === "accepted")) {
+      receipt = pendingReceipt;
+    }
     currentData = data;
     paint();
     freshness.textContent = "Última actualización · " + dateFormatter.format(new Date());
